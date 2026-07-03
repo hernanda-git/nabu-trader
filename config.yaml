@@ -21,6 +21,11 @@ agent:
   auto_trade: false           # start in dry-run mode!
   allowed_pairs:
     - "*"                     # wildcard: allow any pair
+  llm:
+    api_url: "http://localhost:8080/v1/chat/completions"
+    model: "deepseek-v4-flash"
+    api_key: ""
+    timeout: 30
 
 monitoring:
   check_interval_seconds: 10
