@@ -6,46 +6,55 @@
 
 ---
 
-## 🧠 Architecture Overview
+## 🧠 Architecture Overview — Hybrid (LLM + Hard Gates)
 
 ```
   @Gishbanda Channel
         │
         ▼
-┌───────────────────┐
-│  Listener         │  Telethon — monitors channel in real-time
-│  src/listener.py  │  (existing, modified to emit events)
-└──────┬────────────┘
+┌───────────────────────┐
+│  Listener             │  Telethon — monitors channel in real-time
+│  src/listener.py      │  (existing, modified to emit events)
+└──────┬────────────────┘
        │ raw message
        ▼
-┌───────────────────┐
-│  Signal Parser    │  Extracts pair, direction, entry, SL, TP
-│  agent/parser.py  │  Regex + heuristics
-└──────┬────────────┘
-       │ TradeSignal
+┌───────────────────────┐
+│  Regex Pre-Parse      │  Fast 1ms: extract pair, direction, numbers
+│  agent/parser.py      │  Reduces LLM error rate
+└──────┬────────────────┘
+       │ raw text + fields
        ▼
-┌───────────────────┐
-│  Signal Validator │  Checks completeness, sanity, duplicates
-│  agent/validator  │
-└──────┬────────────┘
-       │ validated signal
+┌───────────────────────┐
+│  Safety Gate 1        │  Idempotency, cooldown, pair whitelist
+│  agent/gate.py        │  → SKIP before LLM if duplicate
+└──────┬────────────────┘
+       │ (or skip)
        ▼
-┌───────────────────┐
-│  Risk Engine      │  Position sizing, concurrent limits, cooldown
-│  agent/risk.py    │
-└──────┬────────────┘
-       │ RiskAssessment
-       ▼
-┌───────────────────┐
-│  Decision Engine  │  ENTER / SKIP / CLOSE decision
-│  agent/decision.py│  Uses strategy + confidence threshold
-└──────┬────────────┘
+┌───────────────────────┐
+│  Agent Brain          │  Single LLM call via OpenCode Go
+│  agent/agent.py       │  Parses + validates + risk-assesses
+│                       │  + decides in one response
+│  Input:  raw text     │
+│          regex fields │
+│          positions    │
+│          balance      │
+│                       │
+│  Output: structured   │
+│  TradeDecision JSON   │
+└──────┬────────────────┘
        │ TradeDecision
        ▼
-┌───────────────────┐
-│  Order Service    │  Translates decision → exchange order
-│  execution/       │
-└──────┬────────────┘
+┌───────────────────────┐
+│  Safety Gate 2        │  HARD LIMITS: cap position size,
+│  agent/gate.py        │  enforce max concurrent, daily loss
+│                       │  LLM cannot override these
+└──────┬────────────────┘
+       │ (or reject)
+       ▼
+┌───────────────────────┐
+│  Order Service        │  Translates decision → exchange order
+│  execution/           │  Retry + idempotency
+└──────┬────────────────┘
        │ OrderRequest
        ▼
 ┌──────────────────────────────────┐
@@ -56,16 +65,16 @@
 └────────┬─────────────────────────┘
          │ ExecutionResult
          ▼
-┌───────────────────┐
-│  Position Manager │  Owns SL/TP monitoring, time-based exits
-│  position/        │
-└──────┬────────────┘
+┌───────────────────────┐
+│  Position Manager     │  Owns SL/TP monitoring, time-based exits
+│  execution/           │
+└──────┬────────────────┘
        │ position events
        ▼
-┌───────────────────┐
-│  Event Bus        │  In-process pub/sub
-│  events/bus.py    │  Loose coupling, multiple consumers
-└──┬────┬────┬──────┘
+┌───────────────────────┐
+│  Event Bus            │  In-process pub/sub
+│  events/bus.py        │  Loose coupling, multiple consumers
+└──┬────┬────┬──────────┘
    │    │    │
    ▼    ▼    ▼
 Notify State Audit
@@ -93,13 +102,6 @@ class TradeSignal:
     tp_prices: list[float]
     has_media: bool
     timestamp: datetime
-
-@dataclass(frozen=True)
-class RiskAssessment:
-    allowed: bool
-    quantity: float
-    reason: str
-    confidence: float
 
 @dataclass(frozen=True)
 class TradeDecision:
@@ -158,11 +160,9 @@ class Position:
 
 | Component | File | Responsibility |
 |-----------|------|---------------|
-| Signal Parser | `agent/parser.py` | Regex extraction of pair, direction, entry, SL, TP from raw text |
-| Signal Validator | `agent/validator.py` | Completeness check, pair whitelist, duplicate signal detection |
-| Risk Engine | `agent/risk.py` | Position size = `balance * risk% / (entry - SL)`, max concurrent, daily loss limit, cooldown |
-| Decision Engine | `agent/decision.py` | Orchestrates parser → validator → risk → final ENTER/SKIP/CLOSE decision |
-| LLM Reasoner | `agent/llm.py` | *Optional* — calls Hermes provider chain for ambiguous signal enrichment |
+| Regex Pre-Parse | `agent/parser.py` | Fast (1ms) regex extraction of pair, direction, entry, SL, TP from raw text. Reduces LLM hallucination |
+| Agent Brain | `agent/agent.py` | **Single LLM call via OpenCode Go.** Takes raw text + regex fields + open positions + balance. Returns structured `TradeDecision` JSON — parsing, validation, risk assessment, and decision all in one shot |
+| Safety Gates | `agent/gate.py` | **Gate 1 (pre-LLM):** idempotency check, cooldown timer, pair whitelist. **Gate 2 (post-LLM):** clamp position size to risk %, enforce max concurrent positions, daily loss limit — hard limits the LLM cannot override |
 
 ### Exchange Layer (`exchange/`)
 
@@ -352,11 +352,9 @@ monitoring:
 nabu-trader/
 ├── src/
 │   ├── agent/
-│   │   ├── parser.py         Signal parsing
-│   │   ├── validator.py      Signal validation
-│   │   ├── risk.py           Risk engine
-│   │   ├── decision.py       Decision engine
-│   │   └── llm.py           Optional LLM enrichment
+│   │   ├── parser.py          Regex pre-parse (fast pass)
+│   │   ├── agent.py           LLM agent brain (1 call via OpenCode Go)
+│   │   └── gate.py            Safety gates (Gate 1 + Gate 2)
 │   │
 │   ├── exchange/
 │   │   ├── base.py           Abstract exchange interface
@@ -407,31 +405,46 @@ nabu-trader/
 
 ---
 
-## 🔄 Pipeline Flow (Detailed)
+## 🔄 Pipeline Flow (Fast Path)
 
 ```
 1. Telegram listener receives message
-2. ➡️ Event Bus emits: SignalReceived(signal)
-3. Listeners:
-   a. Signal Parser → TradeSignal
-   b. State: saves to `signals` table
-4. Validator checks: completeness, pair whitelist, idempotency
-   ➡️ Event Bus emits: SignalValidated | SignalRejected
-5. Risk Engine: position size, cooldown, daily limits
-   ➡️ Event Bus emits: RiskAssessment
-6. Decision Engine: ENTER / SKIP / CLOSE
+2. ➡️ Event Bus emits: SignalReceived(raw_text)
+3. Regex Pre-Parse (1ms):
+   - Extract pair, direction, entry, SL, TP
+   - ➡️ Event Bus emits: SignalPreParsed
+4. Safety Gate 1 (pre-LLM):
+   - Idempotency check (processed_signals table)
+   - Cooldown check (was same pair traded <5 min ago?)
+   - Pair whitelist
+   - → SKIP here if rejected (no LLM cost)
+5. Agent Brain — 1 LLM call via OpenCode Go:
+   Input: raw text + regex fields + open positions + balance
+   Output: structured TradeDecision JSON
+   - ENTER: pair, side, quantity, entry_type, price, sl, tp
+   - CLOSE: pair, side
+   - SKIP: reason
    ➡️ Event Bus emits: DecisionCreated | TradeRejected
-7. Order Service: translates decision → OrderRequest → Exchange
-   ➡️ Event Bus emits: OrderPlaced
-8. Exchange returns: order_id, filled, avg_price
-   ➡️ Event Bus emits: OrderFilled | OrderFailed
-9. Position Manager: records position, SL/TP orders placed
-   ➡️ Event Bus emits: PositionOpened
-10. Notifier: sends formatted Telegram message
-11. Background loop:
-    - Every N seconds, Position Manager checks SL levels
-    - If hit → close → Emit: PositionClosed
-    - If new opposite-direction signal → trigger close
+6. Safety Gate 2 (post-LLM):
+   - Clamp quantity to risk % of balance
+   - Enforce max concurrent positions
+   - Enforce daily loss limit
+   - → REJECT if gate blocks (log reason, notify)
+7. Order Service:
+   - Generate client_order_id (idempotency)
+   - Place via Exchange
+   - ➡️ Event Bus emits: OrderPlaced
+8. Exchange returns → OrderFilled | OrderFailed
+9. Position Manager:
+   - Record position
+   - Place SL/TP orders
+   - ➡️ Event Bus emits: PositionOpened
+10. Notifier: Telegram message
+11. Background loop (Position Manager):
+    - Every N seconds: check open positions
+    - SL hit → close → Emit: PositionClosed
+    - TP hit → close
+    - Opposite-direction signal → trigger close
 ```
 
 ---
@@ -464,14 +477,11 @@ nabu-trader/
 
 | Step | Files | What |
 |------|-------|------|
-| 5 | `agent/parser.py` | Signal parsing (reuse from listener.py) |
-| 6 | `agent/validator.py` | Validation rules |
-| 7 | `agent/risk.py` | Position sizing, limits |
-| 8 | `agent/decision.py` | Decision engine |
-| 9 | `exchange/base.py`, `exchange/paper.py` | Exchange abstraction + paper |
-| 10 | `exchange/binance.py` | Binance API (testnet) |
-| 11 | `execution/order_service.py` | Order placement |
-| 12 | `execution/position_manager.py` | Position lifecycle |
+| 5 | `agent/parser.py`, `agent/agent.py`, `agent/gate.py` | Agent: regex pre-parse → LLM brain → safety gates |
+| 6 | `exchange/base.py`, `exchange/paper.py` | Exchange abstraction + paper |
+| 7 | `exchange/binance.py` | Binance API (testnet) |
+| 8 | `execution/order_service.py` | Order placement |
+| 9 | `execution/position_manager.py` | Position lifecycle |
 
 ### Phase 3 — Pipeline
 
@@ -487,7 +497,6 @@ nabu-trader/
 
 | Feature | Priority |
 |---------|----------|
-| LLM enrichment (`agent/llm.py`) | Medium |
 | Retry + circuit breaker | High |
 | Health monitoring | Medium |
 | Metrics (win rate, drawdown) | Low |
@@ -495,4 +504,4 @@ nabu-trader/
 
 ---
 
-*Plan v2.0 — Merged with PLAN_REVISE.md recommendations. Paper trading first, testnet second, mainnet never until proven.*
+*Plan v2.1 — Hybrid architecture: OpenCode Go LLM brain + hard safety gates. Collapsed 4 modules → agent.py + gate.py. Paper trading first, testnet second, mainnet never until proven.*
