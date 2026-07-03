@@ -22,9 +22,9 @@ agent:
   allowed_pairs:
     - "*"                     # wildcard: allow any pair
   llm:
-    api_url: "http://localhost:8080/v1/chat/completions"
+    api_url: "https://opencode.ai/zen/go/v1/chat/completions"
     model: "deepseek-v4-flash"
-    api_key: ""
+    api_key_env: OPENCODE_GO_API_KEY
     timeout: 30
 
 monitoring:

@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -17,39 +19,20 @@ from src.domain.models import TradeDecision, TradeSignal
 log = logging.getLogger("agent.brain")
 
 # System prompt for the trading agent
-SYSTEM_PROMPT = """You are a crypto trading signal analyst. Your job is to analyze Telegram signals and output a structured trade decision.
+SYSTEM_PROMPT = """You are a crypto trading signal analyst.
 
-RESPOND ONLY WITH VALID JSON. No markdown, no explanation, no code blocks.
+After your analysis, end your response with EXACTLY this JSON format (no other text after it):
 
-Available actions:
-- "ENTER": Open a new position
-- "CLOSE": Close an existing position on this pair
-- "SKIP": Do nothing (signal is not actionable)
+{"action":"ENTER|CLOSE|SKIP","pair":"PAIR","direction":"LONG|SHORT","order_type":"MARKET|LIMIT","quantity":0.0,"entry_price":null,"sl_price":null,"tp_prices":[],"reason":"...","confidence":0.0}
 
 Rules:
-1. Be conservative — if you're unsure, output SKIP
-2. For ENTER: provide pair (e.g. BTCUSDT), direction (LONG/SHORT), order_type (MARKET/LIMIT), quantity, optional sl_price and tp_prices
-3. For CLOSE: provide pair and direction only
-4. Quantity: suggest a reasonable amount in the base asset. The safety gate will clamp it.
-5. Confidence: 0.0-1.0. Below 0.5 → SKIP recommended
-6. Reason: brief explanation of your decision
+- ENTER: open position. CLOSE: close existing. SKIP: do nothing (be conservative).
+- For ENTER provide pair like BTCUSDT, direction, quantity, optional sl/tp.
+- For CLOSE provide pair and direction only.
+- Confidence 0-1. Below 0.5 = SKIP.
+- Reason: brief explanation.
 
-Output format:
-```json
-{
-  "action": "ENTER|CLOSE|SKIP",
-  "pair": "BTCUSDT",
-  "direction": "LONG|SHORT",
-  "order_type": "MARKET|LIMIT",
-  "quantity": 0.01,
-  "entry_price": null,
-  "sl_price": null,
-  "tp_prices": [],
-  "reason": "Clear signal with defined entry, SL at 1% risk",
-  "confidence": 0.85
-}
-```
-"""
+IMPORTANT: End your response with the JSON object on its own line. Nothing after it."""
 
 
 def _build_prompt(signal: TradeSignal, open_positions: list[dict],
@@ -86,19 +69,34 @@ def _build_prompt(signal: TradeSignal, open_positions: list[dict],
 
 
 def _parse_decision(raw: str) -> TradeDecision | None:
-    """Parse LLM response into a TradeDecision."""
-    # Strip markdown code fences if present
+    """Parse LLM response into a TradeDecision.
+
+    Tries: raw JSON → code-fenced JSON → regex JSON extraction from full text.
+    """
     text = raw.strip()
+
+    # Try 1: Strip markdown code fences
     if text.startswith("```"):
         text = text.split("\n", 1)[-1]
         text = text.rsplit("```", 1)[0]
     text = text.strip()
 
+    # Try 2: Direct JSON parse
     try:
         data = json.loads(text)
     except json.JSONDecodeError:
-        log.warning("LLM returned invalid JSON: %s", raw[:200])
-        return None
+        # Try 3: Find JSON-like object anywhere in the text
+        import re as _re
+        match = _re.search(r'\{[\s\S]*?"action"\s*:\s*"(ENTER|CLOSE|SKIP)"[\s\S]*?\}', text)
+        if match:
+            try:
+                data = json.loads(match.group(0))
+            except json.JSONDecodeError:
+                log.warning("Found JSON-like block but failed to parse: %s", match.group(0)[:100])
+                return None
+        else:
+            log.warning("LLM returned invalid JSON: %s", raw[:200])
+            return None
 
     action = data.get("action", "SKIP")
     if action not in ("ENTER", "CLOSE", "SKIP"):
@@ -132,12 +130,21 @@ class AgentBrain:
     def __init__(self, config: dict):
         agent_cfg = config.get("agent", {})
         llm_cfg = agent_cfg.get("llm", {})
-        self.api_url = llm_cfg.get(
-            "api_url",
-            agent_cfg.get("llm_api_url", ""),
-        ) or "http://localhost:8080/v1/chat/completions"
-        self.model = llm_cfg.get("model", agent_cfg.get("llm_model", "deepseek-v4-flash"))
-        self.api_key = llm_cfg.get("api_key", agent_cfg.get("llm_api_key", ""))
+        self.api_url = llm_cfg.get("api_url", "https://opencode.ai/zen/go/v1/chat/completions")
+        self.model = llm_cfg.get("model", "deepseek-v4-flash")
+
+        # API key: try api_key field first, then api_key_env env var, then env file
+        self.api_key = llm_cfg.get("api_key", "")
+        if not self.api_key:
+            env_var = llm_cfg.get("api_key_env", "")
+            if env_var:
+                self.api_key = os.environ.get(env_var, "")
+                if not self.api_key:
+                    # Try loading from .env
+                    from dotenv import load_dotenv
+                    load_dotenv(Path(__file__).resolve().parent.parent.parent / ".env")
+                    self.api_key = os.environ.get(env_var, "")
+
         self.timeout = llm_cfg.get("timeout", 30)
         self.auto_trade = agent_cfg.get("auto_trade", False)
         self.confidence_threshold = agent_cfg.get("confidence_threshold", 0.6)
@@ -197,7 +204,7 @@ class AgentBrain:
                 {"role": "user", "content": prompt},
             ],
             "temperature": 0.1,
-            "max_tokens": 500,
+            "max_tokens": 1024,
         }
 
         log.info("Calling LLM: %s with model %s", self.api_url, self.model)
@@ -205,5 +212,9 @@ class AgentBrain:
             resp = client.post(self.api_url, json=payload, headers=headers)
             resp.raise_for_status()
             data = resp.json()
-            content = data["choices"][0]["message"]["content"]
-            return content
+            msg = data["choices"][0]["message"]
+            # Reasoning models may put JSON in content or reasoning_content
+            content = msg.get("content", "") or ""
+            rc = msg.get("reasoning_content", "") or ""
+            # Concatenate both and search for JSON in the full text
+            return content + "\n" + rc
