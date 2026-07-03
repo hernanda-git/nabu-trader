@@ -10,7 +10,9 @@ from typing import Any
 
 log = logging.getLogger("state.database")
 
-DATA_DIR = Path(__file__).resolve().parent.parent.parent / "data"
+from src.config.loader import get_data_dir
+DATA_DIR = get_data_dir()
+DATA_DIR.mkdir(parents=True, exist_ok=True)
 DB_PATH = DATA_DIR / "trades.db"
 
 SCHEMA_SQL = """
@@ -124,7 +126,7 @@ def get_connection(db_path: str | Path | None = None) -> sqlite3.Connection:
     Creates the data directory and initializes schema if needed.
     """
     db_path = Path(db_path) if db_path else DB_PATH
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    db_path.parent.mkdir(parents=True, exist_ok=True)
 
     conn = sqlite3.connect(str(db_path))
     conn.row_factory = sqlite3.Row

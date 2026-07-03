@@ -39,6 +39,7 @@ class TradeDecision:
     tp_prices: list[float] = field(default_factory=list)
     reason: str = ""
     confidence: float = 0.0
+    leverage: int = 1  # futures leverage (calculated by Gate2; LLM can also suggest)
 
 
 # ─── Order ─────────────────────────────────────────────────────────────────────

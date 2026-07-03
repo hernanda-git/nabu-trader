@@ -10,6 +10,37 @@ ROOT_DIR = Path(__file__).resolve().parent.parent.parent
 DEFAULT_CONFIG_PATH = ROOT_DIR / "config.yaml"
 ENV_PATH = ROOT_DIR / ".env"
 
+# ─── Fly.io path helpers ─────────────────────────────────────
+# On Fly.io, /data is a persistent volume; use env var to detect.
+
+def _resolve_data_root() -> Path:
+    """Return the root for persistent data (DB, sessions, logs).
+
+    On Fly.io (FLY_MODE=1 or DATA_ROOT set) the volume is at /data.
+    Locally it defaults to the project root, preserving existing behaviour.
+    """
+    override = os.environ.get("DATA_ROOT")
+    if override:
+        return Path(override)
+    if os.environ.get("FLY_MODE"):
+        return Path("/data")
+    return ROOT_DIR
+
+
+def get_data_dir() -> Path:
+    """Return the directory for persistent data files."""
+    return _resolve_data_root() / "data"
+
+
+def get_session_dir() -> Path:
+    """Return the directory for Telegram session files."""
+    return _resolve_data_root() / "sessions"
+
+
+def get_log_dir() -> Path:
+    """Return the directory for log files."""
+    return _resolve_data_root() / "logs"
+
 
 def _load_env() -> dict[str, str]:
     """Load .env file into a dict (simple parser, no external dep needed for basic cases)."""

@@ -83,11 +83,53 @@ class PositionManager:
         log.debug("Position %s: open_orders=%d, sl_ok=%s, tp_orders=%d",
                   pos.pair, len(open_orders), sl_ok, tp_count)
 
+        # If no SL/TP orders remain and position is OPEN, check if it was
+        # already filled (closed by exchange). Use age as heuristic:
+        # if it's been open > 30 min and has no orders, it was likely closed.
+        if len(open_orders) == 0 and pos.entry_time:
+            from datetime import datetime, timezone
+            if isinstance(pos.entry_time, str):
+                entry_dt = datetime.fromisoformat(pos.entry_time)
+                if entry_dt.tzinfo is None:
+                    entry_dt = entry_dt.replace(tzinfo=timezone.utc)
+            else:
+                entry_dt = pos.entry_time.replace(tzinfo=timezone.utc)
+            age_min = (datetime.now(timezone.utc) - entry_dt).total_seconds() / 60
+            if age_min > 30:
+                log.info("Position %s has no open orders (age=%.1f min) — marking as closed",
+                         pos.pair, age_min)
+                # Try to get latest trade info from exchange to calculate P&L
+                try:
+                    order = await self.exchange.get_order(pos.pair, pos.entry_order_id)
+                    if order.status in ("FILLED", "CANCELED", "EXPIRED") or not order.order_id:
+                        exit_px = order.avg_price or pos.sl_price or pos.entry_price
+                        entry_cost = pos.entry_price * pos.quantity
+                        exit_value = exit_px * pos.quantity
+                        pnl = (exit_value - entry_cost) if pos.direction == "LONG" else (entry_cost - exit_value)
+                        self.position_repo.close_position(
+                            pos.id, exit_price=exit_px,
+                            pnl=pnl, reason="Auto-detected close (no orders remaining)",
+                            closed_by="SYSTEM",
+                        )
+                        log.info("Position %s auto-closed via exchange, PnL=%.2f", pos.pair, pnl)
+                except Exception as e:
+                    # If we can't query the order, close with 0 P&L to unblock
+                    log.warning("Could not verify %s close reason: %s — closing anyway", pos.pair, e)
+                    self.position_repo.close_position(
+                        pos.id, exit_price=pos.entry_price,
+                        pnl=0.0, reason="Auto-closed (no orders, verification failed)",
+                        closed_by="SYSTEM",
+                    )
+
         # Time-based exit — close if position has been open too long
         max_hold_hours = self.config.get("risk", {}).get("max_position_hold_hours", 24)
         if max_hold_hours > 0:
             from datetime import datetime, timezone
-            age_hours = (datetime.now(timezone.utc) - pos.entry_time.replace(tzinfo=timezone.utc)).total_seconds() / 3600
+            if isinstance(pos.entry_time, str):
+                entry_dt = datetime.fromisoformat(pos.entry_time).replace(tzinfo=timezone.utc)
+            else:
+                entry_dt = pos.entry_time.replace(tzinfo=timezone.utc)
+            age_hours = (datetime.now(timezone.utc) - entry_dt).total_seconds() / 3600
             if age_hours > max_hold_hours:
                 log.info("Time-based exit for %s (age=%.1fh > max=%dh)",
                          pos.pair, age_hours, max_hold_hours)

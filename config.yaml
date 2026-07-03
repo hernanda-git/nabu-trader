@@ -2,23 +2,28 @@
 # See PLAN.md for full documentation.
 
 exchange:
-  active: paper              # paper | binance | binance_testnet
+  active: binance              # paper | binance | binance_testnet
   binance:
     api_key_env: BINANCE_API_KEY
     api_secret_env: BINANCE_API_SECRET
-    testnet: true
+    testnet: false
+    futures: true              # false = spot, true = USDⓈ-M futures
     recv_window: 5000
 
 risk:
-  max_position_size_usdt: 100
+  max_position_size_usdt: 5
   max_concurrent_positions: 2
-  risk_per_trade_percent: 2.0
-  daily_loss_limit_percent: 10.0
+  risk_per_trade_percent: 10.0
+  daily_loss_limit_percent: 30.0
   min_cooldown_minutes: 5
+  min_notional_usdt: 1.0
+  max_position_hold_hours: 48
+  max_leverage: 20             # ceiling for dynamic leverage calc
+  margin_usage_pct: 50         # use at most 50% of balance as margin per trade
 
 agent:
-  confidence_threshold: 0.6
-  auto_trade: false           # start in dry-run mode!
+  confidence_threshold: 0.0
+  auto_trade: true           # YOLO mode activated! 🚀
   allowed_pairs:
     - "*"                     # wildcard: allow any pair
   llm:

@@ -72,3 +72,11 @@ class Exchange(ABC):
     @abstractmethod
     async def get_open_orders(self, symbol: str | None = None) -> list[OrderInfo]:
         """Get all open orders."""
+
+    # ─── Optional: futures leverage (no-op on spot/paper exchanges) ────────
+
+    async def set_symbol_leverage(self, symbol: str, leverage: int):
+        """Set futures leverage for a symbol. No-op on non-futures exchanges."""
+
+    async def set_margin_type(self, symbol: str, margin_type: str = "ISOLATED"):
+        """Set margin type for a symbol. No-op on non-futures exchanges."""

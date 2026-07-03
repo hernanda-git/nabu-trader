@@ -114,13 +114,20 @@ class TradeOrchestrator:
             # ── Step 3: Save signal ────────────────────────────────────────
             signal_db_id = self.signal_repo.save(signal)
 
-            # ── Step 4: Agent Brain (1 LLM call) ───────────────────────────
+            # ── Step 4: Fetch balance & Agent Brain (1 LLM call) ────────────
             open_positions = [
                 {"pair": p.pair, "direction": p.direction,
                  "entry_price": p.entry_price, "quantity": p.quantity}
                 for p in self.position_repo.get_open_positions()
             ]
-            decision = self.agent.decide(signal, open_positions)
+            # Fetch real balance from exchange for dynamic sizing
+            try:
+                balance_info = await self.exchange.get_balance()
+                balance = {"USDT": balance_info.free_usdt, "Total": balance_info.total_usdt}
+            except Exception:
+                balance = None
+                log.warning("Failed to fetch balance, sizing blind")
+            decision = self.agent.decide(signal, open_positions, balance)
             log.info("Decision: %s %s (conf=%.2f, reason=%s)",
                      decision.action, decision.pair, decision.confidence, decision.reason)
 
@@ -129,7 +136,8 @@ class TradeOrchestrator:
             }))
 
             # ── Step 5: Safety Gate 2 (post-LLM) ───────────────────────────
-            allowed, reason, clamped_decision = self.gate2.check(decision)
+            bal_for_gate = (balance or {}).get("USDT", None)
+            allowed, reason, clamped_decision = self.gate2.check(decision, bal_for_gate)
             if not allowed:
                 log.info("Gate2 rejected: %s", reason)
                 result["action"] = "rejected"

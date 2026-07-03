@@ -10,6 +10,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 from telethon import TelegramClient, events
 
+from src.config.loader import get_session_dir
 from src.orchestrator import TradeOrchestrator
 
 log = logging.getLogger("listener")
@@ -26,9 +27,9 @@ class SignalListener:
         load_dotenv(Path(__file__).parent.parent / ".env")
         api_id = int(os.getenv("TG_API_ID", "0"))
         api_hash = os.getenv("TG_API_HASH", "")
-        channel = os.getenv("CHANNEL_USERNAME", "gishbanda")
-        session_dir = Path(__file__).parent.parent / "sessions"
-        session_dir.mkdir(exist_ok=True)
+        channel = os.getenv("CHANNEL_USERNAME", "YOUR_SIGNAL_CHANNEL")
+        session_dir = get_session_dir()
+        session_dir.mkdir(parents=True, exist_ok=True)
 
         self.channel = channel
         self.client = TelegramClient(str(session_dir / "nabu"), api_id, api_hash)

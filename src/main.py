@@ -31,7 +31,7 @@ from dotenv import load_dotenv
 
 from src.agent.agent import AgentBrain
 from src.agent.gate import SafetyGate1, SafetyGate2
-from src.config.loader import load_config
+from src.config.loader import get_log_dir, load_config
 from src.config.validator import validate_config
 from src.events.bus import EventBus
 from src.exchange.binance import BinanceExchange
@@ -55,8 +55,8 @@ log = logging.getLogger("main")
 
 def setup_logging():
     """Configure logging to stdout + file."""
-    log_dir = ROOT / "logs"
-    log_dir.mkdir(exist_ok=True)
+    log_dir = get_log_dir()
+    log_dir.mkdir(parents=True, exist_ok=True)
 
     fmt = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
     logging.basicConfig(
@@ -105,12 +105,18 @@ async def main():
     elif exchange_mode in ("binance", "binance_testnet"):
         binance_cfg = cfg["exchange"]["binance"]
         exchange = BinanceExchange(
-            api_key=binance_cfg["api_key"],
-            api_secret=binance_cfg["api_secret"],
-            testnet=(exchange_mode == "binance_testnet"),
-            recv_window=binance_cfg.get("recv_window", 5000),
-        )
-        log.info("Using %s exchange", "BINANCE TESTNET" if exchange_mode == "binance_testnet" else "BINANCE")
+                api_key=binance_cfg["api_key"],
+                api_secret=binance_cfg["api_secret"],
+                testnet=(exchange_mode == "binance_testnet"),
+                futures=binance_cfg.get("futures", False),
+                recv_window=binance_cfg.get("recv_window", 5000),
+            )
+        mode_label = "BINANCE"
+        if exchange_mode == "binance_testnet":
+            mode_label += " TESTNET"
+        if binance_cfg.get("futures"):
+            mode_label += " FUTURES"
+        log.info("Using %s exchange", mode_label)
     else:
         log.error("Unknown exchange mode: %s", exchange_mode)
         sys.exit(1)

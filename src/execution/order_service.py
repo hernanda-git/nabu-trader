@@ -62,6 +62,20 @@ class OrderService:
         client_id = self._generate_client_id(decision_id)
         side = "BUY" if decision.direction == "LONG" else "SELL"
 
+        # Set futures leverage before placing the entry order
+        if decision.leverage > 1:
+            await self.exchange.set_symbol_leverage(symbol, decision.leverage)
+            await self.exchange.set_margin_type(symbol, "ISOLATED")
+
+        # Validate minimum notional (Binance requirement)
+        price_ref = decision.entry_price or 0
+        min_notional = self.config.get("risk", {}).get("min_notional_usdt", 1.0)
+        if quantity * max(price_ref, 1.0) < min_notional:
+            return ExecutionResult(
+                success=False, status="REJECTED",
+                error=f"Order below min notional: {quantity} * {price_ref} < {min_notional} USDT",
+            )
+
         # Place entry order
         if decision.order_type == "MARKET":
             order = await self.exchange.market_buy(symbol, quantity) if side == "BUY" \
@@ -101,13 +115,17 @@ class OrderService:
         pos_id = self.position_repo.create(pos)
 
         # Place SL order
+        sl_placed = False
         if decision.sl_price:
             sl_side = "SELL" if decision.direction == "LONG" else "BUY"
             sl_order = await self.exchange.stop_loss(symbol, quantity, decision.sl_price, sl_side)
             if sl_order.order_id:
+                sl_placed = True
                 log.info("SL placed: %s @ %s", symbol, decision.sl_price)
+            else:
+                log.warning("SL NOT placed for %s @ %s — position is UNPROTECTED", symbol, decision.sl_price)
 
-        # Place TP orders
+        # Place TP orders (only if SL placed or no SL configured)
         for i, tp_price in enumerate(decision.tp_prices[:3]):
             tp_side = "SELL" if decision.direction == "LONG" else "BUY"
             if tp_side == "SELL":

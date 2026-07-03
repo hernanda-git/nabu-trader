@@ -66,11 +66,14 @@ class TelegramNotifier:
             emoji = "🟢" if decision.direction == "LONG" else "🔴"
             tp_str = ", ".join(f"TP{i+1}=`{p}`" for i, p in enumerate(decision.tp_prices)) if decision.tp_prices else ""
             sl_str = f"SL=`{decision.sl_price}`" if decision.sl_price else ""
+            lev_str = f"⚙️ {decision.leverage}x" if decision.leverage > 1 else ""
             text = (
                 f"{emoji} **TRADE — {decision.pair}**\n"
                 f"📊 {decision.direction} | {decision.order_type}\n"
                 f"💰 Qty: `{decision.quantity:.6f}`\n"
             )
+            if lev_str:
+                text += f"{lev_str}\n"
             if sl_str:
                 text += f"🛑 {sl_str}\n"
             if tp_str:

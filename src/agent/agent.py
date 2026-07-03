@@ -19,11 +19,19 @@ from src.domain.models import TradeDecision, TradeSignal
 log = logging.getLogger("agent.brain")
 
 # System prompt for the trading agent
-SYSTEM_PROMPT = """You are a crypto trading signal analyst. After reasoning, output this JSON:
+SYSTEM_PROMPT = """You are a crypto trading signal analyst on Binance USDⓈ-M Futures. Your goal is to maximize profit while strictly limiting risk.
 
+Rules:
+- If the signal looks valid, output ENTER with a position sized to lose at most RISK% of your USDT balance if SL is hit.
+- To calculate quantity: quantity = (balance * RISK% / 100) / abs(entry_price - sl_price)
+- The system uses futures — leverage is applied automatically to meet minimum trade sizes and free up margin. Just calculate quantity correctly; the safety gate handles leverage.
+- If already in a position for that pair, output CLOSE.
+- If signal is unclear / low quality, output SKIP.
+
+Output ONLY this JSON:
 {"action":"ENTER|CLOSE|SKIP","pair":"BTCUSDT","direction":"LONG|SHORT","order_type":"MARKET|LIMIT","quantity":0.01,"entry_price":null,"sl_price":null,"tp_prices":[],"reason":"...","confidence":0.0}
 
-Rules: ENTER=open, CLOSE=close existing, SKIP=skip. Be conservative. End with JSON."""
+Be conservative. End with JSON."""
 
 
 def _build_prompt(signal: TradeSignal, open_positions: list[dict],
@@ -62,7 +70,7 @@ def _build_prompt(signal: TradeSignal, open_positions: list[dict],
 def _parse_decision(raw: str) -> TradeDecision | None:
     """Parse LLM response into a TradeDecision.
 
-    Tries: raw JSON → code-fenced JSON → regex JSON extraction from full text.
+    Tries: raw JSON -> code-fenced JSON -> regex JSON extraction from full text.
     """
     text = raw.strip()
 
