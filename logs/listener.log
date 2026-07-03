@@ -1,0 +1,45 @@
+2026-07-03 13:21:35,520 [INFO] ============================================================
+2026-07-03 13:21:35,521 [INFO] Nabu Trader Listener starting...
+2026-07-03 13:21:35,522 [INFO] Channel: @gishbanda
+2026-07-03 13:21:35,522 [INFO] Notify chat: YOUR_CHAT_ID
+2026-07-03 13:21:35,523 [INFO] Bot token: SET
+2026-07-03 13:21:35,523 [INFO] ============================================================
+2026-07-03 13:21:35,524 [INFO] Connecting to 91.108.56.132:443/TcpFull...
+2026-07-03 13:21:35,546 [INFO] Connection to 91.108.56.132:443/TcpFull complete!
+2026-07-03 13:21:35,870 [INFO] Connected as: Hernanda (ID: YOUR_CHAT_ID)
+2026-07-03 13:21:35,909 [INFO] Channel found: House of Gishbanda (ID: 3941988855)
+2026-07-03 13:21:35,912 [INFO] Listening for new messages... (Ctrl+C to stop)
+2026-07-03 13:21:58,959 [INFO] ============================================================
+2026-07-03 13:21:58,961 [INFO] Nabu Trader Listener starting...
+2026-07-03 13:21:58,963 [INFO] Channel: @gishbanda
+2026-07-03 13:21:58,963 [INFO] Notify chat: YOUR_CHAT_ID
+2026-07-03 13:21:58,964 [INFO] Bot token: SET
+2026-07-03 13:21:58,966 [INFO] ============================================================
+2026-07-03 13:21:58,970 [INFO] Connecting to 91.108.56.132:443/TcpFull...
+2026-07-03 13:21:58,995 [INFO] Connection to 91.108.56.132:443/TcpFull complete!
+2026-07-03 13:21:59,523 [INFO] Connected as: Hernanda (ID: YOUR_CHAT_ID)
+2026-07-03 13:21:59,628 [INFO] Channel found: House of Gishbanda (ID: 3941988855)
+2026-07-03 13:21:59,629 [INFO] Listening for new messages... (Ctrl+C to stop)
+2026-07-03 13:25:34,648 [INFO] New message #3 | text=5 chars | media=False | forward=False
+2026-07-03 13:25:34,650 [INFO] Non-signal post forwarded
+2026-07-03 13:25:36,640 [INFO] HTTP Request: POST https://api.telegram.org/botREMOVED_SECRET/sendMessage "HTTP/1.1 200 OK"
+2026-07-03 13:25:36,642 [INFO] Notification sent to Hermes chat
+2026-07-03 13:26:04,181 [INFO] New message #4 | text=76 chars | media=False | forward=False
+2026-07-03 13:26:04,182 [INFO] Signal detected: ? LONG
+2026-07-03 13:26:05,129 [INFO] HTTP Request: POST https://api.telegram.org/botREMOVED_SECRET/sendMessage "HTTP/1.1 200 OK"
+2026-07-03 13:26:05,130 [INFO] Notification sent to Hermes chat
+2026-07-03 13:28:35,102 [INFO] ============================================================
+2026-07-03 13:28:35,103 [INFO] Nabu Trader Listener starting...
+2026-07-03 13:28:35,103 [INFO] Channel: @gishbanda
+2026-07-03 13:28:35,104 [INFO] Notify chat: YOUR_CHAT_ID
+2026-07-03 13:28:35,104 [INFO] Bot token: SET
+2026-07-03 13:28:35,106 [INFO] ============================================================
+2026-07-03 13:28:35,107 [INFO] Connecting to 91.108.56.132:443/TcpFull...
+2026-07-03 13:28:35,132 [INFO] Connection to 91.108.56.132:443/TcpFull complete!
+2026-07-03 13:28:35,418 [INFO] Connected as: Hernanda (ID: YOUR_CHAT_ID)
+2026-07-03 13:28:35,452 [INFO] Channel found: House of Gishbanda (ID: 3941988855)
+2026-07-03 13:28:35,453 [INFO] Listening for new messages... (Ctrl+C to stop)
+2026-07-03 13:37:29,779 [INFO] New message #5 | text=2 chars | media=False | forward=False
+2026-07-03 13:37:29,785 [INFO] Non-signal post forwarded
+2026-07-03 13:37:36,501 [INFO] HTTP Request: POST https://api.telegram.org/botREMOVED_SECRET/sendMessage "HTTP/1.1 200 OK"
+2026-07-03 13:37:36,502 [INFO] Notification sent to Hermes chat
