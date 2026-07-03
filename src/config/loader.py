@@ -1,0 +1,49 @@
+"""Configuration loader — merges config.yaml + .env + defaults."""
+
+import os
+import yaml
+from pathlib import Path
+from typing import Any
+
+
+ROOT_DIR = Path(__file__).resolve().parent.parent.parent
+DEFAULT_CONFIG_PATH = ROOT_DIR / "config.yaml"
+ENV_PATH = ROOT_DIR / ".env"
+
+
+def _load_env() -> dict[str, str]:
+    """Load .env file into a dict (simple parser, no external dep needed for basic cases)."""
+    env = {}
+    env_path = ENV_PATH
+    if not env_path.exists():
+        return env
+    for line in env_path.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, val = line.partition("=")
+        env[key.strip()] = val.strip().strip("\"'")
+    return env
+
+
+def load_config(path: str | Path | None = None) -> dict[str, Any]:
+    """Load config.yaml and overlay .env secrets. Returns a merged dict."""
+    path = Path(path) if path else DEFAULT_CONFIG_PATH
+
+    if not path.exists():
+        raise FileNotFoundError(f"Config not found: {path}")
+
+    with open(path) as f:
+        cfg: dict[str, Any] = yaml.safe_load(f) or {}
+
+    env = _load_env()
+
+    # Overlay Binance keys from .env
+    binance_cfg = cfg.get("exchange", {}).get("binance", {})
+    api_key_env = binance_cfg.get("api_key_env", "BINANCE_API_KEY")
+    api_secret_env = binance_cfg.get("api_secret_env", "BINANCE_API_SECRET")
+    binance_cfg["api_key"] = env.get(api_key_env, os.environ.get(api_key_env, ""))
+    binance_cfg["api_secret"] = env.get(api_secret_env, os.environ.get(api_secret_env, ""))
+    cfg.setdefault("exchange", {})["binance"] = binance_cfg
+
+    return cfg

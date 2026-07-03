@@ -1,0 +1,27 @@
+# ─── Auto-Trade Configuration ──────────────────────────────────────────────────
+# See PLAN.md for full documentation.
+
+exchange:
+  active: paper              # paper | binance | binance_testnet
+  binance:
+    api_key_env: BINANCE_API_KEY
+    api_secret_env: BINANCE_API_SECRET
+    testnet: true
+    recv_window: 5000
+
+risk:
+  max_position_size_usdt: 100
+  max_concurrent_positions: 2
+  risk_per_trade_percent: 2.0
+  daily_loss_limit_percent: 10.0
+  min_cooldown_minutes: 5
+
+agent:
+  confidence_threshold: 0.6
+  auto_trade: false           # start in dry-run mode!
+  allowed_pairs:
+    - "*"                     # wildcard: allow any pair
+
+monitoring:
+  check_interval_seconds: 10
+  health_check_port: 9090
