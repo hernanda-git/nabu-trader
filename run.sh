@@ -1,4 +1,4 @@
 #!/bin/bash
-# Run the Nabu Trader Listener
+# Run the Auto-Trade Pipeline
 cd "$(dirname "$0")"
-exec /home/it26/.hermes/venvs/netra/bin/python src/listener.py
+exec /home/it26/.hermes/venvs/netra/bin/python src/main.py
