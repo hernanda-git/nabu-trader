@@ -207,5 +207,7 @@ class AgentBrain:
             # Reasoning models may put JSON in content or reasoning_content
             content = msg.get("content", "") or ""
             rc = msg.get("reasoning_content", "") or ""
-            # Concatenate both and search for JSON in the full text
+            # Try content first (it's the actual response), fall back to full text
+            if content.strip():
+                return content
             return content + "\n" + rc
