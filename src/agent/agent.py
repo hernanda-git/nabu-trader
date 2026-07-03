@@ -19,20 +19,11 @@ from src.domain.models import TradeDecision, TradeSignal
 log = logging.getLogger("agent.brain")
 
 # System prompt for the trading agent
-SYSTEM_PROMPT = """You are a crypto trading signal analyst.
+SYSTEM_PROMPT = """You are a crypto trading signal analyst. After reasoning, output this JSON:
 
-After your analysis, end your response with EXACTLY this JSON format (no other text after it):
+{"action":"ENTER|CLOSE|SKIP","pair":"BTCUSDT","direction":"LONG|SHORT","order_type":"MARKET|LIMIT","quantity":0.01,"entry_price":null,"sl_price":null,"tp_prices":[],"reason":"...","confidence":0.0}
 
-{"action":"ENTER|CLOSE|SKIP","pair":"PAIR","direction":"LONG|SHORT","order_type":"MARKET|LIMIT","quantity":0.0,"entry_price":null,"sl_price":null,"tp_prices":[],"reason":"...","confidence":0.0}
-
-Rules:
-- ENTER: open position. CLOSE: close existing. SKIP: do nothing (be conservative).
-- For ENTER provide pair like BTCUSDT, direction, quantity, optional sl/tp.
-- For CLOSE provide pair and direction only.
-- Confidence 0-1. Below 0.5 = SKIP.
-- Reason: brief explanation.
-
-IMPORTANT: End your response with the JSON object on its own line. Nothing after it."""
+Rules: ENTER=open, CLOSE=close existing, SKIP=skip. Be conservative. End with JSON."""
 
 
 def _build_prompt(signal: TradeSignal, open_positions: list[dict],
@@ -204,7 +195,7 @@ class AgentBrain:
                 {"role": "user", "content": prompt},
             ],
             "temperature": 0.1,
-            "max_tokens": 1024,
+            "max_tokens": 2048,
         }
 
         log.info("Calling LLM: %s with model %s", self.api_url, self.model)

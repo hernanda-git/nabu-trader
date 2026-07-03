@@ -46,4 +46,11 @@ def load_config(path: str | Path | None = None) -> dict[str, Any]:
     binance_cfg["api_secret"] = env.get(api_secret_env, os.environ.get(api_secret_env, ""))
     cfg.setdefault("exchange", {})["binance"] = binance_cfg
 
+    # Overlay LLM API key from .env
+    llm_cfg = cfg.get("agent", {}).get("llm", {})
+    llm_key_env = llm_cfg.get("api_key_env", "OPENCODE_GO_API_KEY")
+    if not llm_cfg.get("api_key"):
+        llm_cfg["api_key"] = env.get(llm_key_env, os.environ.get(llm_key_env, ""))
+    cfg.setdefault("agent", {})["llm"] = llm_cfg
+
     return cfg
