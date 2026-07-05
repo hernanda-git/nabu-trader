@@ -59,20 +59,17 @@ CMD ["python", "src/main.py"]
 
 Fly.io mounts a persistent volume at `/data` so data survives restarts.
 
-### Checking the App
+### Check the App
 
 ```bash
-# View logs
-fly logs
-
-# SSH in
-fly ssh console
+# View logs from WSL (use Windows flyctl)
+powershell.exe -NoProfile -Command "& flyctl logs --app nabu-trader --no-tail"
 
 # Check machine status
-fly machine list
+powershell.exe -NoProfile -Command "& flyctl status --app nabu-trader"
 
-# Restart
-fly deploy
+# SSH into machine
+powershell.exe -NoProfile -Command "& flyctl ssh console --app nabu-trader"
 ```
 
 ### Updating
@@ -163,4 +160,4 @@ services:
 2. **Never commit `.env`** — secrets are set via `fly secrets set` or Docker env vars.
 3. **One machine per region** — Fly.io free tier includes 3 shared-cpu-1x machines. One is enough.
 4. **SQLite concurrency** — WAL mode handles single-writer fine. No need for PostgreSQL.
-5. **Health check** — built-in HTTP endpoint at port 9090 (`/health`).
+5. **Cross-platform auth** — This app uses Windows Fly CLI. From WSL, prefix commands with `powershell.exe -NoProfile -Command "& flyctl ..."`

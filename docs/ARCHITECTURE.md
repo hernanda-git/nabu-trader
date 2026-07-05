@@ -52,8 +52,8 @@ The nabu-trader is a **real-time Telegram signal listener → LLM-powered analys
 - Uses **Telethon** (MTProto, not Bot API) to monitor a Telegram channel
 - Default channel: `@YOUR_SIGNAL_CHANNEL` (configurable via `CHANNEL_USERNAME` env var)
 - Two event handlers: `NewMessage` + `MessageEdited` (for signal updates)
-- Deduplication via in-memory `_seen_messages` set + DB `processed_signals` table
-- Requires a user account session (not a bot) — authenticated via `auth.py`
+- Deduplication via DB `processed_signals` table + Gate1 `get_by_message_id()` check
+- Requires a user account session (not a bot) — authenticated via Telegram client
 
 ### 2. Orchestrator (`src/orchestrator.py`)
 The central pipeline coordinator. Wires all components together:

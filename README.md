@@ -10,6 +10,10 @@ Real-time Telegram channel monitor → LLM-powered signal analysis → **Automat
 
 ---
 
+> **🤖 AI Agent?** Read [`AGENTS.md`](AGENTS.md) first — it has everything you need to understand, maintain, and deploy this project.
+
+---
+
 ## What It Does
 
 ```
@@ -213,7 +217,10 @@ print(f'{decision.action} {decision.pair} conf={decision.confidence}')
 ## 🚀 Deploy & Health (Fly.io)
 
 > ⚠️ **Cross-platform auth**: This app is deployed via **Windows Fly CLI** (`YOUR_HOME\.fly\bin\flyctl.exe`).  
-> The WSL Fly token does **NOT** have access. From WSL, use `powershell.exe -NoProfile -Command "& flyctl ..."`
+> The WSL Fly token does **NOT** have access. From WSL, always use:
+> ```bash
+> powershell.exe -NoProfile -Command "& flyctl <command> --app nabu-trader"
+> ```
 
 ### Health Check
 
@@ -223,12 +230,12 @@ flyctl status --app nabu-trader
 flyctl logs --app nabu-trader --no-tail
 ```
 
-| Check | Command |
-|-------|---------|
-| Status & machine | `flyctl status --app nabu-trader` |
-| Live logs | `flyctl logs --app nabu-trader` |
-| SSH console | `flyctl ssh console --app nabu-trader` |
-| Secrets | `flyctl secrets list --app nabu-trader` |
+| Check | WSL Command |
+|-------|-------------|
+| Status & machine | `powershell.exe -NoProfile -Command "& flyctl status --app nabu-trader"` |
+| Live logs | `powershell.exe -NoProfile -Command "& flyctl logs --app nabu-trader"` |
+| SSH console | `powershell.exe -NoProfile -Command "& flyctl ssh console --app nabu-trader"` |
+| Secrets | `powershell.exe -NoProfile -Command "& flyctl secrets list --app nabu-trader"` |
 
 ### Quick Deploy
 
