@@ -12,6 +12,7 @@ import hashlib
 import hmac
 import logging
 import time
+from enum import Enum
 from typing import Any
 from urllib.parse import urlencode
 
@@ -20,6 +21,31 @@ import httpx
 from src.exchange.base import BalanceInfo, Exchange, OrderInfo
 
 log = logging.getLogger("exchange.binance")
+
+
+class BinanceErrorCategory(Enum):
+    AUTH = "auth"        # 401/403 — bad key, no permission
+    RATE_LIMIT = "rate"  # 429 — backoff needed
+    SERVER = "server"    # 5xx — Binance internal error
+    VALIDATION = "validation"  # 400 — bad request params
+    NETWORK = "network"  # timeout / connection
+    UNKNOWN = "unknown"
+
+
+def _categorize_error(status_code: int | None, error_text: str,
+                      exception: Exception | None) -> BinanceErrorCategory:
+    if status_code == 401 or status_code == 403:
+        return BinanceErrorCategory.AUTH
+    if status_code == 429:
+        return BinanceErrorCategory.RATE_LIMIT
+    if status_code and 500 <= status_code < 600:
+        return BinanceErrorCategory.SERVER
+    if status_code == 400:
+        return BinanceErrorCategory.VALIDATION
+    if isinstance(exception, (httpx.TimeoutException, httpx.ConnectError,
+                               httpx.RemoteProtocolError, httpx.TransportError)):
+        return BinanceErrorCategory.NETWORK
+    return BinanceErrorCategory.UNKNOWN
 
 # ─── Base URLs ────────────────────────────────────────────────────────────────
 SPOT_URLS = {
@@ -106,7 +132,13 @@ class BinanceExchange(Exchange):
         resp = await self._client.request(method, path, params=params,
                                     headers=self._headers())
         if resp.status_code != 200:
-            log.error("Binance API error %s: %s", resp.status_code, resp.text)
+            category = _categorize_error(resp.status_code, resp.text, None)
+            log.error("Binance API error %s [%s]: %s", resp.status_code, category.value, resp.text)
+            if category == BinanceErrorCategory.AUTH:
+                raise httpx.HTTPStatusError(
+                    f"Binance auth failed ({resp.status_code}): {resp.text}",
+                    request=resp.request, response=resp,
+                )
             resp.raise_for_status()
         return resp.json()
 
@@ -281,11 +313,22 @@ class BinanceExchange(Exchange):
                     if float(data.get("executedQty", 0)) > 0 else 0.0
                 ),
             )
-        except Exception as e:
-            log.error("Order failed: %s", e)
+        except httpx.HTTPStatusError as e:
+            status = e.response.status_code
+            category = _categorize_error(status, e.response.text, e)
+            log.error("Order failed [%s]: %s", category.value, e)
             return OrderInfo(
                 order_id="", symbol=symbol, side=side, type=order_type,
-                quantity=quantity, status="FAILED", error=str(e),
+                quantity=quantity, status="FAILED" if category != BinanceErrorCategory.NETWORK else "PENDING",
+                error=f"[{category.value}] {e}",
+            )
+        except Exception as e:
+            category = _categorize_error(None, "", e)
+            log.error("Order failed [%s]: %s", category.value, e)
+            return OrderInfo(
+                order_id="", symbol=symbol, side=side, type=order_type,
+                quantity=quantity, status="FAILED" if category != BinanceErrorCategory.NETWORK else "PENDING",
+                error=f"[{category.value}] {e}",
             )
 
     async def market_buy(self, symbol: str, quantity: float) -> OrderInfo:
