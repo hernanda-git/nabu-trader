@@ -33,7 +33,6 @@ class SignalListener:
 
         self.channel = channel
         self.client = TelegramClient(str(session_dir / "nabu"), api_id, api_hash)
-        self._seen_messages: set[int] = set()
 
     async def start(self):
         """Start listening."""
@@ -59,9 +58,6 @@ class SignalListener:
         @self.client.on(events.NewMessage(chats=self.channel))
         async def on_new_message(event):
             msg = event.message
-            if msg.id in self._seen_messages:
-                return
-            self._seen_messages.add(msg.id)
             text = msg.text or msg.message or ""
             log.info("New message #%s | %d chars", msg.id, len(text))
             await self.orchestrator.handle_signal(
