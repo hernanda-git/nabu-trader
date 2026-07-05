@@ -200,6 +200,7 @@ class AgentBrain:
 
         payload = {
             "model": self.model,
+            "response_format": {"type": "json_object"},
             "messages": [
                 {"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user", "content": prompt},
