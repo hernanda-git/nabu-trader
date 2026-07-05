@@ -20,6 +20,12 @@ class TelegramNotifier:
         self.bot_token = bot_token
         self.chat_id = chat_id
         self._base = f"https://api.telegram.org/bot{bot_token}"
+        self._client: httpx.AsyncClient | None = None
+
+    async def _get_client(self) -> httpx.AsyncClient:
+        if self._client is None:
+            self._client = httpx.AsyncClient(timeout=10)
+        return self._client
 
     async def send_message(self, text: str) -> bool:
         """Send a raw message to the configured chat."""
@@ -27,17 +33,17 @@ class TelegramNotifier:
             log.info("[No bot token] %s", text[:100])
             return False
 
-        async with httpx.AsyncClient(timeout=10) as client:
-            resp = await client.post(f"{self._base}/sendMessage", json={
-                "chat_id": self.chat_id,
-                "text": text,
-                "parse_mode": "Markdown",
-                "disable_web_page_preview": True,
-            })
-            if resp.status_code == 200:
-                return True
-            log.error("Telegram send failed: %s", resp.text)
-            return False
+        client = await self._get_client()
+        resp = await client.post(f"{self._base}/sendMessage", json={
+            "chat_id": self.chat_id,
+            "text": text,
+            "parse_mode": "Markdown",
+            "disable_web_page_preview": True,
+        })
+        if resp.status_code == 200:
+            return True
+        log.error("Telegram send failed: %s", resp.text)
+        return False
 
     async def notify_signal_received(self, signal: TradeSignal):
         """Notify that a signal was received from the channel."""
