@@ -10,7 +10,7 @@ from __future__ import annotations
 import logging
 import math
 from dataclasses import replace as dc_replace
-from datetime import datetime, timedelta
+from datetime import datetime, timezone, timedelta
 
 from src.domain.models import TradeDecision, TradeSignal
 from src.state.repositories import PositionRepository, SignalRepository
@@ -49,7 +49,7 @@ class SafetyGate1:
             last_trade = self.position_repo.get_open_by_pair(pair_key)
             if last_trade:
                 cooldown_min = self.config.get("risk", {}).get("min_cooldown_minutes", 5)
-                elapsed = (datetime.utcnow() - last_trade.entry_time).total_seconds() / 60
+                elapsed = (datetime.now(timezone.utc) - last_trade.entry_time).total_seconds() / 60
                 if elapsed < cooldown_min:
                     return False, f"Cooldown active for {signal.pair} ({elapsed:.1f}/{cooldown_min}m)"
 

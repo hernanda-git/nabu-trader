@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Literal
 
 
@@ -21,7 +21,7 @@ class TradeSignal:
     sl_price: float | None = None
     tp_prices: list[float] = field(default_factory=list)
     has_media: bool = False
-    timestamp: datetime = field(default_factory=lambda: datetime.utcnow())
+    timestamp: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 
 
 # ─── Decision ──────────────────────────────────────────────────────────────────
@@ -83,7 +83,7 @@ class Position:
     sl_price: float | None = None
     tp_prices: list[float] = field(default_factory=list)
     entry_order_id: str = ""
-    entry_time: datetime = field(default_factory=lambda: datetime.utcnow())
+    entry_time: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     exit_price: float | None = None
     exit_time: datetime | None = None
     status: Literal["OPEN", "CLOSED", "CANCELLED"] = "OPEN"
@@ -99,4 +99,4 @@ class Event:
     """Base event for the event bus."""
     event_type: str
     payload: dict
-    timestamp: datetime = field(default_factory=lambda: datetime.utcnow())
+    timestamp: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
