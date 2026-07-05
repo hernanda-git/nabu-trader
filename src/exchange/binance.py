@@ -67,7 +67,7 @@ class BinanceExchange(Exchange):
         urls = FUTURES_URLS if futures else SPOT_URLS
         base_url = urls["testnet"] if testnet else urls["mainnet"]
         self._base = base_url
-        self._client = httpx.Client(base_url=base_url, timeout=10)
+        self._client = httpx.AsyncClient(base_url=base_url, timeout=10)
 
         # Leverage is set per-symbol dynamically before each trade.
         # No startup leverage call needed.
@@ -95,7 +95,7 @@ class BinanceExchange(Exchange):
     def _headers(self) -> dict:
         return {"X-MBX-APIKEY": self.api_key}
 
-    def _signed_request(self, method: str, path: str,
+    async def _signed_request(self, method: str, path: str,
                         params: dict | None = None) -> dict:
         """Send a signed request to Binance API."""
         params = params or {}
@@ -103,17 +103,17 @@ class BinanceExchange(Exchange):
         params["recvWindow"] = self.recv_window
         params["signature"] = self._sign(params)
 
-        resp = self._client.request(method, path, params=params,
+        resp = await self._client.request(method, path, params=params,
                                     headers=self._headers())
         if resp.status_code != 200:
             log.error("Binance API error %s: %s", resp.status_code, resp.text)
             resp.raise_for_status()
         return resp.json()
 
-    def _public_request(self, method: str, path: str,
+    async def _public_request(self, method: str, path: str,
                         params: dict | None = None) -> dict:
         """Send a public request (no auth required)."""
-        resp = self._client.request(method, path, params=params)
+        resp = await self._client.request(method, path, params=params)
         resp.raise_for_status()
         return resp.json()
 
@@ -136,7 +136,7 @@ class BinanceExchange(Exchange):
                 "symbol": symbol.upper(),
                 "leverage": leverage,
             }
-            result = self._signed_request("POST", "/fapi/v1/leverage", params)
+            result = await self._signed_request("POST", "/fapi/v1/leverage", params)
             log.info("Leverage set: %s %dx", symbol, leverage)
         except Exception as e:
             log.warning("Failed to set leverage for %s: %s", symbol, e)
@@ -150,7 +150,7 @@ class BinanceExchange(Exchange):
                 "symbol": symbol.upper(),
                 "marginType": margin_type.upper(),
             }
-            self._signed_request("POST", "/fapi/v1/marginType", params)
+            await self._signed_request("POST", "/fapi/v1/marginType", params)
             log.info("Margin type: %s %s", symbol, margin_type.upper())
         except Exception as e:
             # Error -4008 means already set, ignore
@@ -170,7 +170,7 @@ class BinanceExchange(Exchange):
 
     async def _get_spot_balance(self) -> BalanceInfo:
         """Get spot account balance."""
-        data = self._signed_request("GET", "/api/v3/account")
+        data = await self._signed_request("GET", "/api/v3/account")
         assets = {}
         free_usdt = 0.0
         total_usdt = 0.0
@@ -187,7 +187,7 @@ class BinanceExchange(Exchange):
                 else:
                     try:
                         ticker_path = "/api/v3/ticker/price"
-                        ticker = self._public_request(
+                        ticker = await self._public_request(
                             "GET", ticker_path,
                             {"symbol": f"{asset}USDT"},
                         )
@@ -207,7 +207,7 @@ class BinanceExchange(Exchange):
 
         Returns available balance in USDT (wallet balance).
         """
-        data = self._signed_request("GET", "/fapi/v2/account")
+        data = await self._signed_request("GET", "/fapi/v2/account")
 
         assets = {}
         free_usdt = 0.0
@@ -239,7 +239,7 @@ class BinanceExchange(Exchange):
 
     # ─── Orders ────────────────────────────────────────────────────────────────
 
-    def _place_order(self, symbol: str, side: str, order_type: str,
+    async def _place_order(self, symbol: str, side: str, order_type: str,
                      quantity: float, price: float | None = None,
                      stop_price: float | None = None) -> OrderInfo:
         """Place an order on Binance (Spot or Futures).
@@ -266,7 +266,7 @@ class BinanceExchange(Exchange):
             params["timeInForce"] = "GTC"
 
         try:
-            data = self._signed_request("POST", self._order_path(), params)
+            data = await self._signed_request("POST", self._order_path(), params)
             return OrderInfo(
                 order_id=str(data.get("orderId", "")),
                 symbol=data.get("symbol", symbol),
@@ -289,24 +289,24 @@ class BinanceExchange(Exchange):
             )
 
     async def market_buy(self, symbol: str, quantity: float) -> OrderInfo:
-        return self._place_order(symbol, "BUY", "MARKET", quantity)
+        return await self._place_order(symbol, "BUY", "MARKET", quantity)
 
     async def market_sell(self, symbol: str, quantity: float) -> OrderInfo:
-        return self._place_order(symbol, "SELL", "MARKET", quantity)
+        return await self._place_order(symbol, "SELL", "MARKET", quantity)
 
     async def limit_buy(self, symbol: str, quantity: float, price: float) -> OrderInfo:
-        return self._place_order(symbol, "BUY", "LIMIT", quantity, price=price)
+        return await self._place_order(symbol, "BUY", "LIMIT", quantity, price=price)
 
     async def limit_sell(self, symbol: str, quantity: float, price: float) -> OrderInfo:
-        return self._place_order(symbol, "SELL", "LIMIT", quantity, price=price)
+        return await self._place_order(symbol, "SELL", "LIMIT", quantity, price=price)
 
     async def stop_loss(self, symbol: str, quantity: float, stop_price: float,
                         side: str = "SELL") -> OrderInfo:
-        return self._place_order(symbol, side, "STOP_LOSS", quantity, stop_price=stop_price)
+        return await self._place_order(symbol, side, "STOP_LOSS", quantity, stop_price=stop_price)
 
     async def cancel_order(self, symbol: str, order_id: str) -> bool:
         try:
-            self._signed_request("DELETE", self._order_path(), {
+            await self._signed_request("DELETE", self._order_path(), {
                 "symbol": symbol.upper(),
                 "orderId": order_id,
             })
@@ -316,7 +316,7 @@ class BinanceExchange(Exchange):
 
     async def get_order(self, symbol: str, order_id: str) -> OrderInfo:
         try:
-            data = self._signed_request("GET", self._order_path(), {
+            data = await self._signed_request("GET", self._order_path(), {
                 "symbol": symbol.upper(),
                 "orderId": order_id,
             })
@@ -343,7 +343,7 @@ class BinanceExchange(Exchange):
         if symbol:
             params["symbol"] = symbol.upper()
         try:
-            data = self._signed_request("GET", open_path, params)
+            data = await self._signed_request("GET", open_path, params)
             orders = []
             for o in data:
                 orders.append(OrderInfo(
