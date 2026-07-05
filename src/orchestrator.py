@@ -135,7 +135,23 @@ class TradeOrchestrator:
                 "action": decision.action, "pair": decision.pair,
             }))
 
-            # ── Step 5: Safety Gate 2 (post-LLM) ───────────────────────────
+            # ── Step 5: Early exit for SKIP (LLM declined or parse failure) ─
+            if decision.action != "ENTER":  # SKIP / CLOSE — no gate needed
+                self.signal_repo.mark_processed(message_id, raw_text)
+                result["action"] = decision.action.lower()
+                result["skipped"] = True
+                result["reason"] = decision.reason
+                if decision.action == "SKIP" and "Failed to parse" in decision.reason:
+                    await self.notifier.send_message(
+                        f"🤖 **LLM parse error, skipping** ({decision.reason})"
+                    )
+                elif decision.action == "SKIP":
+                    await self.notifier.send_message(
+                        f"⏭️ **Skipped** ({decision.reason})"
+                    )
+                return result
+
+            # ── Step 6: Safety Gate 2 (post-LLM) — only for ENTER decisions
             bal_for_gate = (balance or {}).get("USDT", None)
             allowed, reason, clamped_decision = self.gate2.check(decision, bal_for_gate)
             if not allowed:
@@ -149,14 +165,8 @@ class TradeOrchestrator:
                 return result
             decision = clamped_decision
 
-            # ── Step 6: Notify decision ────────────────────────────────────
+            # ── Step 7: Notify decision ────────────────────────────────────
             await self.notifier.notify_decision(signal, decision)
-
-            if decision.action != "ENTER":
-                self.signal_repo.mark_processed(message_id, raw_text)
-                result["action"] = decision.action.lower()
-                result["skipped"] = decision.action == "SKIP"
-                return result
 
             # ── Step 7: Execute via exchange ───────────────────────────────
             exec_result = await self.order_service.execute(signal_db_id, decision)

@@ -32,8 +32,8 @@ class SafetyGate1:
 
         If allowed=False, the signal should be skipped immediately (no LLM call).
         """
-        # 1. Idempotency — already processed?
-        if self.signal_repo.is_processed(signal.message_id, signal.raw_text):
+        # 1. Idempotency — message_id already seen (blocks edited duplicates)
+        if self.signal_repo.get_by_message_id(signal.message_id):
             return False, "Duplicate signal (already processed)"
 
         # 2. Pair whitelist
@@ -118,12 +118,10 @@ class SafetyGate2:
 
         # 4. Validate quantity > 0
         if decision.quantity <= 0:
-            log.info("Gate2 rejected: invalid quantity %.6f", decision.quantity)
-            return False, f"Invalid quantity {decision.quantity}", decision
+            log.info("Gate2 rejected: invalid quantity %.6f (reason: %s)", decision.quantity, decision.reason)
+            return False, f"{decision.reason}", decision
 
         # 5. Scale up position VALUE if below minimum notional
-        #    NOTE: this may exceed max_size — the exchange requires a minimum
-        #    position size and leverage keeps margin usage reasonable.
         scaled_reason = ""
         if decision.action == "ENTER" and price > 0:
             min_notional = risk.get("min_notional_usdt", 1.0)

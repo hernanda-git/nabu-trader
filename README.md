@@ -210,4 +210,35 @@ print(f'{decision.action} {decision.pair} conf={decision.confidence}')
 
 ---
 
+## 🚀 Deploy & Health (Fly.io)
+
+> ⚠️ **Cross-platform auth**: This app is deployed via **Windows Fly CLI** (`YOUR_HOME\.fly\bin\flyctl.exe`).  
+> The WSL Fly token does **NOT** have access. From WSL, use `powershell.exe -NoProfile -Command "& flyctl ..."`
+
+### Health Check
+
+```powershell
+# Windows PowerShell (or via WSL → powershell.exe bridge)
+flyctl status --app nabu-trader
+flyctl logs --app nabu-trader --no-tail
+```
+
+| Check | Command |
+|-------|---------|
+| Status & machine | `flyctl status --app nabu-trader` |
+| Live logs | `flyctl logs --app nabu-trader` |
+| SSH console | `flyctl ssh console --app nabu-trader` |
+| Secrets | `flyctl secrets list --app nabu-trader` |
+
+### Quick Deploy
+
+```powershell
+cd C:\"Working Folder\Research\nabu-trader"
+flyctl deploy --app nabu-trader
+```
+
+Full health reference: [`docs/Fly-health-check.md`](docs/Fly-health-check.md)
+
+---
+
 *Built with Hermes Agent + OpenCode Go. Binance USDⓈ-M Futures. Dynamic leverage. Hard safety gates.*

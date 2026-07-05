@@ -28,10 +28,12 @@ Rules:
 - If already in a position for that pair, output CLOSE.
 - If signal is unclear / low quality, output SKIP.
 
-Output ONLY this JSON:
-{"action":"ENTER|CLOSE|SKIP","pair":"BTCUSDT","direction":"LONG|SHORT","order_type":"MARKET|LIMIT","quantity":0.01,"entry_price":null,"sl_price":null,"tp_prices":[],"reason":"...","confidence":0.0}
+Output *only* a valid JSON object — no text before, no text after, no markdown fences.
 
-Be conservative. End with JSON."""
+**CRITICAL**: Your entire response must be ONLY the JSON object. No explanations, no reasoning, no markdown formatting — just the raw JSON starting with `{` and ending with `}`.
+
+Example:
+{"action":"ENTER","pair":"BTCUSDT","direction":"LONG","order_type":"LIMIT","quantity":0.01,"entry_price":65000,"sl_price":64000,"tp_prices":[67000],"reason":"Clear support bounce with good R/R","confidence":0.8}"""
 
 
 def _build_prompt(signal: TradeSignal, open_positions: list[dict],

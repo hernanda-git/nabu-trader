@@ -9,7 +9,7 @@ primary_region = 'sin'
 [build]
 
 [env]
-  CHANNEL_USERNAME = 'gishbanda'
+  CHANNEL_USERNAME = 'YOUR_SIGNAL_CHANNEL'
   DATA_ROOT = '/data'
   NOTIFY_CHAT_ID = 'YOUR_CHAT_ID'
   PYTHONUNBUFFERED = '1'
