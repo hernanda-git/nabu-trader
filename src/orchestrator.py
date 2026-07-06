@@ -109,27 +109,30 @@ class TradeOrchestrator:
                 result["skipped"] = True
                 result["reason"] = reason
                 self.signal_repo.mark_processed(message_id, raw_text)
-                await self.notifier.send_message(
-                    f"⏭️ **Skipped** ({reason})"
-                )
+                # Gate1 rejections are expected noise from unparseable/vague messages
+                # — do NOT notify Telegram for these to avoid spam
                 return result
 
-            # ── Step 3: Save signal ────────────────────────────────────────
-            signal_db_id = self.signal_repo.save(signal)
-
-            # ── Step 4: Fetch balance & Agent Brain (1 LLM call) ────────────
+            # ── Step 3: Collect context for skip notifications ─────────────────
             open_positions = [
                 {"pair": p.pair, "direction": p.direction,
                  "entry_price": p.entry_price, "quantity": p.quantity}
                 for p in self.position_repo.get_open_positions()
             ]
-            # Fetch real balance from exchange for dynamic sizing
+            pending_rows = []
+            if self.pending_signal_repo:
+                pending_rows = self.pending_signal_repo.get_pending()
             try:
                 balance_info = await self.exchange.get_balance()
                 balance = {"USDT": balance_info.free_usdt, "Total": balance_info.total_usdt}
             except Exception:
                 balance = None
                 log.warning("Failed to fetch balance, sizing blind")
+
+            # ── Step 3b: Save signal ────────────────────────────────────────
+            signal_db_id = self.signal_repo.save(signal)
+
+            # ── Step 4: Agent Brain (1 LLM call) ────────────────────────────
             decision = self.agent.decide(signal, open_positions, balance)
             log.info("Decision: %s %s (conf=%.2f, reason=%s)",
                      decision.action, decision.pair, decision.confidence, decision.reason)
@@ -211,13 +214,29 @@ class TradeOrchestrator:
                 result["action"] = decision.action.lower()
                 result["skipped"] = True
                 result["reason"] = decision.reason
-                if decision.action == "SKIP" and "Failed to parse" in decision.reason:
-                    await self.notifier.send_message(
-                        f"🤖 **LLM parse error, skipping** ({decision.reason})"
+                if decision.action == "SKIP":
+                    reason_text = decision.reason or "no reason provided"
+                    pos_lines = "\n".join(
+                        f"  • `{p['pair']}` {p['direction']} @ `{p['entry_price']}` × `{p['quantity']}`"
+                        for p in open_positions
+                    ) or "  (none)"
+                    pend_lines = "\n".join(
+                        f"  • `{ps.pair}` {ps.direction} `{ps.condition_type}` `{ps.trigger_price}` ({ps.timeframe})"
+                        for ps in pending_rows
+                    ) or "  (none)"
+                    bal_str = f"`{balance['USDT']:.2f}` USDT" if balance else "(unavailable)"
+                    skip_text = (
+                        f"⏭️ **Skipped**\n"
+                        f"Message: {raw_text[:300]}\n"
+                        f"Reason to Skip: {reason_text}\n"
+                        f"Current Positions:\n{pos_lines}\n"
+                        f"Current Pendings:\n{pend_lines}\n"
+                        f"Balance: {bal_str}"
                     )
-                elif decision.action == "SKIP":
+                    await self.notifier.send_message(skip_text)
+                elif decision.action == "CLOSE":
                     await self.notifier.send_message(
-                        f"⏭️ **Skipped** ({decision.reason})"
+                        f"🔴 **Close signal received** `{signal.pair}` — processing"
                     )
                 return result
 
@@ -229,9 +248,24 @@ class TradeOrchestrator:
                 result["action"] = "rejected"
                 result["reason"] = reason
                 self.signal_repo.mark_processed(message_id, raw_text)
-                await self.notifier.send_message(
-                    f"🚫 **Trade rejected** ({reason})"
+                pos_lines = "\n".join(
+                    f"  • `{p['pair']}` {p['direction']} @ `{p['entry_price']}` × `{p['quantity']}`"
+                    for p in open_positions
+                ) or "  (none)"
+                pend_lines = "\n".join(
+                    f"  • `{ps.pair}` {ps.direction} `{ps.condition_type}` `{ps.trigger_price}` ({ps.timeframe})"
+                    for ps in pending_rows
+                ) or "  (none)"
+                bal_str = f"`{balance['USDT']:.2f}` USDT" if balance else "(unavailable)"
+                reject_text = (
+                    f"🚫 **Trade Rejected**\n"
+                    f"Message: {raw_text[:300]}\n"
+                    f"Reason: {reason}\n"
+                    f"Current Positions:\n{pos_lines}\n"
+                    f"Current Pendings:\n{pend_lines}\n"
+                    f"Balance: {bal_str}"
                 )
+                await self.notifier.send_message(reject_text)
                 return result
             decision = clamped_decision
 
