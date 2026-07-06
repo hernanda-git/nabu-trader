@@ -94,6 +94,8 @@ class SignalListener:
                 await self._handle_positions(event)
             elif cmd == "/balance":
                 await self._handle_balance(event)
+            elif cmd == "/help":
+                await self._handle_help(event)
 
         await self.client.run_until_disconnected()
 
@@ -159,3 +161,14 @@ class SignalListener:
         except Exception as e:
             log.exception("Failed to fetch balance")
             await event.reply(f"❌ **Error fetching balance:** `{e}`")
+
+    async def _handle_help(self, event):
+        """Handle /help — list available commands."""
+        await event.reply(
+            "📋 **Available Commands**\n\n"
+            "  /balance    — Show futures account balance\n"
+            "  /positions  — Show all open futures positions\n"
+            "  /help       — Show this message\n\n"
+            "The bot automatically processes signals from @YOUR_SIGNAL_CHANNEL and\n"
+            "executes trades on Binance Futures when conditions are met."
+        )

@@ -138,6 +138,8 @@ async def main():
 
     if bot_token:
         log.info("Telegram notifier ready (chat_id=%s)", notify_chat_id)
+        await notifier.notify_startup()
+        await notifier.set_commands()
     else:
         log.warning("TELEGRAM_BOT_TOKEN not set — notifications disabled")
 

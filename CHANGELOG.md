@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+### Added
+- **Startup notification**: On every deployment/restart, the bot sends `🟢 LearnerNoLearner — Online` to Telegram so you know a new version is running.
+- **Bot command menu**: Registered `/balance`, `/positions`, and `/help` via Telegram Bot API `setMyCommands` — these appear when you type `/` in your chat.
+- **/help command**: In-chat fallback listing all available commands.
+
 ### Fixed
 - **BONK klines 400 loop**: `get_klines_close` in `exchange/binance.py` now catches `httpx.HTTPStatusError` and returns `None` (instead of warning) for 400 responses — preventing symbol/timeframe unavailability from spamming logs.
 - **Pending signal infinite retry**: `PositionManager._evaluate_condition` now calls `pending_signal_repo.mark_expired()` when klines are unavailable, transitioning the signal from `PENDING → EXPIRED` on first failure instead of retrying forever.

@@ -100,6 +100,32 @@ class TelegramNotifier:
         else:
             text = (
                 f"❌ **Order failed**\n"
-                f"Error: {result.error}"
+                f"Error: `{result.error}`"
             )
         await self.send_message(text)
+
+    async def notify_startup(self):
+        """Notify that a new version has been deployed and is running."""
+        text = (
+            "🟢 **LearnerNoLearner — Online**\n\n"
+            "New version deployed and running.\n\n"
+            "Type / to see available commands."
+        )
+        await self.send_message(text)
+
+    async def set_commands(self):
+        """Register bot slash commands so they appear in Telegram's command menu."""
+        if not self.bot_token:
+            return
+        client = await self._get_client()
+        await client.post(
+            f"{self._base}/setMyCommands",
+            json={
+                "commands": [
+                    {"command": "balance", "description": "Show futures account balance"},
+                    {"command": "positions", "description": "Show all open futures positions"},
+                    {"command": "help", "description": "Show available commands"},
+                ],
+                "scope": {"type": "default"},
+            },
+        )
