@@ -16,10 +16,10 @@ risk:
   risk_per_trade_percent: 10.0
   daily_loss_limit_percent: 30.0
   min_cooldown_minutes: 5
-  min_notional_usdt: 1.0
+  min_notional_usdt: 5.0       # Binance minimum — scaled up to avoid rejection
   max_position_hold_hours: 48
-  max_leverage: 20             # ceiling for dynamic leverage calc
-  margin_usage_pct: 50         # use at most 50% of balance as margin per trade
+  max_leverage: 50             # ceiling for dynamic leverage (low-balance friendly)
+  margin_usage_pct: 80         # use up to 80% of balance as margin per trade
 
 agent:
   confidence_threshold: 0.0

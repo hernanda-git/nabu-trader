@@ -57,16 +57,23 @@ class SafetyGate1:
 
 
 class SafetyGate2:
-    """Post-LLM gate: hard limits + dynamic leverage.
+    """Post-LLM gate: hard limits + dynamic leverage + risk-based sizing.
 
-    The LLM suggests quantity in asset units (e.g. 0.01 BTC).
-    This gate:
-      - Converts to position value (qty * entry_price) for USDT comparisons
-      - Clamps position value to max_position_size_usdt
-      - Scales up position if below min_notional (user accepts higher risk)
-      - Calculates optimal futures leverage per trade
+    The LLM suggests SL/TP/direction; this gate computes the OPTIMAL quantity
+    so that max loss (if SL hit) ≤ risk_per_trade_percent of balance.
 
-    All USDT comparisons use position_value = quantity * entry_price.
+    Sizing formula:
+      max_loss     = balance × risk_per_trade_percent / 100
+      sl_distance  = |entry - SL| / entry
+      pos_value    = max_loss / sl_distance   ← can be much larger than balance
+      leverage     = ceil(pos_value / (balance × margin_usage_pct / 100))
+      quantity     = pos_value / entry
+
+    This allows positions large enough to pass Binance min notional (~$5)
+    while capping actual risk to 10% of balance. Leverage handles the gap
+    between position value and available margin.
+
+    Fallback (no SL or no balance): clamp to max_position_size_usdt.
     """
 
     def __init__(self, config: dict, position_repo: PositionRepository):
@@ -80,8 +87,18 @@ class SafetyGate2:
         clamped to balance * risk_per_trade_percent / 100, and
         leverage is calculated automatically.
         """
+        # ── RISK-BASED POSITION SIZING ──────────────────────────────────
+        # Goal: max loss if SL hit ≤ risk_per_trade_percent of balance.
+        # This lets position VALUE exceed balance (via leverage) while
+        # keeping actual dollar risk capped at ~10% of balance.
+        # ──────────────────────────────────────────────────────────────
         risk = self.config.get("risk", {})
         price = decision.entry_price or 0.0
+        risk_pct = risk.get("risk_per_trade_percent", 10)
+        max_size_hard = risk.get("max_position_size_usdt", 100)
+        max_lev = risk.get("max_leverage", 20)
+        margin_usage = risk.get("margin_usage_pct", 50)
+        min_notional = risk.get("min_notional_usdt", 1.0)
 
         # 1. Max concurrent positions
         max_concurrent = risk.get("max_concurrent_positions", 2)
@@ -89,26 +106,7 @@ class SafetyGate2:
         if open_count >= max_concurrent:
             return False, f"Max concurrent positions reached ({open_count}/{max_concurrent})", decision
 
-        # 2. Clamp position VALUE (in USDT) — compare position_value against max_size
-        max_size = risk.get("max_position_size_usdt", 100)
-        if balance_usdt is not None and balance_usdt > 0:
-            risk_pct = risk.get("risk_per_trade_percent", 10)
-            dynamic_max = balance_usdt * risk_pct / 100
-            max_size = min(max_size, dynamic_max)
-
-        clamped_reason = ""
-        if price > 0 and decision.quantity * price > max_size:
-            clamped_qty = max_size / price
-            decision = dc_replace(
-                decision,
-                quantity=clamped_qty,
-                reason=f"{decision.reason} (position ${decision.quantity * price:.2f} → ${max_size:.2f})",
-            )
-            clamped_reason = f"Position clamped to ${max_size:.2f}"
-            log.info("Gate2: clamped position $%.2f → $%.2f (qty %.6f)",
-                     decision.quantity * price, max_size, clamped_qty)
-
-        # 3. Daily loss limit
+        # 2. Daily loss limit
         daily_loss_pct = risk.get("daily_loss_limit_percent", 10)
         if daily_loss_pct > 0:
             daily_pnl = self.position_repo.get_daily_pnl()
@@ -116,53 +114,72 @@ class SafetyGate2:
             if daily_pnl < 0 and abs(daily_pnl) / bal * 100 >= daily_loss_pct:
                 return False, f"Daily loss limit reached ({abs(daily_pnl):.2f} USDT)", decision
 
+        # 3. Compute quantity from risk (SL distance) + leverage
+        sizing_reason = ""
+        can_risk_size = (
+            balance_usdt is not None
+            and balance_usdt > 0
+            and price > 0
+            and decision.sl_price is not None
+            and decision.sl_price > 0
+        )
+
+        if can_risk_size:
+            # Risk-based: size so SL hit = max_loss
+            max_loss = balance_usdt * risk_pct / 100  # e.g. $8.11 * 10% = $0.81
+            sl_distance_pct = abs(price - (decision.sl_price or 0.0)) / price
+            if sl_distance_pct > 0:
+                # position value that makes loss = max_loss when SL hit
+                # NO position-value cap — leverage handles the margin gap.
+                # User constraint: "no need to clamp position size, just
+                # make the loss no more than 10%, adjust leverage and portion"
+                pos_value = max_loss / sl_distance_pct
+                # ensure meets min notional (scale up, user accepts higher risk)
+                if pos_value < min_notional:
+                    pos_value = min_notional
+                    sizing_reason += f"scaled to min notional ${min_notional:.2f}; "
+                quantity = pos_value / price
+                # leverage: enough so margin ≤ margin_usage% of balance
+                margin_target = balance_usdt * margin_usage / 100
+                if margin_target > 0 and pos_value > 0:
+                    leverage = max(1, math.ceil(pos_value / margin_target))
+                else:
+                    leverage = 1
+                leverage = min(leverage, max_lev)
+                decision = dc_replace(
+                    decision, quantity=quantity, leverage=leverage,
+                    reason=(decision.reason or "") + f" [risk-sized: max_loss=${max_loss:.2f}, "
+                            f"sl_dist={sl_distance_pct*100:.2f}%, pos_val=${pos_value:.2f}, lev={leverage}x]"
+                )
+                log.info("Gate2 risk-sizing: balance=$%.2f max_loss=$%.2f sl_dist=%.2f%% "
+                         "pos_val=$%.2f qty=%.6f lev=%dx",
+                         balance_usdt, max_loss, sl_distance_pct * 100,
+                         pos_value, quantity, leverage)
+            else:
+                # SL == entry → zero distance, can't risk-size; fallback
+                decision = dc_replace(decision, quantity=max_size_hard / price if price > 0 else 0)
+                sizing_reason += "SL==entry (zero distance), fallback sizing; "
+        else:
+            # Fallback: no SL or no balance → clamp to max_size_hard
+            fallback_qty = (max_size_hard / price) if price > 0 else 0
+            decision = dc_replace(decision, quantity=fallback_qty)
+            sizing_reason += "no SL/balance, fallback to max_position_size; "
+            # Still calculate leverage if we have balance
+            if balance_usdt is not None and balance_usdt > 0 and price > 0:
+                pos_value = decision.quantity * price
+                margin_target = balance_usdt * margin_usage / 100
+                if margin_target > 0 and pos_value > 0:
+                    leverage = max(1, math.ceil(pos_value / margin_target))
+                    leverage = min(leverage, max_lev)
+                    decision = dc_replace(decision, leverage=leverage)
+                    sizing_reason += f"lev={leverage}x; "
+
         # 4. Validate quantity > 0
         if decision.quantity <= 0:
             log.info("Gate2 rejected: invalid quantity %.6f (reason: %s)", decision.quantity, decision.reason)
             return False, f"{decision.reason}", decision
 
-        # 5. Scale up position VALUE if below minimum notional
-        scaled_reason = ""
-        if decision.action == "ENTER" and price > 0:
-            min_notional = risk.get("min_notional_usdt", 1.0)
-            current_pos_value = decision.quantity * price
-            if current_pos_value < min_notional:
-                target_value = min_notional
-                scaled_qty = target_value / price
-                decision = dc_replace(
-                    decision,
-                    quantity=scaled_qty,
-                    reason=f"{decision.reason} (scaled to meet min_notional: ${current_pos_value:.2f} → ${target_value:.2f})",
-                )
-                scaled_reason = f"Position scaled ${current_pos_value:.2f} → ${target_value:.2f} (min notional)"
-                log.info("Gate2: scaled position $%.2f → $%.2f for min_notional",
-                         current_pos_value, target_value)
-
-        # 6. Calculate dynamic leverage for ENTER decisions
-        lev_reason = ""
-        if decision.action == "ENTER" and balance_usdt is not None and balance_usdt > 0:
-            max_lev = risk.get("max_leverage", 20)
-            margin_usage = risk.get("margin_usage_pct", 50)
-            pos_value = (decision.quantity or 0) * (decision.entry_price or 1.0)
-
-            # Target: use at most margin_usage% of balance as margin for this trade
-            margin_target = balance_usdt * margin_usage / 100
-            if margin_target > 0 and pos_value > 0:
-                # Minimum leverage so margin_needed <= margin_target
-                leverage = max(1, math.ceil(pos_value / margin_target))
-                # Cap at max allowed
-                leverage = min(leverage, max_lev)
-            else:
-                leverage = 1
-
-            leverage = max(1, leverage)
-
-            decision = dc_replace(decision, leverage=leverage)
-            lev_reason = f"leverage: {leverage}x"
-            log.info("Gate2: leverage %dx (pos=$%.2f, balance=$%.2f, margin_target=$%.2f)",
-                     leverage, pos_value, balance_usdt, margin_target)
-
-        # 7. Validate SL is on correct side of entry price
+        # 5. Validate SL is on correct side of entry price
         if decision.sl_price and decision.entry_price and decision.action == "ENTER":
             if decision.direction == "LONG" and decision.sl_price >= decision.entry_price:
                 return False, f"SL {decision.sl_price} >= entry {decision.entry_price} for LONG", decision
@@ -170,7 +187,6 @@ class SafetyGate2:
                 return False, f"SL {decision.sl_price} <= entry {decision.entry_price} for SHORT", decision
 
         # Compose final reason
-        parts = [p for p in (clamped_reason, scaled_reason, lev_reason) if p]
-        gate_reason = "; ".join(parts) if parts else ""
+        gate_reason = sizing_reason.rstrip("; ") if sizing_reason else ""
 
         return True, gate_reason, decision
