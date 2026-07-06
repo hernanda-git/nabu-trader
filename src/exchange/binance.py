@@ -416,6 +416,13 @@ class BinanceExchange(Exchange):
             if len(resp) == 1:
                 return float(resp[0][4])
             return None
+        except httpx.HTTPStatusError as e:
+            # 400 Bad Request — symbol/interval unavailable on this exchange tier
+            if e.response.status_code == 400:
+                log.debug("Klines unavailable for %s %s (HTTP 400)", symbol, interval)
+            else:
+                log.warning("Failed to fetch klines for %s %s: %s", symbol, interval, e)
+            return None
         except Exception as e:
             log.warning("Failed to fetch klines for %s %s: %s", symbol, interval, e)
             return None

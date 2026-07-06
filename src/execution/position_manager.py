@@ -205,7 +205,9 @@ class PositionManager:
         # Fetch the latest closed candle close price
         close_price = await self.exchange.get_klines_close(symbol, ps.timeframe)
         if close_price is None:
-            log.debug("No close price for %s %s — skipping check", symbol, ps.timeframe)
+            log.warning("Klines unavailable for %s %s — expiring pending signal", symbol, ps.timeframe)
+            if self.pending_signal_repo:
+                self.pending_signal_repo.mark_expired(ps.id)
             return
 
         triggered = False
