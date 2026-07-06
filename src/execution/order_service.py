@@ -49,6 +49,9 @@ class OrderService:
         if decision.action == "CLOSE":
             return await self._close_position(decision_id, decision)
 
+        if decision.action == "MODIFY":
+            return await self._modify_position(decision_id, decision)
+
         return await self._enter_position(decision_id, decision)
 
     async def _enter_position(self, decision_id: int,
@@ -183,4 +186,72 @@ class OrderService:
             filled_quantity=position.quantity,
             avg_price=order.avg_price or 0,
             status="CLOSED",
+        )
+
+    async def _modify_position(self, decision_id: int,
+                               decision: TradeDecision) -> ExecutionResult:
+        """Modify an existing position — cancel old SL/TP, place new ones."""
+        symbol = decision.pair.replace("#", "").replace("$", "").upper()
+        if not symbol.endswith("USDT"):
+            symbol += "USDT"
+
+        position = self.position_repo.get_open_by_pair(symbol)
+        if not position:
+            return ExecutionResult(
+                success=False, status="NOT_FOUND",
+                error=f"No open position for {symbol} to modify",
+            )
+
+        log.info("Modifying %s %s: cancel old SL/TP → place new", position.direction, symbol)
+
+        # Cancel existing SL/TP orders
+        cancelled = await self.exchange.cancel_all_orders(symbol)
+        log.info("Cancelled %d existing orders for %s", cancelled, symbol)
+
+        # Place new SL order if specified
+        sl_placed = False
+        if decision.sl_price and decision.sl_price > 0:
+            sl_side = "SELL" if position.direction == "LONG" else "BUY"
+            sl_order = await self.exchange.stop_loss(
+                symbol, position.quantity, decision.sl_price, sl_side
+            )
+            if sl_order.order_id:
+                sl_placed = True
+                log.info("New SL placed: %s @ %s", symbol, decision.sl_price)
+            else:
+                log.warning("New SL NOT placed for %s @ %s", symbol, decision.sl_price)
+
+        # Place new TP orders if specified
+        tp_placed = 0
+        for i, tp_price in enumerate(decision.tp_prices[:3]):
+            if tp_price <= 0:
+                continue
+            tp_side = "SELL" if position.direction == "LONG" else "BUY"
+            if tp_side == "SELL":
+                tp_order = await self.exchange.limit_sell(symbol, position.quantity, tp_price)
+            else:
+                tp_order = await self.exchange.limit_buy(symbol, position.quantity, tp_price)
+            if tp_order.order_id:
+                tp_placed += 1
+                log.info("New TP%d placed: %s @ %s", i + 1, symbol, tp_price)
+
+        # Update position SL/TP in database
+        self.position_repo.update_sl_tp(
+            position.id,
+            sl_price=decision.sl_price,
+            tp_prices=decision.tp_prices,
+        )
+
+        pnl_after = decision.sl_price or position.sl_price or 0
+        log.info("Position modified: %s %s SL→%.6f TP→%s",
+                 position.direction, symbol, pnl_after, decision.tp_prices)
+
+        return ExecutionResult(
+            success=True,
+            symbol=symbol,
+            status="MODIFIED",
+            error=(
+                f"SL placed={'✅' if sl_placed else '❌'}, "
+                f"TP placed={tp_placed}/{len(decision.tp_prices) if decision.tp_prices else 0}"
+            ),
         )

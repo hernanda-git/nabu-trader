@@ -135,7 +135,31 @@ class TradeOrchestrator:
                 "action": decision.action, "pair": decision.pair,
             }))
 
-            # ── Step 5: Early exit for SKIP (LLM declined or parse failure) ─
+            # ── Step 5: Handle MODIFY action (position management) ────────
+            if decision.action == "MODIFY":
+                log.info("Decision: MODIFY %s (SL=%s, TP=%s, reason=%s)",
+                         decision.pair, decision.sl_price, decision.tp_prices, decision.reason)
+                exec_result = await self.order_service.execute(signal_db_id, decision)
+                result["action"] = "modified"
+                result["reason"] = decision.reason
+                if exec_result.success:
+                    await self.notifier.send_message(
+                        f"🔄 **Position modified — {decision.pair}**\n"
+                        f"📋 {exec_result.error}\n"
+                        f"📝 {decision.reason[:200]}"
+                    )
+                else:
+                    await self.notifier.send_message(
+                        f"❌ **Modification failed — {decision.pair}**\n"
+                        f"Error: {exec_result.error}"
+                    )
+                self.signal_repo.mark_processed(message_id, raw_text)
+                self.event_bus.emit(Event("PositionModified", {
+                    "pair": decision.pair, "reason": decision.reason,
+                }))
+                return result
+
+            # ── Step 6: Early exit for SKIP / CLOSE (LLM declined) ─────
             if decision.action != "ENTER":  # SKIP / CLOSE — no gate needed
                 self.signal_repo.mark_processed(message_id, raw_text)
                 result["action"] = decision.action.lower()

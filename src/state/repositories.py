@@ -175,6 +175,21 @@ class PositionRepository:
         )
         self.conn.commit()
 
+    def update_sl_tp(self, position_id: int, sl_price: float | None = None,
+                     tp_prices: list[float] | None = None) -> None:
+        """Update SL and/or TP for an open position."""
+        if sl_price is not None:
+            self.conn.execute(
+                "UPDATE positions SET sl_price = ? WHERE id = ?",
+                (sl_price, position_id),
+            )
+        if tp_prices is not None:
+            self.conn.execute(
+                "UPDATE positions SET tp_prices = ? WHERE id = ?",
+                (json_dumps(tp_prices), position_id),
+            )
+        self.conn.commit()
+
     def get_daily_pnl(self) -> float:
         """Sum P&L of positions closed today."""
         cursor = self.conn.execute(

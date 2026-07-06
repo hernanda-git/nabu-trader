@@ -92,6 +92,16 @@ class Exchange(ABC):
     async def get_open_orders(self, symbol: str | None = None) -> list[OrderInfo]:
         """Get all open orders."""
 
+    async def cancel_all_orders(self, symbol: str) -> int:
+        """Cancel all open orders for a symbol. Returns number of orders cancelled.
+        Override for exchange-specific bulk cancellation. Default: cancel one by one."""
+        orders = await self.get_open_orders(symbol)
+        count = 0
+        for o in orders:
+            if await self.cancel_order(symbol, o.order_id):
+                count += 1
+        return count
+
     # ─── Optional: futures leverage (no-op on spot/paper exchanges) ────────
 
     async def set_symbol_leverage(self, symbol: str, leverage: int):

@@ -27,6 +27,7 @@ Rules:
 - The system uses futures — leverage is applied automatically to meet minimum trade sizes and free up margin. Just calculate quantity correctly; the safety gate handles leverage.
 - If already in a position for that pair, output CLOSE.
 - If signal is unclear / low quality, output SKIP.
+- If the message is position management advice (e.g. "move SL to entry", "trail SL", "take partial profit") for an existing open position, output MODIFY with the pair, the new sl_price, and/or new tp_prices as specified. The MODIFY action cancels existing SL/TP orders and places new ones.
 
 Output *only* a valid JSON object — no text before, no text after, no markdown fences.
 
@@ -88,7 +89,7 @@ def _parse_decision(raw: str) -> TradeDecision | None:
     except json.JSONDecodeError:
         # Try 3: Find JSON-like object anywhere in the text
         import re as _re
-        match = _re.search(r'\{[\s\S]*?"action"\s*:\s*"(ENTER|CLOSE|SKIP)"[\s\S]*?\}', text)
+        match = _re.search(r'\{[\s\S]*?"action"\s*:\s*"(ENTER|CLOSE|SKIP|MODIFY)"[\s\S]*?\}', text)
         if match:
             try:
                 data = json.loads(match.group(0))
@@ -100,7 +101,7 @@ def _parse_decision(raw: str) -> TradeDecision | None:
             return None
 
     action = data.get("action", "SKIP")
-    if action not in ("ENTER", "CLOSE", "SKIP"):
+    if action not in ("ENTER", "CLOSE", "SKIP", "MODIFY"):
         action = "SKIP"
 
     direction = data.get("direction", "LONG")

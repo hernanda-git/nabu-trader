@@ -29,7 +29,7 @@ class TradeSignal:
 @dataclass(frozen=True)
 class TradeDecision:
     """Structured output from the agent brain (LLM)."""
-    action: Literal["ENTER", "CLOSE", "SKIP"]
+    action: Literal["ENTER", "CLOSE", "SKIP", "MODIFY"]
     pair: str
     direction: Literal["LONG", "SHORT"]
     order_type: Literal["MARKET", "LIMIT"] = "MARKET"
