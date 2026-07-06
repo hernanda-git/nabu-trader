@@ -142,7 +142,9 @@ async def main():
         log.warning("TELEGRAM_BOT_TOKEN not set — notifications disabled")
 
     # ── Position Manager ─────────────────────────────────────────────────
-    position_manager = PositionManager(exchange, cfg, position_repo, pending_signal_repo=pending_signal_repo, notifier=notifier)
+    position_manager = PositionManager(exchange, cfg, position_repo,
+                                       pending_signal_repo=pending_signal_repo,
+                                       notifier=notifier)
 
     # ── Orchestrator ─────────────────────────────────────────────────────
     orchestrator = TradeOrchestrator(
@@ -162,6 +164,9 @@ async def main():
         event_bus=event_bus,
         pending_signal_repo=pending_signal_repo,
     )
+
+    # Wire orchestrator to position manager for trigger auto-entry
+    position_manager._orchestrator = orchestrator
 
     # ── Listener ─────────────────────────────────────────────────────────
     listener = SignalListener(orchestrator, cfg, exchange=exchange)

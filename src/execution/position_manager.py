@@ -24,12 +24,14 @@ class PositionManager:
     def __init__(self, exchange: Exchange, config: dict,
                  position_repo: PositionRepository,
                  pending_signal_repo: PendingSignalRepository | None = None,
-                 notifier=None):  # TelegramNotifier, lazy import to avoid circular
+                 notifier=None,  # TelegramNotifier
+                 orchestrator=None):  # TradeOrchestrator — for trigger execution
         self.exchange = exchange
         self.config = config
         self.position_repo = position_repo
         self.pending_signal_repo = pending_signal_repo
         self._notifier = notifier
+        self._orchestrator = orchestrator
         self._running = False
         self._task: asyncio.Task | None = None
         self._interval = config.get("monitoring", {}).get("check_interval_seconds", 10)
@@ -226,7 +228,7 @@ class PositionManager:
         # Mark as triggered immediately to prevent duplicate execution
         self.pending_signal_repo.mark_triggered(ps.id)
 
-        # Send notification
+        # Send initial trigger notification
         if self._notifier:
             try:
                 emoji = "🟢" if ps.direction == "LONG" else "🔴"
@@ -237,7 +239,20 @@ class PositionManager:
                     f"   ├ Current close: `{close_price:.8f}`\n"
                     f"   ├ Timeframe: `{ps.timeframe}`\n"
                     f"   └ Original: `{ps.raw_text[:150]}`\n\n"
-                    f"⚡ **Signal ready for manual entry or auto-trade!**"
+                    f"⏳ **Auto-entering via LLM...**"
                 )
             except Exception:
                 log.exception("Failed to notify condition trigger")
+
+        # Auto-enter via orchestrator (LLM decides sizing, SL, TP; Gate2 clamps to 10%)
+        if self._orchestrator:
+            try:
+                await self._orchestrator.execute_trigger(ps)
+            except Exception as e:
+                log.exception("Auto-entry failed for %s", symbol)
+                if self._notifier:
+                    await self._notifier.send_message(
+                        f"❌ **Auto-entry failed** — {symbol}\n`{e}`"
+                    )
+        else:
+            log.warning("No orchestrator available — trigger not executed for %s", symbol)

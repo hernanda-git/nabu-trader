@@ -274,3 +274,117 @@ class TradeOrchestrator:
             result["error"] = str(e)
 
         return result
+
+    # ── Trigger execution ──────────────────────────────────────────────────
+
+    async def execute_trigger(self, pending: PendingSignal) -> dict:
+        """Execute a trade when a conditional signal triggers.
+
+        Calls the LLM with trigger context, applies Gate2 sizing (10% risk),
+        places the order via exchange, and notifies the result.
+        """
+        result: dict = {
+            "pair": pending.pair,
+            "direction": pending.direction,
+            "action": "unknown",
+            "error": None,
+        }
+        try:
+            # Build a synthetic signal for the agent
+            signal = TradeSignal(
+                message_id=pending.message_id or 0,
+                channel="condition_trigger",
+                raw_text=pending.raw_text,
+                pair=pending.pair,
+                direction=pending.direction,
+                entry_price=pending.trigger_price,
+            )
+
+            # Fetch balance + open positions for LLM context
+            open_positions = [
+                {"pair": p.pair, "direction": p.direction,
+                 "entry_price": p.entry_price, "quantity": p.quantity}
+                for p in self.position_repo.get_open_positions()
+            ]
+            try:
+                balance_info = await self.exchange.get_balance()
+                balance = {"USDT": balance_info.free_usdt, "Total": balance_info.total_usdt}
+            except Exception:
+                balance = None
+                log.warning("Failed to fetch balance for trigger entry")
+
+            # LLM decides (ENTER / SKIP / CLOSE with sizing)
+            decision = self.agent.decide(signal, open_positions, balance)
+            log.info("Trigger decision: %s %s (conf=%.2f, reason=%s)",
+                     decision.action, decision.pair, decision.confidence, decision.reason)
+
+            if decision.action != "ENTER":
+                await self.notifier.send_message(
+                    f"⏭️ **Trigger skipped** — {decision.pair}\n"
+                    f"LLM declined entry: {decision.reason}"
+                )
+                result["action"] = "skipped"
+                result["reason"] = decision.reason
+                return result
+
+            # Gate2 enforces 10% risk / position sizing
+            bal_for_gate = (balance or {}).get("USDT", None)
+            allowed, reason, clamped_decision = self.gate2.check(decision, bal_for_gate)
+            if not allowed:
+                log.info("Gate2 rejected trigger: %s", reason)
+                await self.notifier.send_message(
+                    f"🚫 **Trigger rejected by safety gate**\n{reason}"
+                )
+                result["action"] = "rejected"
+                result["reason"] = reason
+                return result
+            decision = clamped_decision
+
+            # Save a synthetic signal + decision to DB
+            signal_db_id = self.signal_repo.save(signal)
+
+            # Execute
+            exec_result = await self.order_service.execute(signal_db_id, decision)
+            result["execution"] = {
+                "success": exec_result.success,
+                "order_id": exec_result.order_id,
+                "symbol": exec_result.symbol,
+                "price": exec_result.avg_price,
+                "quantity": exec_result.filled_quantity,
+            }
+
+            if exec_result.success:
+                result["action"] = "entered"
+                await self.notifier.send_message(
+                    f"🚀 **Trigger ENTERED — {exec_result.symbol}**\n"
+                    f"   ├ Direction: `{decision.direction}`\n"
+                    f"   ├ Entry: `{exec_result.avg_price:.8f}`\n"
+                    f"   ├ Qty: `{exec_result.filled_quantity:.6f}`\n"
+                    f"   ├ SL: `{decision.sl_price}`\n"
+                    f"   ├ TP: `{decision.tp_prices}`\n"
+                    f"   ├ Leverage: `{decision.leverage}x`\n"
+                    f"   └ Reason: {decision.reason[:200]}"
+                )
+                self.event_bus.emit(Event("TriggerEntered", {
+                    "pair": exec_result.symbol, "price": exec_result.avg_price,
+                    "quantity": exec_result.filled_quantity,
+                }))
+            else:
+                result["action"] = "failed"
+                result["error"] = exec_result.error
+                await self.notifier.send_message(
+                    f"❌ **Trigger entry failed** — {exec_result.symbol}\n"
+                    f"Error: {exec_result.error}"
+                )
+
+            self.event_repo.save_event("TriggerExecuted", result)
+
+        except Exception as e:
+            log.exception("Trigger execution error for %s", pending.pair)
+            result["action"] = "error"
+            result["error"] = str(e)
+            await self.notifier.send_message(
+                f"❌ **Trigger execution error** — {pending.pair}\n`{e}`"
+            )
+
+        return result
