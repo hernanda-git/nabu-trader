@@ -8,7 +8,7 @@ import random
 from datetime import datetime
 from typing import Any
 
-from src.exchange.base import BalanceInfo, Exchange, OrderInfo
+from src.exchange.base import BalanceInfo, Exchange, OrderInfo, PositionInfo
 
 log = logging.getLogger("exchange.paper")
 
@@ -40,6 +40,24 @@ class PaperExchange(Exchange):
     async def get_balance(self) -> BalanceInfo:
         """Return simulated balance."""
         return self._balance
+
+    async def get_positions(self) -> list[PositionInfo]:
+        """Return simulated open positions."""
+        result = []
+        for pair, pos in self._positions.items():
+            direction = pos.get("direction", "LONG")
+            size = pos.get("quantity", 0)
+            entry = pos.get("entry_price", 0)
+            mark = pos.get("mark_price", entry)
+            result.append(PositionInfo(
+                symbol=pair,
+                direction=direction,
+                size=size,
+                entry_price=entry,
+                mark_price=mark,
+                notional=size * mark,
+            ))
+        return result
 
     async def _simulate_price(self, symbol: str, side: str) -> float:
         """Simulate a market price for a symbol."""

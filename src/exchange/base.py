@@ -28,6 +28,21 @@ class OrderInfo:
     error: str | None = None
 
 
+@dataclass
+class PositionInfo:
+    """An open futures position from the exchange."""
+    symbol: str = ""
+    direction: str = ""  # LONG or SHORT
+    size: float = 0.0    # position size in base asset
+    entry_price: float = 0.0
+    mark_price: float = 0.0
+    liquidation_price: float = 0.0
+    unrealized_pnl: float = 0.0
+    margin: float = 0.0
+    leverage: int = 1
+    notional: float = 0.0  # position value in USDT
+
+
 class Exchange(ABC):
     """Abstract base for all exchange adapters."""
 
@@ -39,6 +54,10 @@ class Exchange(ABC):
     @abstractmethod
     async def get_balance(self) -> BalanceInfo:
         """Get account balance."""
+
+    @abstractmethod
+    async def get_positions(self) -> list[PositionInfo]:
+        """Get all open futures positions."""
 
     @abstractmethod
     async def market_buy(self, symbol: str, quantity: float) -> OrderInfo:

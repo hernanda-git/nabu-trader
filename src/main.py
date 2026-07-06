@@ -161,7 +161,7 @@ async def main():
     )
 
     # ── Listener ─────────────────────────────────────────────────────────
-    listener = SignalListener(orchestrator, cfg)
+    listener = SignalListener(orchestrator, cfg, exchange=exchange)
 
     # ── Start ────────────────────────────────────────────────────────────
     try:

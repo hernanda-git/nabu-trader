@@ -18,7 +18,7 @@ from urllib.parse import urlencode
 
 import httpx
 
-from src.exchange.base import BalanceInfo, Exchange, OrderInfo
+from src.exchange.base import BalanceInfo, Exchange, OrderInfo, PositionInfo
 
 log = logging.getLogger("exchange.binance")
 
@@ -268,6 +268,35 @@ class BinanceExchange(Exchange):
             free_usdt=round(free_usdt, 2),
             assets=assets,
         )
+
+    async def get_positions(self) -> list[PositionInfo]:
+        """Get all open futures positions from the exchange."""
+        if not self.futures:
+            return []
+        try:
+            data = await self._signed_request("GET", "/fapi/v2/account")
+            positions: list[PositionInfo] = []
+            for pos in data.get("positions", []):
+                size = float(pos.get("positionAmt", 0))
+                if size == 0:
+                    continue
+                direction = "LONG" if size > 0 else "SHORT"
+                positions.append(PositionInfo(
+                    symbol=pos.get("symbol", ""),
+                    direction=direction,
+                    size=abs(size),
+                    entry_price=float(pos.get("entryPrice", 0)),
+                    mark_price=float(pos.get("markPrice", 0)),
+                    liquidation_price=float(pos.get("liquidationPrice", 0)),
+                    unrealized_pnl=float(pos.get("unrealizedProfit", 0)),
+                    margin=float(pos.get("isolatedWallet", 0)),
+                    leverage=int(float(pos.get("leverage", 1))),
+                    notional=abs(float(pos.get("notional", 0))),
+                ))
+            return positions
+        except Exception as e:
+            log.error("Failed to fetch positions: %s", e)
+            return []
 
     # ─── Orders ────────────────────────────────────────────────────────────────
 
