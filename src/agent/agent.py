@@ -150,21 +150,54 @@ class AgentBrain:
         self.auto_trade = agent_cfg.get("auto_trade", False)
         self.confidence_threshold = agent_cfg.get("confidence_threshold", 0.6)
 
+    def _build_reinforce_prompt(self, original_prompt: str,
+                                 bad_response: str) -> str:
+        """Build a reinforced prompt telling the LLM its last response was invalid."""
+        return (
+            "Your previous response was NOT valid JSON. "
+            "You MUST return ONLY a valid JSON object this time.\n\n"
+            "## CRITICAL — READ CAREFULLY\n"
+            "- Your ENTIRE response must be a single JSON object.\n"
+            "- Start with `{` and end with `}`.\n"
+            "- DO NOT include any text before or after the JSON.\n"
+            "- DO NOT use markdown code fences (```).\n"
+            "- DO NOT include explanations, reasoning, or analysis.\n"
+            "- ONLY the raw JSON object.\n\n"
+            "## Your invalid response (DO NOT repeat this)\n"
+            f"{bad_response[:500]}\n\n"
+            "## The original request\n"
+            f"{original_prompt}\n\n"
+            "## Decision\n"
+            "Output ONLY the JSON object now:"
+        )
+
     def decide(self, signal: TradeSignal,
                open_positions: list[dict] | None = None,
                balance: dict[str, Any] | None = None) -> TradeDecision:
         """Analyze a signal and return a trade decision."""
         prompt = _build_prompt(signal, open_positions or [], balance)
 
+        # Try 1: normal call
+        response = ""
         try:
             response = self._call_llm(prompt)
             decision = _parse_decision(response)
         except Exception as e:
             log.error("LLM call failed: %s", e)
-            return TradeDecision(
-                action="SKIP", pair=signal.pair or "", direction="LONG",
-                reason=f"LLM error: {e}", confidence=0.0,
-            )
+            decision = None
+
+        # Try 2: retry with reinforced prompt if first attempt failed to parse
+        if decision is None:
+            log.warning("LLM response invalid, retrying with reinforced prompt...")
+            reinforce = self._build_reinforce_prompt(prompt, response or "(no response)")
+            try:
+                response2 = self._call_llm(reinforce)
+                decision = _parse_decision(response2)
+                if decision is not None:
+                    log.info("Retry succeeded — LLM returned valid JSON on second attempt")
+            except Exception as e:
+                log.error("LLM retry also failed: %s", e)
+                decision = None
 
         if decision is None:
             return TradeDecision(
