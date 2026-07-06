@@ -29,7 +29,7 @@ class TradeSignal:
 @dataclass(frozen=True)
 class TradeDecision:
     """Structured output from the agent brain (LLM)."""
-    action: Literal["ENTER", "CLOSE", "SKIP", "MODIFY"]
+    action: Literal["ENTER", "CLOSE", "SKIP", "MODIFY", "CONDITIONAL"]
     pair: str
     direction: Literal["LONG", "SHORT"]
     order_type: Literal["MARKET", "LIMIT"] = "MARKET"
@@ -100,3 +100,21 @@ class Event:
     event_type: str
     payload: dict
     timestamp: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+
+
+# ─── Pending Conditional Signal ──────────────────────────────────────────────
+
+@dataclass
+class PendingSignal:
+    """A conditional signal waiting for price conditions to trigger."""
+    id: int = 0
+    pair: str = ""
+    direction: Literal["LONG", "SHORT"] = "LONG"
+    condition_type: Literal["close_above", "close_below"] = "close_above"
+    trigger_price: float = 0.0
+    timeframe: str = "4h"
+    raw_text: str = ""
+    message_id: int = 0
+    status: Literal["PENDING", "TRIGGERED", "EXPIRED", "CANCELLED"] = "PENDING"
+    created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    triggered_at: datetime | None = None

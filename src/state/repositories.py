@@ -9,7 +9,7 @@ import sqlite3
 from datetime import datetime, timezone
 from typing import Any
 
-from src.domain.models import Position, TradeDecision, TradeSignal
+from src.domain.models import PendingSignal, Position, TradeDecision, TradeSignal
 from src.state.database import get_connection, json_dumps, json_loads
 
 log = logging.getLogger("state.repositories")
@@ -225,3 +225,47 @@ class EventRepository:
             (event_type, json_dumps(payload)),
         )
         self.conn.commit()
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Pending Signal Repository
+# ═════════════════════════════════════════════════════════════════════════════
+
+
+class PendingSignalRepository:
+    def __init__(self, conn: sqlite3.Connection | None = None):
+        self.conn = conn or get_connection()
+
+    def save(self, signal: PendingSignal) -> int:
+        self.conn.execute(
+            """INSERT INTO pending_signals
+               (pair, direction, condition_type, trigger_price, timeframe, raw_text, message_id)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (signal.pair, signal.direction, signal.condition_type,
+             signal.trigger_price, signal.timeframe, signal.raw_text, signal.message_id),
+        )
+        self.conn.commit()
+        return self.conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+
+    def get_pending(self) -> list[PendingSignal]:
+        cursor = self.conn.execute(
+            "SELECT * FROM pending_signals WHERE status = 'PENDING' ORDER BY created_at ASC"
+        )
+        return [self._row_to_signal(row) for row in cursor.fetchall()]
+
+    def mark_triggered(self, signal_id: int) -> None:
+        self.conn.execute(
+            "UPDATE pending_signals SET status = 'TRIGGERED', triggered_at = CURRENT_TIMESTAMP WHERE id = ?",
+            (signal_id,),
+        )
+        self.conn.commit()
+
+    def mark_expired(self, signal_id: int) -> None:
+        self.conn.execute(
+            "UPDATE pending_signals SET status = 'EXPIRED' WHERE id = ?",
+            (signal_id,),
+        )
+        self.conn.commit()
+
+    def _row_to_signal(self, row: sqlite3.Row) -> PendingSignal:
+        return PendingSignal(**dict(row))

@@ -117,6 +117,21 @@ CREATE TABLE IF NOT EXISTS daily_stats (
     max_drawdown REAL DEFAULT 0.0,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
+
+-- Pending conditional signals awaiting price triggers
+CREATE TABLE IF NOT EXISTS pending_signals (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    pair TEXT NOT NULL,
+    direction TEXT NOT NULL,
+    condition_type TEXT NOT NULL DEFAULT 'close_above',
+    trigger_price REAL NOT NULL,
+    timeframe TEXT NOT NULL DEFAULT '4h',
+    raw_text TEXT NOT NULL,
+    message_id INTEGER,
+    status TEXT NOT NULL DEFAULT 'PENDING',
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    triggered_at TIMESTAMP
+);
 """
 
 

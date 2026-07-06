@@ -46,6 +46,7 @@ from src.state.repositories import (
     DecisionRepository,
     EventRepository,
     OrderRepository,
+    PendingSignalRepository,
     PositionRepository,
     SignalRepository,
 )
@@ -93,6 +94,7 @@ async def main():
     order_repo = OrderRepository(conn)
     position_repo = PositionRepository(conn)
     event_repo = EventRepository(conn)
+    pending_signal_repo = PendingSignalRepository(conn)
 
     # ── Event Bus ────────────────────────────────────────────────────────
     event_bus = EventBus()
@@ -131,9 +133,6 @@ async def main():
     # ── Order Service ────────────────────────────────────────────────────
     order_service = OrderService(exchange, cfg, signal_repo, decision_repo, order_repo, position_repo)
 
-    # ── Position Manager ─────────────────────────────────────────────────
-    position_manager = PositionManager(exchange, cfg, position_repo)
-
     # ── Notifier ─────────────────────────────────────────────────────────
     notifier = TelegramNotifier(bot_token=bot_token, chat_id=notify_chat_id)
 
@@ -141,6 +140,9 @@ async def main():
         log.info("Telegram notifier ready (chat_id=%s)", notify_chat_id)
     else:
         log.warning("TELEGRAM_BOT_TOKEN not set — notifications disabled")
+
+    # ── Position Manager ─────────────────────────────────────────────────
+    position_manager = PositionManager(exchange, cfg, position_repo, pending_signal_repo=pending_signal_repo, notifier=notifier)
 
     # ── Orchestrator ─────────────────────────────────────────────────────
     orchestrator = TradeOrchestrator(
@@ -158,6 +160,7 @@ async def main():
         position_repo=position_repo,
         event_repo=event_repo,
         event_bus=event_bus,
+        pending_signal_repo=pending_signal_repo,
     )
 
     # ── Listener ─────────────────────────────────────────────────────────

@@ -6,9 +6,9 @@ import asyncio
 import logging
 from typing import Any
 
-from src.domain.models import Position
+from src.domain.models import PendingSignal, Position
 from src.exchange.base import Exchange
-from src.state.repositories import PositionRepository
+from src.state.repositories import PendingSignalRepository, PositionRepository
 
 log = logging.getLogger("execution.position_manager")
 
@@ -22,10 +22,14 @@ class PositionManager:
     """
 
     def __init__(self, exchange: Exchange, config: dict,
-                 position_repo: PositionRepository):
+                 position_repo: PositionRepository,
+                 pending_signal_repo: PendingSignalRepository | None = None,
+                 notifier=None):  # TelegramNotifier, lazy import to avoid circular
         self.exchange = exchange
         self.config = config
         self.position_repo = position_repo
+        self.pending_signal_repo = pending_signal_repo
+        self._notifier = notifier
         self._running = False
         self._task: asyncio.Task | None = None
         self._interval = config.get("monitoring", {}).get("check_interval_seconds", 10)
@@ -50,10 +54,11 @@ class PositionManager:
         log.info("Position manager stopped")
 
     async def _monitor_loop(self):
-        """Background loop that checks open positions."""
+        """Background loop that checks open positions and pending conditions."""
         while self._running:
             try:
                 await self._check_positions()
+                await self._check_pending_conditions()
             except Exception:
                 log.exception("Error in position monitor loop")
             await asyncio.sleep(self._interval)
@@ -167,3 +172,72 @@ class PositionManager:
         except Exception as e:
             log.error("Failed to close %s: %s", pos.pair, e)
             return False
+
+    # ── Pending conditions ──────────────────────────────────────────────────
+
+    async def _check_pending_conditions(self):
+        """Check all pending conditional signals and trigger if price condition met."""
+        if not self.pending_signal_repo:
+            return
+        try:
+            pending = self.pending_signal_repo.get_pending()
+        except Exception:
+            log.exception("Failed to load pending signals")
+            return
+        if not pending:
+            return
+
+        for ps in pending:
+            try:
+                await self._evaluate_condition(ps)
+            except Exception:
+                log.exception("Error evaluating condition for %s", ps.pair)
+
+    async def _evaluate_condition(self, ps: PendingSignal):
+        """Evaluate a single pending condition against current market price."""
+        # Build the symbol
+        symbol = ps.pair.replace("#", "").replace("$", "").upper()
+        if not symbol.endswith("USDT"):
+            symbol += "USDT"
+
+        # Fetch the latest closed candle close price
+        close_price = await self.exchange.get_klines_close(symbol, ps.timeframe)
+        if close_price is None:
+            log.debug("No close price for %s %s — skipping check", symbol, ps.timeframe)
+            return
+
+        triggered = False
+        if ps.condition_type == "close_above" and close_price > ps.trigger_price:
+            triggered = True
+        elif ps.condition_type == "close_below" and close_price < ps.trigger_price:
+            triggered = True
+
+        if not triggered:
+            log.debug("Condition %s %s: current=%.8f trigger=%s%.8f (not met)",
+                      symbol, ps.condition_type, close_price,
+                      ">" if ps.condition_type == "close_above" else "<",
+                      ps.trigger_price)
+            return
+
+        # ── Condition met! Execute the trade ──
+        log.info("Condition TRIGGERED: %s %s current=%.8f trigger=%.8f on %s",
+                 symbol, ps.direction, close_price, ps.trigger_price, ps.timeframe)
+
+        # Mark as triggered immediately to prevent duplicate execution
+        self.pending_signal_repo.mark_triggered(ps.id)
+
+        # Send notification
+        if self._notifier:
+            try:
+                emoji = "🟢" if ps.direction == "LONG" else "🔴"
+                await self._notifier.send_message(
+                    f"🚀 **Condition triggered — {symbol}**\n"
+                    f"   ├ Direction: `{ps.direction}`\n"
+                    f"   ├ Condition: `{ps.condition_type}` at `{ps.trigger_price:.8f}`\n"
+                    f"   ├ Current close: `{close_price:.8f}`\n"
+                    f"   ├ Timeframe: `{ps.timeframe}`\n"
+                    f"   └ Original: `{ps.raw_text[:150]}`\n\n"
+                    f"⚡ **Signal ready for manual entry or auto-trade!**"
+                )
+            except Exception:
+                log.exception("Failed to notify condition trigger")

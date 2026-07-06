@@ -92,6 +92,11 @@ class Exchange(ABC):
     async def get_open_orders(self, symbol: str | None = None) -> list[OrderInfo]:
         """Get all open orders."""
 
+    async def get_klines_close(self, symbol: str, interval: str = "4h") -> float | None:
+        """Get the latest closed candle close price.
+        Returns None if not supported by this exchange."""
+        return None
+
     async def cancel_all_orders(self, symbol: str) -> int:
         """Cancel all open orders for a symbol. Returns number of orders cancelled.
         Override for exchange-specific bulk cancellation. Default: cancel one by one."""

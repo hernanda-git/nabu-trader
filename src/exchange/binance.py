@@ -298,6 +298,32 @@ class BinanceExchange(Exchange):
             log.error("Failed to fetch positions: %s", e)
             return []
 
+    # ─── Price / Candles ──────────────────────────────────────────────────
+
+    async def get_klines_close(self, symbol: str, interval: str = "4h") -> float | None:
+        """Get the latest closed candle close price from Binance Futures klines.
+
+        Args:
+            symbol: Trading pair (e.g. 'BONKUSDT')
+            interval: Candle interval (1m, 5m, 15m, 30m, 1h, 2h, 4h, 6h, 12h, 1d, etc.)
+
+        Returns:
+            Close price of the most recently closed candle, or None on error.
+        """
+        try:
+            params = {"symbol": symbol.upper(), "interval": interval, "limit": 2}
+            resp = await self._public_request("GET", "/fapi/v1/klines" if self.futures else "/api/v3/klines", params)
+            # Last item is the forming candle; second-to-last is the last closed one
+            if len(resp) >= 2:
+                close_price = float(resp[-2][4])  # index 4 = close
+                return close_price
+            if len(resp) == 1:
+                return float(resp[0][4])
+            return None
+        except Exception as e:
+            log.warning("Failed to fetch klines for %s %s: %s", symbol, interval, e)
+            return None
+
     # ─── Orders ────────────────────────────────────────────────────────────────
 
     async def _place_order(self, symbol: str, side: str, order_type: str,

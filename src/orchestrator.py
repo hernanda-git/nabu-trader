@@ -21,7 +21,7 @@ from typing import Any
 from src.agent.agent import AgentBrain
 from src.agent.gate import SafetyGate1, SafetyGate2
 from src.agent.parser import parse_signal
-from src.domain.models import Event, ExecutionResult, TradeDecision, TradeSignal
+from src.domain.models import Event, ExecutionResult, PendingSignal, TradeDecision, TradeSignal
 from src.events.bus import EventBus
 from src.exchange.base import Exchange
 from src.execution.order_service import OrderService
@@ -31,6 +31,7 @@ from src.state.repositories import (
     DecisionRepository,
     EventRepository,
     OrderRepository,
+    PendingSignalRepository,
     PositionRepository,
     SignalRepository,
 )
@@ -57,6 +58,7 @@ class TradeOrchestrator:
         position_repo: PositionRepository,
         event_repo: EventRepository,
         event_bus: EventBus,
+        pending_signal_repo: PendingSignalRepository | None = None,
     ):
         self.config = config
         self.exchange = exchange
@@ -72,6 +74,7 @@ class TradeOrchestrator:
         self.position_repo = position_repo
         self.event_repo = event_repo
         self.event_bus = event_bus
+        self.pending_signal_repo = pending_signal_repo
         self._dry_run = not config.get("agent", {}).get("auto_trade", False)
 
     async def handle_signal(self, message_id: int, channel: str,
@@ -156,6 +159,49 @@ class TradeOrchestrator:
                 self.signal_repo.mark_processed(message_id, raw_text)
                 self.event_bus.emit(Event("PositionModified", {
                     "pair": decision.pair, "reason": decision.reason,
+                }))
+                return result
+
+            # ── Step 5b: Handle CONDITIONAL action (setup/alert signals) ──
+            if decision.action == "CONDITIONAL":
+                log.info("Decision: CONDITIONAL %s (trigger=%.6f, reason=%s)",
+                         decision.pair, decision.entry_price or 0, decision.reason)
+                # Determine condition type from direction + reason
+                cond_type = "close_above" if decision.direction == "LONG" else "close_below"
+                # Extract timeframe from reason or default to 4h
+                import re as _re
+                tf_match = _re.search(r'(\d+)([mhdw])', decision.reason or "")
+                timeframe = f"{tf_match.group(1)}{tf_match.group(2)}" if tf_match else "4h"
+                if self.pending_signal_repo:
+                    pending = PendingSignal(
+                        pair=decision.pair,
+                        direction=decision.direction,
+                        condition_type=cond_type,
+                        trigger_price=decision.entry_price or 0,
+                        timeframe=timeframe,
+                        raw_text=raw_text,
+                        message_id=message_id,
+                    )
+                    db_id = self.pending_signal_repo.save(pending)
+                    log.info("Pending signal saved (id=%d): %s %s @ %.6f on %s close",
+                             db_id, decision.direction, decision.pair, pending.trigger_price, timeframe)
+                    await self.notifier.send_message(
+                        f"⏳ **Conditional signal saved — {decision.pair}**\n"
+                        f"   ├ Direction: `{decision.direction}`\n"
+                        f"   ├ Condition: `{cond_type}` `{pending.trigger_price:.8f}`\n"
+                        f"   ├ Timeframe: `{timeframe}`\n"
+                        f"   └ Reason: {decision.reason[:200]}"
+                    )
+                else:
+                    log.warning("PendingSignalRepository not available — cannot save conditional signal")
+                    await self.notifier.send_message(
+                        f"⚠️ **Conditional signal detected but not saved**\n"
+                        f"PendingSignalRepository not configured.\n"
+                        f"`{decision.pair}` `{decision.direction}` trigger={decision.entry_price}"
+                    )
+                self.signal_repo.mark_processed(message_id, raw_text)
+                self.event_bus.emit(Event("ConditionalSignalSaved", {
+                    "pair": decision.pair, "trigger": decision.entry_price, "timeframe": timeframe,
                 }))
                 return result
 
