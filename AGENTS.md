@@ -143,6 +143,35 @@ src/
 | **LLM returns text instead of JSON** | "LLM parse error, skipping" | Fixed: `response_format: json_object` in API call |
 | **Position manager stale orders** | SL/TP not placed | Check exchange balance + open orders manually |
 | **Binance 401 on order** | "code:-2015 Invalid API-key" | API key missing Futures permission — check Binance API mgmt |
+| **1000x symbol mapping** | `-1121 Invalid symbol` for BONKUSDT, PEPEUSDT, SHIBUSDT | Mapped automatically via `SYMBOL_MAP` in `binance.py` |
+| **1000x quantity precision** | `-1111 Precision over maximum` | Auto-rounded to integer via fallback in `_place_order()` |
+| **1000x STOP orders blocked** | `-4120 Use Algo Order API` | Binance limitation — SL handled by position manager monitoring (1m klines polling) |
+| **1000x LIMIT SL fills instantly** | Position closed immediately | LIMIT SELL below market is NOT a valid SL — use position manager monitoring |
+| **Windows/WSL out of sync** | Deploy pushes old code | Always `cp` changed files to Windows path before `flyctl deploy` |
+
+### ⚠️ 1000x Contract Compatibility
+
+Binance lists some low-price tokens (BONK, PEPE, SHIB, FLOKI) as "1000x" contracts on USDⓈ-M Futures. These have critical differences:
+
+**Current mapped symbols:**
+| User Symbol | Exchange Symbol | Base Asset |
+|---|---|---|
+| `BONKUSDT` | `1000BONKUSDT` | 1000BONK (price/tick in BONK scale) |
+| `PEPEUSDT` | `1000PEPEUSDT` | 1000PEPE |
+| `SHIBUSDT` | `1000SHIBUSDT` | 1000SHIB |
+| `FLOKIUSDT` | `1000FLOKIUSDT` | 1000FLOKI |
+
+**Semantics:**
+- **Price:** Quoted in base asset price (e.g., 1 BONK = 0.0044 USDT). NOT multiplied by 1000.
+- **Quantity:** In base asset tokens (7309 BONK). NOT divided by 1000.
+- **LOT_SIZE:** `stepSize=1`, `minQty=1` (integer quantity only)
+- **MIN_NOTIONAL:** `5 USDT` (enforced as `qty × price`)
+
+**SL/TP Limitations (API):**
+- `LIMIT SELL` ABOVE market → ✅ Take Profit (resting order, waits for price rise)
+- `LIMIT SELL` BELOW market → ❌ NOT a valid Stop Loss (fills instantly as cheap ask)
+- `STOP_MARKET`, `STOP`, `TAKE_PROFIT_MARKET`, `TAKE_PROFIT` → ❌ ALL blocked (-4120)
+- **SL must be handled via position-manager monitoring** (polls 1m klines, closes via MARKET SELL on breach)
 
 ---
 
@@ -162,14 +191,22 @@ powershell.exe -NoProfile -Command "& flyctl logs --app nabu-trader --no-tail"
 ```
 
 ### 2. Deploy New Code
-```bash
-# Commit + deploy in one flow:
-git add -A
-git commit -m "fix|feat(scope): description"
-git push origin feature/auto-trade
 
-# Deploy to Fly.io (MUST use Windows flyctl):
-powershell.exe -NoProfile -Command "cd C:\"Working Folder\Research\nabu-trader\"; & flyctl deploy --app nabu-trader"
+**⚠️ CRITICAL: Windows/WSL sync.** The Fly.io deploy MUST run from the Windows path. Always:
+1. Make changes in WSL (`/home/it26/learnornoearner-listener/`)
+2. Copy changed files to Windows: `cp src/exchange/binance.py "/mnt/c/Working Folder/Research/learnornoearner-listener/src/exchange/binance.py"`
+3. Commit and deploy from Windows:
+
+```bash
+# From WSL — copy changed files
+cp -u /home/it26/nabu-trader/src/*.py "/mnt/c/Working Folder/Research/learnornoearner-listener/src/"
+# Or for specific file:
+cp /home/it26/nabu-trader/src/exchange/binance.py "/mnt/c/Working Folder/Research/learnornoearner-listener/src/exchange/binance.py"
+
+# Then deploy from Windows
+cd /mnt/c/"Working Folder/Research/learnornoearner-listener"
+git add -A && git commit -m "description"
+powershell.exe -NoProfile -Command "flyctl deploy --app learnornoearner-listener --detach --image-label v<NEXT>"
 ```
 
 ### 3. Add a New Signal Format

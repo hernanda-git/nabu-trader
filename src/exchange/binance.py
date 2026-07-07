@@ -69,6 +69,61 @@ FUTURES_ORDER_TYPES = {
     "TAKE_PROFIT_LIMIT": "TAKE_PROFIT",
 }
 
+# ─── Symbol mapping: user-facing pair → actual Binance Futures symbol + price multiplier ──
+# Some low-price tokens are listed as 1000x contracts on Binance Futures
+# (e.g., 1 contract = 1000 BONK tokens)
+# CRITICAL: The price on 1000x contracts is QUOTED in the base asset price (e.g. BONK = 0.0044),
+# NOT multiplied by 1000. The lot multiplier handles the conversion internally.
+# QUANTITY is also in base asset tokens (e.g. BONK), not divided by 1000.
+# The "1000" in the symbol name only affects the CONTRACT MULTIPLIER for PnL calc.
+# (symbol, price_multiplier, qty_divisor)
+SYMBOL_MAP: dict[str, tuple[str, float, float]] = {
+    # (actual_symbol, price_multiplier, qty_divisor)
+    # Both price and quantity remain in base asset (BONK) terms
+    "BONKUSDT":   ("1000BONKUSDT", 1.0, 1.0),
+    "PEPEUSDT":   ("1000PEPEUSDT", 1.0, 1.0),
+    "SHIBUSDT":   ("1000SHIBUSDT", 1.0, 1.0),
+    "FLOKIUSDT":  ("1000FLOKIUSDT", 1.0, 1.0),
+    "1000BONK":   ("1000BONKUSDT", 1.0, 1.0),
+    "1000PEPE":   ("1000PEPEUSDT", 1.0, 1.0),
+    "1000SHIB":   ("1000SHIBUSDT", 1.0, 1.0),
+    "1000FLOKI":  ("1000FLOKIUSDT", 1.0, 1.0),
+}
+
+def _resolve_futures_symbol(raw_symbol: str) -> tuple[str, float, float]:
+    """Resolve a user-facing symbol to the actual Binance Futures symbol + multipliers.
+
+    1000x contracts (e.g. 1000BONKUSDT, 1000PEPEUSDT):
+    - The "1000" prefix is a CONTRACT MULTIPLIER for PnL calculation only.
+    - PRICE is quoted in base asset terms (e.g. BONK = 0.0044), NOT multiplied by 1000.
+    - QUANTITY is also in base asset tokens (e.g. BONK), NOT divided by 1000.
+    - STOP/STOP_MARKET orders are BLOCKED by Binance for 1000x contracts (error -4120).
+    - LIMIT orders (TP) work fine on 1000x contracts.
+
+    Args:
+        raw_symbol: User-facing symbol (e.g. 'BONKUSDT', 'PEPEUSDT', '1000BONKUSDT')
+
+    Returns:
+        (resolved_symbol, price_multiplier, qty_divisor)
+        - price_multiplier: always 1.0 (price stays in base asset terms)
+        - qty_divisor: always 1.0 (quantity stays in base asset terms)
+          The "1000" is ONLY the contract multiplier for PnL — no price/qty conversion needed.
+    """
+    s = raw_symbol.upper().strip()
+    if s in SYMBOL_MAP:
+        mapped, pm, qd = SYMBOL_MAP[s]
+        return mapped, pm, qd
+    # Try without 'USDT' suffix for coin-only names
+    base = s.replace("USDT", "").replace("USD", "")
+    if base in SYMBOL_MAP:
+        mapped, pm, qd = SYMBOL_MAP[base]
+        return mapped, pm, qd
+    # Check if already 1000x prefixed
+    if s.startswith("1000"):
+        return s, 1.0, 1.0
+    # Default: use the symbol as-is
+    return s, 1.0, 1.0
+
 
 class BinanceExchange(Exchange):
     """Binance API adapter for Spot or USDⓈ-M Futures.
@@ -91,9 +146,6 @@ class BinanceExchange(Exchange):
         self.futures = futures
         self.leverage = max(1, leverage)  # fallback default
         self.recv_window = min(int(recv_window), 60000)
-        # Cache symbol rules: stepSize/minQty/maxQty/valid
-        self._filters: dict[str, dict] = {}
-        self._invalid_symbols: dict[str, datetime] = {}
 
         urls = FUTURES_URLS if futures else SPOT_URLS
         base_url = urls["testnet"] if testnet else urls["mainnet"]
@@ -175,14 +227,15 @@ class BinanceExchange(Exchange):
         """Set leverage for a specific symbol before trading."""
         if not self.futures:
             return
+        resolve_sym, _, _ = _resolve_futures_symbol(symbol)
         leverage = max(1, min(leverage, 125))
         try:
             params = {
-                "symbol": symbol.upper(),
+                "symbol": resolve_sym,
                 "leverage": leverage,
             }
             result = await self._signed_request("POST", "/fapi/v1/leverage", params)
-            log.info("Leverage set: %s %dx", symbol, leverage)
+            log.info("Leverage set: %s -> %s %dx", symbol, resolve_sym, leverage)
         except Exception as e:
             log.warning("Failed to set leverage for %s: %s", symbol, e)
 
@@ -190,13 +243,14 @@ class BinanceExchange(Exchange):
         """Set margin type (ISOLATED or CROSSED) for futures position."""
         if not self.futures:
             return
+        resolve_sym, _, _ = _resolve_futures_symbol(symbol)
         try:
             params = {
-                "symbol": symbol.upper(),
+                "symbol": resolve_sym,
                 "marginType": margin_type.upper(),
             }
             await self._signed_request("POST", "/fapi/v1/marginType", params)
-            log.info("Margin type: %s %s", symbol, margin_type.upper())
+            log.info("Margin type: %s -> %s %s", symbol, resolve_sym, margin_type.upper())
         except Exception as e:
             # Error -4008 means already set, ignore
             log.info("Margin type %s for %s (may already be set)", margin_type, symbol)
@@ -285,9 +339,10 @@ class BinanceExchange(Exchange):
 
     async def _load_futures_filters(self, symbol: str) -> dict | None:
         """Get symbol trading rules from exchange info, with caching."""
+        resolve_sym, _, _ = _resolve_futures_symbol(symbol)
         now = datetime.now(timezone.utc)
         # Reuse if recent
-        cached = self._filters.get(symbol)
+        cached = self._filters.get(resolve_sym)
         if cached:
             if (now - cached["_updated"]).total_seconds() < 600:
                 return cached
@@ -300,11 +355,11 @@ class BinanceExchange(Exchange):
                 return None
         # Fetch
         try:
-            data = await self._public_request("GET", "/fapi/v1/exchangeInfo", {"symbol": symbol.upper()})
+            data = await self._public_request("GET", "/fapi/v1/exchangeInfo", {"symbol": resolve_sym})
             rules = data.get("symbols", [])
             if not rules:
-                self._invalid_symbols[symbol] = now
-                log.info("Binance futures symbol not found: %s", symbol)
+                self._invalid_symbols[resolve_sym] = now
+                log.info("Binance futures symbol not found: %s (from %s)", resolve_sym, symbol)
                 return None
             s = rules[0]
             out = {"_updated": now, "valid": True}
@@ -322,27 +377,41 @@ class BinanceExchange(Exchange):
             out["status"] = status
             if status != "TRADING":
                 out["valid"] = False
-                self._invalid_symbols[symbol] = now
-                log.info("Binance symbol not trading: %s (%s)", symbol, status)
+                self._invalid_symbols[resolve_sym] = now
+                log.info("Binance symbol not trading: %s (%s)", resolve_sym, status)
                 return None
-            self._filters[symbol] = out
+            self._filters[resolve_sym] = out
             return out
         except Exception as e:
             log.debug("exchangeInfo lookup failed for %s: %s", symbol, e)
             return None
 
-    def _round_quantity(self, symbol: str, quantity: float) -> tuple[float, dict | None]:
-        """Round quantity to exchange precision for symbol if known.
+    async def _round_quantity(self, symbol: str, quantity: float) -> tuple[float, dict | None]:
+        """Round quantity to exchange precision for symbol.
+
+        Lazily loads filters on cache miss (async) for reliability.
+        Falls back to integer rounding for low-price coins if filters unavailable.
 
         Returns (rounded_quantity, rules_or_None).
-        Falls back to raw quantity if rules are unknown so we
-        don't reject trades due to missing cache.
         """
         if quantity <= 0:
             return quantity, None
+
+        # Lazy-load filters if not cached
         rules = self._filters.get(symbol)
         if not rules:
-            return quantity, None
+            filters = await self._load_futures_filters(symbol)
+            if filters:
+                rules = filters
+            else:
+                # Fallback: integer rounding for low-price coins (< 1 USDT per token)
+                if quantity > 0 and quantity < 10000000:
+                    qty = round(quantity)
+                    prec = max(0, -int(round(log10(1))) if 1 < 1 else 0)
+                    qty = float(f"{qty:.{prec}f}")
+                    return qty, None
+                return round(quantity), None
+
         step = rules.get("stepSize") or rules.get("mktStepSize") or 1.0
         rounded = round(quantity / step) * step
         if rounded <= 0 and step > 0:
@@ -351,18 +420,16 @@ class BinanceExchange(Exchange):
             rounded = max(rounded, rules["minQty"])
         if "mktMinQty" in rules:
             rounded = max(rounded, rules["mktMinQty"])
-        mint = rules.get("minQty", rules.get("mktMinQty", 0))
-        if rounded < mint:
-            rounded = mint
         prec = max(0, -int(round(log10(step))) if step < 1 else 0)
         rounded = float(f"{rounded:.{prec}f}")
         return rounded, rules
 
     async def _preflight_symbol(self, symbol: str) -> bool:
         """Ensure a futures symbol can be traded; loads filters if needed."""
-        if symbol in self._filters or symbol in self._invalid_symbols:
-            return bool(self._filters.get(symbol, {}).get("valid") is True)
-        rules = await self._load_futures_filters(symbol)
+        resolve_sym, _, _ = _resolve_futures_symbol(symbol)
+        if resolve_sym in self._filters or resolve_sym in self._invalid_symbols:
+            return bool(self._filters.get(resolve_sym, {}).get("valid") is True)
+        rules = await self._load_futures_filters(resolve_sym)
         return bool(rules)
 
     async def get_positions(self) -> list[PositionInfo]:
@@ -406,8 +473,9 @@ class BinanceExchange(Exchange):
         Returns:
             Close price of the most recently closed candle, or None on error.
         """
+        resolve_sym, _, _ = _resolve_futures_symbol(symbol)
         try:
-            params = {"symbol": symbol.upper(), "interval": interval, "limit": 2}
+            params = {"symbol": resolve_sym, "interval": interval, "limit": 2}
             resp = await self._public_request("GET", "/fapi/v1/klines" if self.futures else "/api/v3/klines", params)
             # Last item is the forming candle; second-to-last is the last closed one
             if len(resp) >= 2:
@@ -427,6 +495,29 @@ class BinanceExchange(Exchange):
             log.warning("Failed to fetch klines for %s %s: %s", symbol, interval, e)
             return None
 
+    async def get_mark_price(self, symbol: str) -> float | None:
+        """Get the current mark price from Binance Futures 24hr ticker.
+
+        Faster than klines for real-time price checks (e.g. SL monitoring).
+        Uses /fapi/v1/ticker/24hr (or /api/v3/ticker/24hr for spot).
+
+        Args:
+            symbol: Trading pair (e.g. 'BONKUSDT')
+
+        Returns:
+            Current mark/close price, or None on error.
+        """
+        resolve_sym, _, _ = _resolve_futures_symbol(symbol)
+        try:
+            if self.futures:
+                resp = await self._public_request("GET", "/fapi/v1/ticker/24hr", {"symbol": resolve_sym})
+            else:
+                resp = await self._public_request("GET", "/api/v3/ticker/24hr", {"symbol": resolve_sym})
+            return float(resp.get("lastPrice", 0))
+        except Exception as e:
+            log.warning("Failed to fetch mark price for %s: %s", symbol, e)
+            return None
+
     # ─── Orders ────────────────────────────────────────────────────────────────
 
     async def _place_order(self, symbol: str, side: str, order_type: str,
@@ -439,9 +530,26 @@ class BinanceExchange(Exchange):
           - Limit orders work the same
 
         NOTE: Call set_symbol_leverage() BEFORE this method for futures.
+
+        Resolves 1000x symbols (e.g. BONKUSDT → 1000BONKUSDT) and
+        adjusts quantity and prices accordingly.
         """
+        resolve_sym, price_mult, qty_div = _resolve_futures_symbol(symbol)
+        # Scale quantity: for 1000x contracts, Binance uses quantity in base asset
+        # tokens (BONK), not contract units. The "1000" is the contract multiplier
+        # for PnL calculation, not for order quantity. So qty_div is always 1.0.
+        if qty_div > 1.0:
+            quantity = quantity / qty_div
+            quantity = round(quantity)
+        # Scale prices to contract-precision (always 1.0 — 1000x contracts
+        # are quoted at the base asset price, e.g. BONK = 0.0044)
+        if price is not None:
+            price = price * price_mult
+        if stop_price is not None:
+            stop_price = stop_price * price_mult
+
         mapped_type = self._map_type(order_type)
-        symbol_key = symbol.upper()
+        symbol_key = resolve_sym
 
         if self.futures and mapped_type not in {"MARKET", "LIMIT", "STOP_MARKET", "TAKE_PROFIT_MARKET", "TRAILING_STOP_MARKET"}:
             return OrderInfo(
@@ -471,7 +579,11 @@ class BinanceExchange(Exchange):
 
         qty = quantity
         if self.futures:
-            qty, _ = self._round_quantity(symbol_key, qty)
+            qty, rules = await self._round_quantity(symbol_key, qty)
+            # For 1000x contracts where LOT_SIZE.stepSize = 1,
+            # _round_quantity already handles integer rounding.
+            # For very low-price coins with cache miss, the fallback
+            # in _round_quantity applies integer rounding.
 
         params = {
             "symbol": symbol_key,
@@ -535,12 +647,44 @@ class BinanceExchange(Exchange):
 
     async def stop_loss(self, symbol: str, quantity: float, stop_price: float,
                         side: str = "SELL") -> OrderInfo:
+        """Place a stop loss order.
+
+        For futures 1000x contracts (1000BONKUSDT etc.), STOP orders are blocked
+        by Binance with error -4120 (Use Algo Order API). The Algo API endpoints
+        all return 404, so SL/TP cannot be placed as exchange orders for these
+        contracts. This method returns a special "UNPROTECTED" status so the
+        caller knows SL was not placed and should rely on position-manager
+        price monitoring instead.
+
+        1000x contract order strategy:
+        - ENTRY: MARKET (works normally)
+        - TAKE PROFIT: LIMIT SELL above market (works as a resting order)
+        - STOP LOSS: Cannot be placed — use position_manager monitoring
+          (poll 1m klines or mark price, close via MARKET if SL breached)
+
+        Using LIMIT SELL below market as a stop-loss substitute DOES NOT WORK
+        because it fills instantly at a worse price than the market would.
+        """
+        resolve_sym, _, _ = _resolve_futures_symbol(symbol)
+        # Check if this is a 1000x contract type
+        is_1000x = resolve_sym.startswith("1000")
+
+        if self.futures and is_1000x:
+            log.info("STOP orders blocked for %s (1000x contract). SL will be monitored by position manager.", resolve_sym)
+            return OrderInfo(
+                order_id="", symbol=symbol, side=side.upper(),
+                type="STOP_LOSS", quantity=quantity,
+                status="UNPROTECTED",
+                error="STOP orders not supported for 1000x contracts; SL handled by position manager monitoring",
+            )
+
         return await self._place_order(symbol, side, "STOP_LOSS", quantity, stop_price=stop_price)
 
     async def cancel_order(self, symbol: str, order_id: str) -> bool:
+        resolve_sym, _, _ = _resolve_futures_symbol(symbol)
         try:
             await self._signed_request("DELETE", self._order_path(), {
-                "symbol": symbol.upper(),
+                "symbol": resolve_sym,
                 "orderId": order_id,
             })
             return True
@@ -548,9 +692,10 @@ class BinanceExchange(Exchange):
             return False
 
     async def get_order(self, symbol: str, order_id: str) -> OrderInfo:
+        resolve_sym, _, _ = _resolve_futures_symbol(symbol)
         try:
             data = await self._signed_request("GET", self._order_path(), {
-                "symbol": symbol.upper(),
+                "symbol": resolve_sym,
                 "orderId": order_id,
             })
             return OrderInfo(
@@ -574,7 +719,8 @@ class BinanceExchange(Exchange):
         open_path = "/fapi/v1/openOrders" if self.futures else "/api/v3/openOrders"
         params = {}
         if symbol:
-            params["symbol"] = symbol.upper()
+            resolve_sym, _, _ = _resolve_futures_symbol(symbol)
+            params["symbol"] = resolve_sym
         try:
             data = await self._signed_request("GET", open_path, params)
             orders = []

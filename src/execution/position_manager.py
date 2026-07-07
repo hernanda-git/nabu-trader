@@ -90,6 +90,26 @@ class PositionManager:
         log.debug("Position %s: open_orders=%d, sl_ok=%s, tp_orders=%d",
                   pos.pair, len(open_orders), sl_ok, tp_count)
 
+        # Price-based SL check — for positions where exchange STOP orders aren't
+        # supported (e.g. 1000x contracts), monitor the price and close if SL hit
+        if not sl_ok and pos.sl_price and pos.sl_price > 0:
+            try:
+                # Get current mark price
+                close_price = await self.exchange.get_klines_close(pos.pair, "1m")
+                if close_price is not None:
+                    if pos.direction == "LONG" and close_price <= pos.sl_price:
+                        log.warning("SL HIT for %s: current=%.8f <= sl=%.8f — closing",
+                                    pos.pair, close_price, pos.sl_price)
+                        await self._close_position(pos, f"SL hit ({close_price:.8f})")
+                        return
+                    elif pos.direction == "SHORT" and close_price >= pos.sl_price:
+                        log.warning("SL HIT for %s: current=%.8f >= sl=%.8f — closing",
+                                    pos.pair, close_price, pos.sl_price)
+                        await self._close_position(pos, f"SL hit ({close_price:.8f})")
+                        return
+            except Exception as e:
+                log.debug("Price-based SL check failed for %s: %s", pos.pair, e)
+
         # If no SL/TP orders remain and position is OPEN, check if it was
         # already filled (closed by exchange). Use age as heuristic:
         # if it's been open > 30 min and has no orders, it was likely closed.
