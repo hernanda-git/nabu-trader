@@ -323,8 +323,7 @@ class TradeOrchestrator:
                     )
                 else:
                     await self.notifier.send_message(
-                        f"❌ **Modification failed — {decision.pair}**\n"
-                        f"Error: {exec_result.error}"
+                        exec_result.error or f"❌ **Modification failed — {decision.pair}**"
                     )
                 self.signal_repo.mark_processed(message_id, raw_text)
                 if self.event_bus:
@@ -672,8 +671,7 @@ class TradeOrchestrator:
                 result["action"] = "failed"
                 result["error"] = exec_result.error
                 await self.notifier.send_message(
-                    f"❌ **Trigger entry failed** — {exec_result.symbol}\n"
-                    f"Error: {exec_result.error}"
+                    exec_result.error or f"❌ **Trigger entry failed — {exec_result.symbol}**"
                 )
 
             self.event_repo.save_event("TriggerExecuted", result)

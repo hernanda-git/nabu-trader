@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import json
 import logging
 import time
 from datetime import datetime, timezone
@@ -32,6 +33,68 @@ class BinanceErrorCategory(Enum):
     VALIDATION = "validation"  # 400 — bad request params
     NETWORK = "network"  # timeout / connection
     UNKNOWN = "unknown"
+
+
+# ─── Binance error code → user-friendly message ─────────────────────────────
+_ERROR_MESSAGES: dict[int, str] = {
+    -1100: "Illegal characters in request — possible symbol or quantity format issue",
+    -1013: "Order value too small — increase quantity or use higher leverage",
+    -1102: "Missing required parameter — contact developer",
+    -1111: "Price/quantity precision too high for this pair — rounding issue",
+    -1121: "Invalid symbol — this pair may not exist on Binance Futures",
+    -2019: "Insufficient margin — not enough free USDT for this position size",
+    -2020: "Order would immediately fill — try a different price or order type",
+    -4003: "Quantity must be greater than zero",
+    -4004: "Quantity too large for this pair",
+    -4164: "Order notional too small — minimum $5 on Binance Futures (increase quantity or leverage)",
+    -4120: "Order type not supported for this contract — SL/TP handled by position manager",
+    -4136: "Invalid order type/parameters for this contract",
+    -4188: "Reduce-only order would increase position — check order side",
+}
+
+
+def _parse_binance_error(response_text: str) -> tuple[int, str]:
+    """Extract Binance error code and message from JSON response body.
+
+    Returns (code, message). Falls back to raw text if not JSON.
+    """
+    try:
+        data = json.loads(response_text)
+        code = int(data.get("code", 0))
+        msg = str(data.get("msg", ""))
+        return code, msg
+    except (json.JSONDecodeError, ValueError, TypeError):
+        return 0, response_text[:200]
+
+
+def _format_order_error(symbol: str, side: str, order_type: str,
+                        quantity: float, price: float | None,
+                        leverage: int, status_code: int,
+                        response_text: str) -> str:
+    """Build a user-friendly, traceable error message for a failed order.
+
+    Includes: what was attempted, why it failed, and what to do about it.
+    """
+    code, binance_msg = _parse_binance_error(response_text)
+    friendly = _ERROR_MESSAGES.get(code, binance_msg or f"HTTP {status_code}")
+
+    # Compute notional for context
+    ref_price = price or 0
+    notional = quantity * ref_price if ref_price > 0 else 0
+
+    parts = [
+        f"❌ **Order failed — {symbol}**",
+        f"   ├ Side: `{side}` | Type: `{order_type}`",
+        f"   ├ Qty: `{quantity}`",
+    ]
+    if ref_price > 0:
+        parts.append(f"   ├ Price: `{ref_price}` | Notional: `${notional:.2f}`")
+    if leverage > 1:
+        parts.append(f"   ├ Leverage: `{leverage}x`")
+    parts.append(f"   ├ Error code: `{code}`" if code else f"   ├ HTTP: `{status_code}`")
+    parts.append(f"   └ {friendly}")
+
+    return "\n".join(parts)
 
 
 def _categorize_error(status_code: int | None, error_text: str,
@@ -254,6 +317,7 @@ class BinanceExchange(Exchange):
                 "leverage": leverage,
             }
             result = await self._signed_request("POST", "/fapi/v1/leverage", params)
+            self._last_leverage = leverage
             log.info("Leverage set: %s -> %s %dx", symbol, resolve_sym, leverage)
         except Exception as e:
             log.warning("Failed to set leverage for %s: %s", symbol, e)
@@ -665,11 +729,15 @@ class BinanceExchange(Exchange):
         except httpx.HTTPStatusError as e:
             status = e.response.status_code
             category = _categorize_error(status, e.response.text, e)
-            log.error("Order failed [%s]: %s", category.value, e)
+            error_msg = _format_order_error(
+                symbol, side_upper, mapped_type, quantity, price,
+                getattr(self, "_last_leverage", 1), status, e.response.text,
+            )
+            log.error("Order failed [%s]: %s", category.value, error_msg)
             return OrderInfo(
                 order_id="", symbol=symbol, side=side, type=order_type,
                 quantity=quantity, status="FAILED" if category != BinanceErrorCategory.NETWORK else "PENDING",
-                error=f"[{category.value}] {e}",
+                error=error_msg,
             )
         except Exception as e:
             category = _categorize_error(None, "", e)
