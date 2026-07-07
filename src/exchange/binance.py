@@ -528,21 +528,25 @@ class BinanceExchange(Exchange):
         For futures:
           - STOP_LOSS → STOP_MARKET (triggers market order)
           - Limit orders work the same
+          - 1000x symbols (e.g. BONKUSDT → 1000BONKUSDT) are auto-resolved
+
+        1000x contract notes:
+        - PRICE is in base asset terms (e.g. BONK = 0.0044), NOT multiplied by 1000
+        - QUANTITY is in base asset tokens (e.g. BONK), NOT divided by 1000
+        - The "1000" prefix is the CONTRACT MULTIPLIER for PnL calculation only
+        - No price/qty scaling is needed — multipliers are both 1.0
 
         NOTE: Call set_symbol_leverage() BEFORE this method for futures.
-
-        Resolves 1000x symbols (e.g. BONKUSDT → 1000BONKUSDT) and
-        adjusts quantity and prices accordingly.
         """
         resolve_sym, price_mult, qty_div = _resolve_futures_symbol(symbol)
-        # Scale quantity: for 1000x contracts, Binance uses quantity in base asset
-        # tokens (BONK), not contract units. The "1000" is the contract multiplier
-        # for PnL calculation, not for order quantity. So qty_div is always 1.0.
+        # 1000x symbols (1000BONKUSDT etc.): multipliers are always 1.0 because
+        # PRICE is in base asset terms (e.g. BONK = 0.0044) and QUANTITY is in
+        # base asset tokens (e.g. BONK). The "1000" is the contract multiplier
+        # for PnL calculation only — no price/qty scaling is needed.
+        # Guard clauses below keep this safe if SYMBOL_MAP ever changes.
         if qty_div > 1.0:
             quantity = quantity / qty_div
             quantity = round(quantity)
-        # Scale prices to contract-precision (always 1.0 — 1000x contracts
-        # are quoted at the base asset price, e.g. BONK = 0.0044)
         if price is not None:
             price = price * price_mult
         if stop_price is not None:

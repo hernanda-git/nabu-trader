@@ -143,10 +143,9 @@ src/
 | **LLM returns text instead of JSON** | "LLM parse error, skipping" | Fixed: `response_format: json_object` in API call |
 | **Position manager stale orders** | SL/TP not placed | Check exchange balance + open orders manually |
 | **Binance 401 on order** | "code:-2015 Invalid API-key" | API key missing Futures permission — check Binance API mgmt |
-| **1000x symbol mapping** | `-1121 Invalid symbol` for BONKUSDT, PEPEUSDT, SHIBUSDT | Mapped automatically via `SYMBOL_MAP` in `binance.py` |
-| **1000x quantity precision** | `-1111 Precision over maximum` | Auto-rounded to integer via fallback in `_place_order()` |
-| **1000x STOP orders blocked** | `-4120 Use Algo Order API` | Binance limitation — SL handled by position manager monitoring (1m klines polling) |
-| **1000x LIMIT SL fills instantly** | Position closed immediately | LIMIT SELL below market is NOT a valid SL — use position manager monitoring |
+| **1000x STOP orders blocked** | `-4120 Use Algo Order API` | Binance limitation — SL handled by position-manager monitoring (mark price + 1m klines polling). Use `get_mark_price()` for faster detection |
+| **1000x LIMIT SL fills instantly** | Position closed immediately | LIMIT SELL below market is NOT a valid SL — use position manager monitoring or MARKET |
+| **1000x filter cache miss** | `-1111 Precision over maximum` for low-price coins | Fixed: `_round_quantity()` now lazy-loads filters on miss, falls back to integer rounding |
 | **Windows/WSL out of sync** | Deploy pushes old code | Always `cp` changed files to Windows path before `flyctl deploy` |
 
 ### ⚠️ 1000x Contract Compatibility

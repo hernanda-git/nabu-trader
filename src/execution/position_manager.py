@@ -94,18 +94,27 @@ class PositionManager:
         # supported (e.g. 1000x contracts), monitor the price and close if SL hit
         if not sl_ok and pos.sl_price and pos.sl_price > 0:
             try:
-                # Get current mark price
-                close_price = await self.exchange.get_klines_close(pos.pair, "1m")
-                if close_price is not None:
-                    if pos.direction == "LONG" and close_price <= pos.sl_price:
-                        log.warning("SL HIT for %s: current=%.8f <= sl=%.8f — closing",
-                                    pos.pair, close_price, pos.sl_price)
-                        await self._close_position(pos, f"SL hit ({close_price:.8f})")
+                # Try mark price first (current price, faster detection)
+                mark_price = await self.exchange.get_mark_price(pos.pair)
+                if mark_price is not None:
+                    current_price = mark_price
+                    source = "mark"
+                else:
+                    # Fallback: last closed 1m candle close (slower, up to 1 min delay)
+                    close_price = await self.exchange.get_klines_close(pos.pair, "1m")
+                    current_price = close_price
+                    source = "klines" if close_price is not None else None
+
+                if current_price is not None:
+                    if pos.direction == "LONG" and current_price <= pos.sl_price:
+                        log.warning("SL HIT for %s (via %s): current=%.8f <= sl=%.8f — closing",
+                                    pos.pair, source, current_price, pos.sl_price)
+                        await self._close_position(pos, f"SL hit ({current_price:.8f})")
                         return
-                    elif pos.direction == "SHORT" and close_price >= pos.sl_price:
-                        log.warning("SL HIT for %s: current=%.8f >= sl=%.8f — closing",
-                                    pos.pair, close_price, pos.sl_price)
-                        await self._close_position(pos, f"SL hit ({close_price:.8f})")
+                    elif pos.direction == "SHORT" and current_price >= pos.sl_price:
+                        log.warning("SL HIT for %s (via %s): current=%.8f >= sl=%.8f — closing",
+                                    pos.pair, source, current_price, pos.sl_price)
+                        await self._close_position(pos, f"SL hit ({current_price:.8f})")
                         return
             except Exception as e:
                 log.debug("Price-based SL check failed for %s: %s", pos.pair, e)

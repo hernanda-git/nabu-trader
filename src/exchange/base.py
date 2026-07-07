@@ -97,6 +97,11 @@ class Exchange(ABC):
         Returns None if not supported by this exchange."""
         return None
 
+    async def get_mark_price(self, symbol: str) -> float | None:
+        """Get the current market price.
+        Returns None if not supported by this exchange."""
+        return None
+
     async def cancel_all_orders(self, symbol: str) -> int:
         """Cancel all open orders for a symbol. Returns number of orders cancelled.
         Override for exchange-specific bulk cancellation. Default: cancel one by one."""
