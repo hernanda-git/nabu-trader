@@ -130,30 +130,20 @@ class OrderService:
                     error=f"Cannot determine entry price for {symbol}",
                 )
 
-        # Ensure LIMIT price is fillable: for BUY, price must be >= current;
-        # for SELL, price must be <= current. Otherwise the order waits forever.
-        try:
-            current = await self.exchange.get_mark_price(symbol)
-            if current and current > 0:
-                if side == "BUY" and entry_price < current:
-                    log.info("Entry price %.8f < current %.8f — adjusting to current",
-                             entry_price, current)
-                    entry_price = current
-                elif side == "SELL" and entry_price > current:
-                    log.info("Entry price %.8f > current %.8f — adjusting to current",
-                             entry_price, current)
-                    entry_price = current
-        except Exception:
-            pass
+        # Do NOT adjust entry_price to current market — that defeats the
+        # purpose of a LIMIT order. The order rests on the book at the
+        # specified price and fills when the market comes to it.
 
         order = await self.exchange.limit_buy(symbol, quantity, entry_price) if side == "BUY" \
             else await self.exchange.limit_sell(symbol, quantity, entry_price)
 
-        # Wait for LIMIT fill (up to 30s, poll every 2s)
+        # If already filled (price was at or through the limit), done.
+        # Otherwise the order rests on the book — save it as PENDING.
         if order.order_id and order.status != "FILLED":
             import asyncio as _aio
-            for _attempt in range(15):
-                await _aio.sleep(2)
+            # Quick check: did it fill in the first few seconds?
+            for _attempt in range(5):
+                await _aio.sleep(1)
                 try:
                     check = await self.exchange.get_order(symbol, order.order_id)
                     if check.status == "FILLED":
@@ -167,15 +157,9 @@ class OrderService:
                 except Exception:
                     pass
             else:
-                # Timeout — cancel and fail
-                try:
-                    await self.exchange.cancel_order(symbol, order.order_id)
-                except Exception:
-                    pass
-                return ExecutionResult(
-                    success=False, status="TIMEOUT",
-                    error=f"Entry LIMIT not filled within 30s for {symbol} @ {entry_price}",
-                )
+                # Order didn't fill in quick check — it's resting on the book
+                log.info("LIMIT resting on book: %s %s qty=%.4f @ %.8f (order %s)",
+                         symbol, side, quantity, entry_price, order.order_id)
 
         # Save order
         order_db_id = self.order_repo.save(
@@ -201,6 +185,23 @@ class OrderService:
                 success=False, status=order.status, error=order.error or "Order rejected",
             )
 
+        # If not yet filled, the order is resting on the book — return PENDING
+        if order.status != "FILLED":
+            self.order_repo.update_status(order_db_id, "PENDING", order.order_id)
+            log.info("LIMIT order resting: %s %s qty=%.4f @ %.8f — waiting for price",
+                     symbol, side, quantity, entry_price)
+            return ExecutionResult(
+                success=True,
+                order_id=order.order_id,
+                symbol=symbol,
+                side=side,
+                filled_quantity=0,
+                avg_price=entry_price,
+                status="PENDING",
+                error=f"⏳ LIMIT order placed @ {entry_price} — waiting for price to reach it",
+            )
+
+        # Order is FILLED — save position and place SL/TP
         self.order_repo.update_status(order_db_id, "FILLED", order.order_id)
 
         # Save position

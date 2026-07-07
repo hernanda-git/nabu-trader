@@ -489,6 +489,16 @@ class TradeOrchestrator:
                         f"   ├ TP: `{decision.tp_prices or '—'}`\n\n"
                         f"{exec_result.error}"
                     )
+                elif exec_result.status == "PENDING":
+                    await self.notifier.send_message(
+                        f"⏳ **LIMIT order placed — {exec_result.symbol}**\n"
+                        f"   ├ Direction: `{decision.direction}`\n"
+                        f"   ├ Qty: `{decision.quantity:,.0f}`\n"
+                        f"   ├ Entry: `{exec_result.avg_price:.8f}`\n"
+                        f"   ├ SL: `{decision.sl_price or '—'}`\n"
+                        f"   ├ TP: `{decision.tp_prices or '—'}`\n"
+                        f"   └ Waiting for price to reach entry level"
+                    )
 
                 if self.event_bus:
                     self.event_bus.emit(Event("PositionOpened", {
