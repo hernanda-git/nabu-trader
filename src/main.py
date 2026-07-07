@@ -136,7 +136,7 @@ async def main():
     # ── Notifier ─────────────────────────────────────────────────────────
     notifier = TelegramNotifier(bot_token=bot_token, chat_id=notify_chat_id)
 
-    # Determine version: Fly.io release version, or git commit hash
+    # Determine version: Fly.io release version, git commit hash, or package version
     app_version = os.environ.get("FLY_RELEASE_VERSION") or os.environ.get("SOURCE_VERSION", "")
     if not app_version:
         try:
@@ -146,6 +146,12 @@ async def main():
                 capture_output=True, text=True, timeout=5,
             )
             app_version = result.stdout.strip()
+        except Exception:
+            app_version = ""
+    if not app_version:
+        try:
+            from src.version import __version__  # type: ignore[import-untyped]
+            app_version = __version__
         except Exception:
             app_version = ""
     version_str = f"v{app_version}" if app_version and not app_version.startswith("v") else app_version
