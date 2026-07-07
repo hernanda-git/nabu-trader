@@ -158,20 +158,85 @@ class SignalListener:
                     "No active futures positions found on Binance."
                 )
                 return
-            lines = ["📊 **Binance Futures — Open Positions**\n"]
+
+            # Fetch balance for context
+            try:
+                bal = await self.exchange.get_balance()
+                total_balance = bal.total_usdt
+                free_balance = bal.free_usdt
+            except Exception:
+                total_balance = 0
+                free_balance = 0
+
+            # Fetch current prices for all position symbols in one call
+            price_map: dict[str, float] = {}
+            for p in positions:
+                try:
+                    price = await self.exchange.get_mark_price(p.symbol)
+                    if price and price > 0:
+                        price_map[p.symbol] = price
+                except Exception:
+                    pass
+
+            # Build the message
+            total_margin = 0.0
+            total_pnl = 0.0
+            lines = ["💼 **Open Positions**\n"]
+
             for i, p in enumerate(positions, 1):
-                emoji = "🟢" if p.direction == "LONG" else "🔴"
-                pnl_emoji = "📈" if p.unrealized_pnl >= 0 else "📉"
+                current_price = price_map.get(p.symbol, p.mark_price)
+                direction_emoji = "🟢" if p.direction == "LONG" else "🔴"
+                direction_label = "LONG ▲" if p.direction == "LONG" else "SHORT ▼"
+
+                # Calculate margin in use
+                margin_used = p.margin if p.margin > 0 else (p.notional / p.leverage if p.leverage > 0 else 0)
+                total_margin += margin_used
+                total_pnl += p.unrealized_pnl
+
+                # PnL styling
+                pnl_sign = "+" if p.unrealized_pnl >= 0 else ""
+                pnl_emoji = "🟢" if p.unrealized_pnl >= 0 else "🔴"
+
+                # Price change %
+                if p.entry_price > 0 and current_price > 0:
+                    if p.direction == "LONG":
+                        pct_change = ((current_price - p.entry_price) / p.entry_price) * 100
+                    else:
+                        pct_change = ((p.entry_price - current_price) / p.entry_price) * 100
+                    pct_str = f"{pnl_sign}{pct_change:.2f}%"
+                else:
+                    pct_str = "—"
+
+                # Format price with appropriate precision
+                def fmt_price(val):
+                    if val <= 0:
+                        return "—"
+                    if val < 0.001:
+                        return f"{val:.8f}"
+                    if val < 1:
+                        return f"{val:.6f}"
+                    return f"{val:.4f}"
+
                 lines.append(
-                    f"{emoji} **{i}. {p.symbol}**\n"
-                    f"   ┣ Direction: `{p.direction}`\n"
-                    f"   ┣ Size: `{p.size:.4f}` ({p.notional:.2f} USDT)\n"
-                    f"   ┣ Entry: `{p.entry_price:.6f}`\n"
-                    f"   ┣ Mark: `{p.mark_price:.6f}`\n"
-                    f"   ┣ Liq: `{p.liquidation_price:.6f}`\n"
-                    f"   ┣ Leverage: `{p.leverage}x`\n"
-                    f"   ┗ {pnl_emoji} PnL: `{p.unrealized_pnl:+.2f} USDT`\n"
+                    f"{direction_emoji} **{p.symbol}** · `{direction_label}`\n"
+                    f"   Entry `{fmt_price(p.entry_price)}` → Now `{fmt_price(current_price)}` ({pct_str})\n"
+                    f"   Size `{p.size:,.0f}` · Lev `{p.leverage}x` · Margin `${margin_used:.2f}`\n"
+                    f"   {pnl_emoji} PnL `${pnl_sign}{p.unrealized_pnl:.2f}`"
                 )
+
+            # Footer with account summary
+            used_pct = (total_margin / total_balance * 100) if total_balance > 0 else 0
+            lines.append("")
+            lines.append(
+                f"💰 Balance `${total_balance:.2f}` · "
+                f"Free `${free_balance:.2f}` · "
+                f"In use `${total_margin:.2f}` ({used_pct:.0f}%)"
+            )
+            if total_pnl != 0:
+                tp = "+" if total_pnl >= 0 else ""
+                te = "🟢" if total_pnl >= 0 else "🔴"
+                lines.append(f"{te} Total PnL `${tp}{total_pnl:.2f}`")
+
             await event.reply("\n".join(lines))
         except Exception as e:
             log.exception("Failed to fetch positions")
