@@ -192,8 +192,10 @@ Binance lists some low-price tokens (BONK, PEPE, SHIB, FLOKI) as "1000x" contrac
 **SL/TP Limitations (API):**
 - `LIMIT SELL` ABOVE market → ✅ Take Profit (resting order, waits for price rise)
 - `LIMIT SELL` BELOW market → ❌ NOT a valid Stop Loss (fills instantly as cheap ask)
-- `STOP_MARKET`, `STOP`, `TAKE_PROFIT_MARKET`, `TAKE_PROFIT` → ❌ ALL blocked (-4120)
-- **SL must be handled via position-manager monitoring** (polls 1m klines, closes via MARKET SELL on breach)
+- `STOP_MARKET`, `TAKE_PROFIT_MARKET` → ❌ blocked (-4120) on most contracts
+- `STOP`, `TAKE_PROFIT` (stop-limit / tp-limit) → ✅ Conditional tab, fills as LIMIT (no slippage). Used by default for all contracts.
+- **If `STOP`/`TAKE_PROFIT` blocked (-4120) on a contract**, the bot falls back: SL → position-manager monitoring (polls mark price, closes via LIMIT on breach); TP → resting Basic-tab LIMIT at the TP price.
+- **SL/TP default strategy (v54+):** SL = `STOP` (Conditional), TP = `TAKE_PROFIT` (Conditional), both LIMIT fills. Fallbacks applied per-contract.
 
 ---
 
@@ -214,21 +216,19 @@ powershell.exe -NoProfile -Command "& flyctl logs --app nabu-trader --no-tail"
 
 ### 2. Deploy New Code
 
-**⚠️ CRITICAL: Windows/WSL sync.** The Fly.io deploy MUST run from the Windows path. Always:
-1. Make changes in WSL (`/home/it26/learnornoearner-listener/`)
-2. Copy changed files to Windows: `cp src/exchange/binance.py "/mnt/c/Working Folder/Research/learnornoearner-listener/src/exchange/binance.py"`
-3. Commit and deploy from Windows:
+**The `deploy.sh` script handles WSL→Windows sync automatically.** From WSL:
 
 ```bash
-# From WSL — copy changed files
-cp -u /home/it26/nabu-trader/src/*.py "/mnt/c/Working Folder/Research/learnornoearner-listener/src/"
-# Or for specific file:
-cp /home/it26/nabu-trader/src/exchange/binance.py "/mnt/c/Working Folder/Research/learnornoearner-listener/src/exchange/binance.py"
+cd /home/it26/nabu-trader
+bash deploy.sh "feat: description of changes"
+```
 
-# Then deploy from Windows
-cd /mnt/c/"Working Folder/Research/learnornoearner-listener"
-git add -A && git commit -m "description"
-powershell.exe -NoProfile -Command "flyctl deploy --app learnornoearner-listener --detach --image-label v<NEXT>"
+This script: (1) rsyncs WSL → Windows path, (2) detects next Fly.io release
+version, (3) writes `src/version.py`, (4) commits from Windows path, (5) runs
+`flyctl deploy --detach` via the Windows PowerShell bridge.
+
+**⚠️ Do NOT deploy manually bypassing `deploy.sh`** — the Fly CLI is on Windows
+and WSL changes are invisible to it. The script exists precisely to solve that.
 ```
 
 ### 3. Add a New Signal Format

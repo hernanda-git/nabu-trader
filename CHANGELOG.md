@@ -2,7 +2,30 @@
 
 All notable changes to this project are documented here.
 
-## [Unreleased]
+## [v54] — 2026-07-07
+
+### Added
+- **Conditional SL/TP orders**: `stop_loss()` now places a `STOP` (stop-limit) order → Binance **Conditional tab**, fills as LIMIT (no slippage). New `take_profit()` method places `TAKE_PROFIT` (tp-limit) → Conditional tab, LIMIT fill. Both appear in the Conditional tab, exactly as the user requested.
+- **Per-contract fallbacks** when a contract blocks `STOP`/`TAKE_PROFIT` (`-4120`): SL → position-manager mark-price monitoring (closes via LIMIT on breach); TP → resting Basic-tab `LIMIT` at the TP price. No order type silently drops — TP always works.
+- **LIMIT-order resting policy (user correction)**: Entry LIMIT now rests on the book at the specified price and waits for the market to reach it. No auto-adjustment to current price, no timeout cancellation. Returns `PENDING` status + "⏳ waiting for price" notification.
+- **LLM fallback on order failure (v52)**: `OrderService` calls `_llm_fallback()` on `FAILED`/`REJECTED`/`EXPIRED` — sends full error context (code, qty, price, notional, leverage, balance) to the LLM, which returns corrected params or `ABORT`. On success, notifies user with root cause + fix applied. Wired via `agent=` param in `main.py`.
+- **TA context for decisions (v46)**: New `src/agent/ta_context.py` fetches 100 candles and computes ATR(14), swing highs/lows, EMA20/50, Fib, round levels — injected into the LLM prompt **only when a signal lacks SL/TP**.
+- **Slash commands `/pending` and `/cancel`** (v50): list pending conditional signals, cancel one or all.
+- **API endpoints for manual trade + pending management (v50)**: `POST /api/v1/trade` (auto pair-resolves ticker → Binance symbol, auto-sizes leverage to meet $5 min notional, LIMIT entry/TP), `GET /api/v1/pending`, `POST /api/v1/pending/{id}/cancel`, `POST /api/v1/pending/cancel_all`.
+- **Improved `/positions` display (v51)**: live mark price, entry→now %, margin in use, account summary.
+- **User-friendly Binance error formatting (v49)**: maps error codes to human-readable messages with full context (symbol, side, qty, price, notional, leverage); strips raw URL/signature.
+- **Double-notification fix (v45)**: `content_hash` dedup on startup + Telegram `setMyCommands` so the menu doesn't re-trigger the handler.
+
+### Changed
+- **LIMIT-only order policy (HARD RULE)**: entry, close, SL, TP all LIMIT. No MARKET orders anywhere.
+- `stop_loss()` signature now accepts `stop_price` and emits `STOP` instead of `STOP_LOSS`/`STOP_MARKET`.
+- `OrderService` constructor accepts optional `agent` for LLM fallback.
+- `_enter_position` returns `PENDING` (not failure) when the LIMIT hasn't filled yet.
+
+### Fixed
+- `_row_to_position` crash on extra DB columns (v48) — now filters to `Position` dataclass fields.
+
+## [v44 and earlier]
 
 ### Added
 - **Comprehensive trade DB**: 5 new tables (`llm_interactions`, `trade_logs`, `position_events`, `config_snapshots`) + correlation_id columns on existing tables

@@ -224,16 +224,31 @@ class OrderService:
             sl_order = await self.exchange.stop_loss(symbol, quantity, decision.sl_price, sl_side)
             if sl_order.order_id:
                 sl_placed = True
-                log.info("SL placed: %s @ %s", symbol, decision.sl_price)
+                log.info("SL placed: %s @ %s (conditional)", symbol, decision.sl_price)
+            elif sl_order.status == "UNPROTECTED":
+                log.warning("SL NOT placed for %s @ %s — position monitored by position manager",
+                            symbol, decision.sl_price)
             else:
-                log.warning("SL NOT placed for %s @ %s — position is UNPROTECTED", symbol, decision.sl_price)
+                log.warning("SL NOT placed for %s @ %s — position UNPROTECTED (%s)",
+                            symbol, decision.sl_price, sl_order.error)
 
-        # Place TP orders as conditional TAKE_PROFIT-LIMIT (only if SL placed or no SL configured)
+        # Place TP orders (conditional TAKE_PROFIT-LIMIT, fallback to Basic LIMIT)
         for i, tp_price in enumerate(decision.tp_prices[:3]):
             tp_side = "SELL" if decision.direction == "LONG" else "BUY"
             tp_order = await self.exchange.take_profit(symbol, quantity, tp_price, tp_side)
             if tp_order.order_id:
                 log.info("TP%d placed: %s @ %s (conditional)", i + 1, symbol, tp_price)
+            else:
+                # Some contracts block conditional TP (-4120). Fall back to a
+                # resting Basic-tab LIMIT at the TP price so TP still works.
+                log.warning("TP%d conditional blocked (%s) — falling back to Basic LIMIT @ %s",
+                            i + 1, tp_order.error, tp_price)
+                if tp_side == "SELL":
+                    fb = await self.exchange.limit_sell(symbol, quantity, tp_price)
+                else:
+                    fb = await self.exchange.limit_buy(symbol, quantity, tp_price)
+                if fb.order_id:
+                    log.info("TP%d placed (Basic LIMIT fallback): %s @ %s", i + 1, symbol, tp_price)
 
         log.info("Position opened: %s %s %s qty=%.4f", decision.direction, symbol, decision.order_type, quantity)
 
@@ -480,10 +495,12 @@ class OrderService:
             if sl_order.order_id:
                 sl_placed = True
                 log.info("New SL placed: %s @ %s", symbol, decision.sl_price)
+            elif sl_order.status == "UNPROTECTED":
+                log.warning("New SL monitored by position manager: %s @ %s", symbol, decision.sl_price)
             else:
-                log.warning("New SL NOT placed for %s @ %s", symbol, decision.sl_price)
+                log.warning("New SL NOT placed for %s @ %s (%s)", symbol, decision.sl_price, sl_order.error)
 
-        # Place new TP orders if specified
+        # Place new TP orders if specified (conditional, fallback to Basic LIMIT)
         tp_placed = 0
         for i, tp_price in enumerate(decision.tp_prices[:3]):
             if tp_price <= 0:
@@ -493,6 +510,12 @@ class OrderService:
             if tp_order.order_id:
                 tp_placed += 1
                 log.info("New TP%d placed: %s @ %s", i + 1, symbol, tp_price)
+            else:
+                fb = await self.exchange.limit_sell(symbol, position.quantity, tp_price) if tp_side == "SELL" \
+                    else await self.exchange.limit_buy(symbol, position.quantity, tp_price)
+                if fb.order_id:
+                    tp_placed += 1
+                    log.info("New TP%d placed (Basic LIMIT fallback): %s @ %s", i + 1, symbol, tp_price)
 
         # Update position SL/TP in database
         self.position_repo.update_sl_tp(

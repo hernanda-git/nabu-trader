@@ -15,6 +15,7 @@ class Exchange(ABC):
     async def limit_buy(self, symbol: str, quantity: float, price: float) -> OrderInfo: ...
     async def limit_sell(self, symbol: str, quantity: float, price: float) -> OrderInfo: ...
     async def stop_loss(self, symbol: str, quantity: float, stop_price: float, side: str = "SELL") -> OrderInfo: ...
+    async def take_profit(self, symbol: str, quantity: float, tp_price: float, side: str = "SELL") -> OrderInfo: ...
     async def cancel_order(self, symbol: str, order_id: str) -> bool: ...
     async def get_order(self, symbol: str, order_id: str) -> OrderInfo: ...
     async def get_open_orders(self, symbol: str | None = None) -> list[OrderInfo]: ...
@@ -81,12 +82,21 @@ For Spot mode, uses `/api/v3/` equivalents.
 
 ### Order Type Mapping (Futures)
 
-| Input Type | Futures Equivalent |
-|------------|-------------------|
-| `MARKET` | `MARKET` |
-| `LIMIT` | `LIMIT` |
-| `STOP_LOSS` | `STOP_MARKET` |
-| `TAKE_PROFIT` | `TAKE_PROFIT_MARKET` |
+| Input Type | Futures Equivalent | Tab | Fill |
+|------------|-------------------|-----|------|
+| `MARKET` | `MARKET` | — | Immediate (taker) |
+| `LIMIT` | `LIMIT` | Basic | Rests at price (maker) |
+| `STOP_LOSS` (stop_loss) | `STOP` (stop-limit) | Conditional | Triggers at stopPrice, fills as LIMIT |
+| `TAKE_PROFIT` (take_profit) | `TAKE_PROFIT` (tp-limit) | Conditional | Triggers at tpPrice, fills as LIMIT |
+
+**SL/TP strategy (v54+):** `stop_loss()` places a `STOP` (stop-limit) conditional
+order; `take_profit()` places a `TAKE_PROFIT` (tp-limit) conditional order. Both
+fill as LIMIT (no slippage) once their trigger price is touched.
+
+**Fallbacks:** If `STOP`/`TAKE_PROFIT` are blocked on a contract (`-4120`), the
+order service falls back: SL → position-manager monitoring (closes via LIMIT on
+breach); TP → resting Basic-tab `LIMIT` at the TP price. None of these are
+`MARKET` — the bot is LIMIT-only by design.
 
 ### Futures-Specific Features
 
