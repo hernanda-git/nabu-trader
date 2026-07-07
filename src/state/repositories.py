@@ -75,6 +75,30 @@ class SignalRepository:
         )
         self.conn.commit()
 
+    def claim(self, message_id: int, raw_text: str = "") -> bool:
+        """Atomically reserve a message_id at the start of processing.
+
+        Returns ``True`` if THIS call is the first/owner of the message (so it
+        should proceed), ``False`` if the message was already claimed or is
+        already in-flight (so the caller must skip it to avoid duplicate work
+        and duplicate Telegram notifications).
+
+        The method is await-free, so under asyncio's single-threaded event loop
+        it runs to completion without yielding — making it atomic with respect
+        to concurrent event handlers (e.g. a channel ``NewMessage`` and
+        ``MessageEdited`` event for the same ``message_id`` racing each other,
+        or a reconnect replaying an event). The first delivery claims the id
+        and proceeds; every later delivery for that id returns ``False`` and is
+        skipped before any LLM call or notification fires.
+        """
+        h = hashlib.sha256(raw_text.encode()).hexdigest()
+        cur = self.conn.execute(
+            "INSERT OR IGNORE INTO processed_signals (message_id, signal_hash) VALUES (?, ?)",
+            (message_id, h),
+        )
+        self.conn.commit()
+        return cur.rowcount == 1
+
 
 # ═════════════════════════════════════════════════════════════════════════════
 # Decision Repository

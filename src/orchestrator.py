@@ -186,6 +186,18 @@ class TradeOrchestrator:
         result["correlation_id"] = correlation_id
 
         try:
+            # ── Step 0: Idempotent claim ────────────────────────────────────
+            # Prevent double-processing / double Telegram notifications when the
+            # same message_id is delivered more than once (channel post + an
+            # immediate edit event on the same id, a reconnect replay, etc.).
+            # The first delivery claims the id and proceeds; all later ones are
+            # skipped here — before any LLM call or notification.
+            if not self.signal_repo.claim(message_id, raw_text):
+                log.info("Message %s already claimed — skipping duplicate delivery", message_id)
+                result["action"] = "duplicate"
+                result["skipped"] = True
+                return result
+
             # ── Step 1: Regex Pre-Parse ────────────────────────────────────
             signal = parse_signal(message_id, channel, raw_text, has_media)
             log.info("Parsed signal: pair=%s dir=%s entry=%s",
