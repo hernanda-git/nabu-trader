@@ -339,6 +339,23 @@ class PendingSignalRepository:
         )
         self.conn.commit()
 
+    def cancel(self, signal_id: int) -> bool:
+        """Cancel a pending signal. Returns True if it was pending."""
+        cur = self.conn.execute(
+            "UPDATE pending_signals SET status = 'CANCELLED' WHERE id = ? AND status = 'PENDING'",
+            (signal_id,),
+        )
+        self.conn.commit()
+        return cur.rowcount > 0
+
+    def cancel_all(self) -> int:
+        """Cancel all pending signals. Returns count cancelled."""
+        cur = self.conn.execute(
+            "UPDATE pending_signals SET status = 'CANCELLED' WHERE status = 'PENDING'"
+        )
+        self.conn.commit()
+        return cur.rowcount
+
     def _row_to_signal(self, row: sqlite3.Row) -> PendingSignal:
         return PendingSignal(**dict(row))
 

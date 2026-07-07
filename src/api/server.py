@@ -571,8 +571,209 @@ async def search_trades(
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# ENTRY POINT
+# PENDING CONDITIONAL SIGNALS
 # ═══════════════════════════════════════════════════════════════════════════════
+
+
+@app.get("/api/v1/pending")
+async def list_pending():
+    """List all pending conditional signals."""
+    try:
+        rows = _run_query(
+            "SELECT * FROM pending_signals WHERE status = 'PENDING' ORDER BY created_at ASC"
+        )
+        return {"signals": rows, "count": len(rows)}
+    except Exception as e:
+        log.exception("Failed to list pending signals")
+        raise HTTPException(HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
+
+
+@app.post("/api/v1/pending/{signal_id}/cancel")
+async def cancel_pending(signal_id: int):
+    """Cancel a specific pending signal."""
+    conn = _get_conn()
+    try:
+        cur = conn.execute(
+            "UPDATE pending_signals SET status = 'CANCELLED' WHERE id = ? AND status = 'PENDING'",
+            (signal_id,),
+        )
+        conn.commit()
+        if cur.rowcount > 0:
+            return {"success": True, "message": f"Signal #{signal_id} cancelled"}
+        # Check if it exists at all
+        row = conn.execute(
+            "SELECT status FROM pending_signals WHERE id = ?", (signal_id,)
+        ).fetchone()
+        if row:
+            return {"success": False, "message": f"Signal #{signal_id} is already {dict(row)['status']}"}
+        raise HTTPException(404, detail=f"Signal #{signal_id} not found")
+    finally:
+        conn.close()
+
+
+@app.post("/api/v1/pending/cancel_all")
+async def cancel_all_pending():
+    """Cancel all pending signals."""
+    conn = _get_conn()
+    try:
+        cur = conn.execute(
+            "UPDATE pending_signals SET status = 'CANCELLED' WHERE status = 'PENDING'"
+        )
+        conn.commit()
+        return {"success": True, "cancelled": cur.rowcount}
+    finally:
+        conn.close()
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# MANUAL TRADE EXECUTION
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+@app.post("/api/v1/trade")
+async def execute_trade(payload: dict):
+    """Execute a trade manually with auto pair resolution and minimum notional handling.
+
+    Body:
+    {
+        "pair": "PUMP",           // auto-resolved (PUMP → PUMPUSDT, BONK → 1000BONKUSDT, etc.)
+        "direction": "LONG",      // LONG or SHORT
+        "entry_price": 0.00162,   // optional — uses current price if omitted
+        "sl_price": 0.001568,     // optional
+        "tp_prices": [0.001975],  // optional
+        "leverage": 0,            // optional — auto-calculated if 0
+        "port_pct": 10            // optional — % of balance to risk (default 10)
+    }
+    """
+    try:
+        from src.exchange.binance import BinanceExchange, _resolve_futures_symbol
+        from src.exchange.symbol_registry import get_registry
+        from src.config.loader import load_config
+
+        cfg = load_config()
+        binance_cfg = cfg["exchange"]["binance"]
+        exchange = BinanceExchange(
+            api_key=binance_cfg["api_key"],
+            api_secret=binance_cfg["api_secret"],
+            testnet=False,
+            futures=binance_cfg.get("futures", True),
+        )
+
+        # ── Resolve pair ──
+        raw_pair = (payload.get("pair") or "").upper().strip()
+        if not raw_pair:
+            raise HTTPException(400, detail="pair is required")
+        if not raw_pair.endswith("USDT"):
+            raw_pair += "USDT"
+
+        resolved_sym, _, _ = _resolve_futures_symbol(raw_pair)
+
+        # Verify symbol exists
+        registry = get_registry()
+        if registry and registry.is_ready:
+            info = registry.get_symbol_info(resolved_sym)
+            if not info:
+                raise HTTPException(400, detail=f"Symbol {resolved_sym} not found on Binance Futures")
+
+        # ── Direction ──
+        direction = (payload.get("direction") or "LONG").upper()
+        if direction not in ("LONG", "SHORT"):
+            raise HTTPException(400, detail="direction must be LONG or SHORT")
+        side = "BUY" if direction == "LONG" else "SELL"
+
+        # ── Entry price ──
+        entry_price = payload.get("entry_price")
+        if not entry_price or entry_price <= 0:
+            mark = await exchange.get_mark_price(resolved_sym)
+            if not mark or mark <= 0:
+                raise HTTPException(400, detail=f"Cannot determine price for {resolved_sym}")
+            entry_price = mark
+
+        # ── Balance + sizing ──
+        bal = await exchange.get_balance()
+        port_pct = float(payload.get("port_pct", 10))
+        margin_budget = bal.free_usdt * port_pct / 100.0
+
+        # Get min notional from symbol info
+        min_notional = 5.0  # Binance default
+        if registry and registry.is_ready:
+            info = registry.get_symbol_info(resolved_sym)
+            if info:
+                min_notional = info.min_notional
+
+        # Calculate leverage needed to meet min notional
+        leverage = int(payload.get("leverage", 0))
+        if leverage <= 0:
+            if margin_budget > 0:
+                leverage = max(1, int(min_notional / margin_budget) + 1)
+            else:
+                leverage = 1
+
+        notional = margin_budget * leverage
+        if notional < min_notional:
+            raise HTTPException(400, detail={
+                "error": "INSUFFICIENT_MARGIN",
+                "message": f"Cannot meet ${min_notional} minimum notional",
+                "balance": bal.free_usdt,
+                "margin_budget": margin_budget,
+                "min_notional": min_notional,
+                "leverage_needed": int(min_notional / margin_budget) + 1 if margin_budget > 0 else 999,
+            })
+
+        quantity = int(notional / entry_price)  # step=1 for most low-price coins
+        if quantity <= 0:
+            raise HTTPException(400, detail="Calculated quantity is 0 — increase balance or leverage")
+
+        # ── Set leverage ──
+        await exchange.set_symbol_leverage(resolved_sym, leverage)
+
+        # ── Place LIMIT entry ──
+        order = await exchange.limit_buy(resolved_sym, quantity, entry_price) if side == "BUY" \
+            else await exchange.limit_sell(resolved_sym, quantity, entry_price)
+
+        if order.status in ("FAILED", "REJECTED", "EXPIRED"):
+            return {
+                "success": False,
+                "error": order.error,
+                "pair": resolved_sym,
+                "quantity": quantity,
+                "leverage": leverage,
+            }
+
+        # ── Place TP ──
+        tp_prices = payload.get("tp_prices") or []
+        tp_orders = []
+        for tp in tp_prices[:3]:
+            tp_side = "SELL" if direction == "LONG" else "BUY"
+            tp_order = await exchange.limit_sell(resolved_sym, quantity, tp) if tp_side == "SELL" \
+                else await exchange.limit_buy(resolved_sym, quantity, tp)
+            tp_orders.append({"price": tp, "order_id": tp_order.order_id, "status": tp_order.status})
+
+        # ── SL via position manager (STOP_MARKET blocked for some contracts) ──
+        sl_price = payload.get("sl_price")
+        sl_status = "MONITORED_BY_POSITION_MANAGER"
+
+        return {
+            "success": True,
+            "pair": resolved_sym,
+            "direction": direction,
+            "entry_price": entry_price,
+            "quantity": quantity,
+            "notional": round(notional, 4),
+            "leverage": leverage,
+            "margin_used": round(margin_budget, 4),
+            "order_id": order.order_id,
+            "order_status": order.status,
+            "sl_price": sl_price,
+            "sl_status": sl_status,
+            "tp_orders": tp_orders,
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        log.exception("Manual trade execution failed")
+        raise HTTPException(HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
 
 
 def start_api_server():

@@ -130,6 +130,10 @@ class SignalListener:
                 await self._handle_setport(event)
             elif cmd == "/getport":
                 await self._handle_getport(event)
+            elif cmd == "/pending":
+                await self._handle_pending(event)
+            elif cmd.startswith("/cancel"):
+                await self._handle_cancel(event)
 
         await self.client.run_until_disconnected()
 
@@ -203,7 +207,10 @@ class SignalListener:
             "📋 **Available Commands**\n\n"
             "  /balance    — Show futures account balance\n"
             "  /positions  — Show all open futures positions\n"
-            "  /setport N  — Set margin per trade to $N (e.g. /setport 2)\n"
+            "  /pending    — List pending conditional signals\n"
+            "  /cancel <id> — Cancel a pending signal\n"
+            "  /cancel all — Cancel all pending signals\n"
+            "  /setport N  — Set margin per trade to $N\n"
             "  /getport    — Show current margin per trade\n"
             "  /version    — Show bot version\n"
             "  /help       — Show this message\n\n"
@@ -262,3 +269,65 @@ class SignalListener:
             f"Leverage = position value ÷ ${port:.2f}\n\n"
             f"Change it with `/setport <value>`"
         )
+
+    async def _handle_pending(self, event):
+        """Handle /pending — list all pending conditional signals."""
+        psr = getattr(self.orchestrator, 'pending_signal_repo', None)
+        if not psr:
+            await event.reply("❌ Pending signal repository not configured.")
+            return
+        log.info("Command: /pending")
+        try:
+            pending = psr.get_pending()
+            if not pending:
+                await event.reply("📭 **No pending conditions**\n\nNo conditional signals waiting to trigger.")
+                return
+            lines = ["⏳ **Pending Conditional Signals**\n"]
+            for ps in pending:
+                emoji = "🟢" if ps.direction == "LONG" else "🔴"
+                cond = "close >" if ps.condition_type == "close_above" else "close <"
+                lines.append(
+                    f"{emoji} **#{ps.id} — {ps.pair}**\n"
+                    f"   ├ Direction: `{ps.direction}`\n"
+                    f"   ├ Condition: `{cond}` `{ps.trigger_price:.8f}`\n"
+                    f"   ├ Timeframe: `{ps.timeframe}`\n"
+                    f"   └ Created: `{ps.created_at}`\n"
+                )
+            lines.append(f"Cancel: `/cancel <id>` or `/cancel all`")
+            await event.reply("\n".join(lines))
+        except Exception as e:
+            log.exception("Failed to fetch pending signals")
+            await event.reply(f"❌ **Error:** `{e}`")
+
+    async def _handle_cancel(self, event):
+        """Handle /cancel <id> or /cancel all — cancel pending signals."""
+        psr = getattr(self.orchestrator, 'pending_signal_repo', None)
+        if not psr:
+            await event.reply("❌ Pending signal repository not configured.")
+            return
+        parts = (event.message.text or "").strip().split()
+        if len(parts) < 2:
+            await event.reply(
+                "⚠️ **Usage:**\n"
+                "  `/cancel <id>` — cancel a specific signal\n"
+                "  `/cancel all` — cancel all pending signals"
+            )
+            return
+        target = parts[1].lower()
+        log.info("Command: /cancel %s", target)
+        try:
+            if target == "all":
+                count = psr.cancel_all()
+                await event.reply(f"✅ **Cancelled {count}** pending signal(s)." if count else "📭 No pending signals to cancel.")
+            else:
+                signal_id = int(target)
+                ok = psr.cancel(signal_id)
+                if ok:
+                    await event.reply(f"✅ **Cancelled signal #{signal_id}**")
+                else:
+                    await event.reply(f"⚠️ Signal #{signal_id} not found or already processed.")
+        except ValueError:
+            await event.reply(f"❌ Invalid ID: `{parts[1]}`. Use `/cancel <id>` or `/cancel all`.")
+        except Exception as e:
+            log.exception("Failed to cancel signal")
+            await event.reply(f"❌ **Error:** `{e}`")
