@@ -22,6 +22,8 @@ import os
 import sys
 from pathlib import Path
 
+# Used in shutdown for api_task cancellation
+
 # Ensure project root is on path
 ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
@@ -43,12 +45,16 @@ from src.notifier.telegram import TelegramNotifier
 from src.orchestrator import TradeOrchestrator
 from src.state.database import get_connection
 from src.state.repositories import (
+    ConfigSnapshotRepository,
     DecisionRepository,
     EventRepository,
+    LLMInteractionRepository,
     OrderRepository,
     PendingSignalRepository,
+    PositionEventRepository,
     PositionRepository,
     SignalRepository,
+    TradeLogRepository,
 )
 
 log = logging.getLogger("main")
@@ -95,6 +101,10 @@ async def main():
     position_repo = PositionRepository(conn)
     event_repo = EventRepository(conn)
     pending_signal_repo = PendingSignalRepository(conn)
+    llm_repo = LLMInteractionRepository(conn)
+    trade_log_repo = TradeLogRepository(conn)
+    position_event_repo = PositionEventRepository(conn)
+    config_snapshot_repo = ConfigSnapshotRepository(conn)
 
     # ── Event Bus ────────────────────────────────────────────────────────
     event_bus = EventBus()
@@ -136,9 +146,29 @@ async def main():
     # ── Notifier ─────────────────────────────────────────────────────────
     notifier = TelegramNotifier(bot_token=bot_token, chat_id=notify_chat_id)
 
+    # Determine version: Fly.io release version, git commit hash, or package version
+    app_version = os.environ.get("FLY_RELEASE_VERSION") or os.environ.get("SOURCE_VERSION", "")
+    if not app_version:
+        try:
+            import subprocess
+            result = subprocess.run(
+                ["git", "-C", str(Path(__file__).resolve().parent.parent), "rev-parse", "--short", "HEAD"],
+                capture_output=True, text=True, timeout=5,
+            )
+            app_version = result.stdout.strip()
+        except Exception:
+            app_version = ""
+    if not app_version:
+        try:
+            from src.version import __version__  # type: ignore[import-untyped]
+            app_version = __version__
+        except Exception:
+            app_version = ""
+    version_str = f"v{app_version}" if app_version and not app_version.startswith("v") else app_version
+
     if bot_token:
         log.info("Telegram notifier ready (chat_id=%s)", notify_chat_id)
-        await notifier.notify_startup()
+        await notifier.notify_startup(version=version_str or None)
         await notifier.set_commands()
     else:
         log.warning("TELEGRAM_BOT_TOKEN not set — notifications disabled")
@@ -146,7 +176,29 @@ async def main():
     # ── Position Manager ─────────────────────────────────────────────────
     position_manager = PositionManager(exchange, cfg, position_repo,
                                        pending_signal_repo=pending_signal_repo,
+                                       position_event_repo=position_event_repo,
                                        notifier=notifier)
+
+    # ── API Server (background task) ──────────────────────────────────────
+    api_task = None
+    if cfg.get("api", {}).get("enabled", True):
+        try:
+            import asyncio
+            import uvicorn
+            from src.api.server import app as api_app
+
+            api_host = cfg.get("api", {}).get("host", "0.0.0.0")
+            api_port = cfg.get("api", {}).get("port", 9090)
+
+            async def start_api():
+                config = uvicorn.Config(api_app, host=api_host, port=api_port, log_level="info")
+                server = uvicorn.Server(config)
+                await server.serve()
+
+            api_task = asyncio.create_task(start_api())
+            log.info("API bridge starting on %s:%d", api_host, api_port)
+        except Exception as e:
+            log.warning("API bridge not started: %s", e)
 
     # ── Orchestrator ─────────────────────────────────────────────────────
     orchestrator = TradeOrchestrator(
@@ -163,15 +215,20 @@ async def main():
         order_repo=order_repo,
         position_repo=position_repo,
         event_repo=event_repo,
+        llm_repo=llm_repo,
+        trade_log_repo=trade_log_repo,
+        position_event_repo=position_event_repo,
+        config_snapshot_repo=config_snapshot_repo,
         event_bus=event_bus,
         pending_signal_repo=pending_signal_repo,
+        app_version=version_str or "",
     )
 
     # Wire orchestrator to position manager for trigger auto-entry
     position_manager._orchestrator = orchestrator
 
     # ── Listener ─────────────────────────────────────────────────────────
-    listener = SignalListener(orchestrator, cfg, exchange=exchange)
+    listener = SignalListener(orchestrator, cfg, exchange=exchange, version=version_str or None)
 
     # ── Start ────────────────────────────────────────────────────────────
     try:
@@ -182,6 +239,12 @@ async def main():
     finally:
         await listener.stop()
         await position_manager.stop()
+        if api_task:
+            api_task.cancel()
+            try:
+                await api_task
+            except (asyncio.CancelledError, Exception):
+                pass
         conn.close()
         log.info("Goodbye.")
 

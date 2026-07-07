@@ -35,3 +35,20 @@ agent:
 monitoring:
   check_interval_seconds: 10
   health_check_port: 9090
+
+# ─── API Bridge ──────────────────────────────────────────────────
+# Secure HTTP API for Hermes ↔ Fly.io interaction.
+# Port 9090 is already exposed by fly.toml [http_service].
+api:
+  enabled: true
+  host: "0.0.0.0"
+  port: 9090
+  # API_KEY is loaded from environment (Fly.io secret)
+  # Rate limiting: 30 req/min per IP (hardcoded in auth.py)
+
+# ─── Webhook ─────────────────────────────────────────────────────
+# Push trade events to a Hermes webhook endpoint.
+# WEBHOOK_URL and WEBHOOK_HMAC_SECRET are loaded from environment.
+webhook:
+  url: ""                       # Set via env WEBHOOK_URL or config
+  hmac_secret: ""               # Set via env WEBHOOK_HMAC_SECRET or config

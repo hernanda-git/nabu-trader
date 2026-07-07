@@ -37,10 +37,19 @@ class OrderService:
         """Generate a unique, idempotent client order ID."""
         return f"lnr_{decision_id}_{uuid.uuid4().hex[:8]}"
 
-    async def execute(self, signal_id: int, decision: TradeDecision) -> ExecutionResult:
-        """Execute a trade decision and return the result."""
-        # Save decision
-        decision_id = self.decision_repo.save(signal_id, decision)
+    async def execute(self, signal_id: int, decision: TradeDecision,
+                      decision_id: int | None = None) -> ExecutionResult:
+        """Execute a trade decision and return the result.
+
+        Args:
+            signal_id: The DB ID of the signal triggering this decision.
+            decision: The trade decision to execute.
+            decision_id: Optional pre-saved decision ID. If None, the decision
+                         is saved internally and a new ID is created.
+        """
+        # Save decision if not pre-saved
+        if decision_id is None:
+            decision_id = self.decision_repo.save(signal_id, decision)
 
         if decision.action == "SKIP":
             return ExecutionResult(success=True, status="SKIPPED",

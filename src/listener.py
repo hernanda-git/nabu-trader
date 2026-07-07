@@ -20,10 +20,11 @@ log = logging.getLogger("listener")
 class SignalListener:
     """Telethon-based listener that forwards messages to the orchestrator."""
 
-    def __init__(self, orchestrator: TradeOrchestrator, config: dict, exchange: Exchange | None = None):
+    def __init__(self, orchestrator: TradeOrchestrator, config: dict, exchange: Exchange | None = None, version: str | None = None):
         self.orchestrator = orchestrator
         self.config = config
         self.exchange = exchange or getattr(orchestrator, 'exchange', None)
+        self.version = version
 
         # Load Telegram API credentials
         load_dotenv(Path(__file__).parent.parent / ".env")
@@ -96,6 +97,8 @@ class SignalListener:
                 await self._handle_balance(event)
             elif cmd == "/help":
                 await self._handle_help(event)
+            elif cmd == "/version":
+                await self._handle_version(event)
 
         await self.client.run_until_disconnected()
 
@@ -168,7 +171,18 @@ class SignalListener:
             "📋 **Available Commands**\n\n"
             "  /balance    — Show futures account balance\n"
             "  /positions  — Show all open futures positions\n"
+            "  /version    — Show bot version\n"
             "  /help       — Show this message\n\n"
             "The bot automatically processes signals from @YOUR_SIGNAL_CHANNEL and\n"
             "executes trades on Binance Futures when conditions are met."
+        )
+
+    async def _handle_version(self, event):
+        """Handle /version — show bot version."""
+        ver = self.version or "unknown"
+        await event.reply(
+            f"📦 **Crypto Signal Auto-Trade**\n\n"
+            f"Version: `{ver}`\n"
+            f"Mode: `{'🚀 YOLO auto-trade' if self.config.get('agent', {}).get('auto_trade') else '🔍 Dry run (no trades)'}`\n\n"
+            f"_Deployed on Fly.io (Singapore)_"
         )

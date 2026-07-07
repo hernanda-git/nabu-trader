@@ -9,7 +9,16 @@ import sqlite3
 from datetime import datetime, timezone
 from typing import Any
 
-from src.domain.models import PendingSignal, Position, TradeDecision, TradeSignal
+from src.domain.models import (
+    ConfigSnapshot,
+    LLMInteraction,
+    PendingSignal,
+    Position,
+    PositionEvent,
+    TradeDecision,
+    TradeLogEntry,
+    TradeSignal,
+)
 from src.state.database import get_connection, json_dumps, json_loads
 
 log = logging.getLogger("state.repositories")
@@ -269,3 +278,167 @@ class PendingSignalRepository:
 
     def _row_to_signal(self, row: sqlite3.Row) -> PendingSignal:
         return PendingSignal(**dict(row))
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# LLM Interaction Repository
+# ═════════════════════════════════════════════════════════════════════════════
+
+
+class LLMInteractionRepository:
+    def __init__(self, conn: sqlite3.Connection | None = None):
+        self.conn = conn or get_connection()
+
+    def save(self, interaction: LLMInteraction) -> int:
+        self.conn.execute(
+            """INSERT INTO llm_interactions
+               (decision_id, model, system_prompt, user_prompt, raw_response,
+                parsed_decision_json, prompt_tokens, completion_tokens,
+                latency_ms, success, error)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                interaction.decision_id,
+                interaction.model,
+                interaction.system_prompt,
+                interaction.user_prompt,
+                interaction.raw_response,
+                interaction.parsed_decision_json,
+                interaction.prompt_tokens,
+                interaction.completion_tokens,
+                interaction.latency_ms,
+                1 if interaction.success else 0,
+                interaction.error,
+            ),
+        )
+        self.conn.commit()
+        return self.conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+
+    def get_by_decision_id(self, decision_id: int) -> list[LLMInteraction]:
+        cursor = self.conn.execute(
+            "SELECT * FROM llm_interactions WHERE decision_id = ? ORDER BY created_at",
+            (decision_id,),
+        )
+        return [LLMInteraction(**dict(r)) for r in cursor.fetchall()]
+
+    def get_all(self, limit: int = 50) -> list[LLMInteraction]:
+        cursor = self.conn.execute(
+            "SELECT * FROM llm_interactions ORDER BY created_at DESC LIMIT ?",
+            (limit,),
+        )
+        return [LLMInteraction(**dict(r)) for r in cursor.fetchall()]
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Trade Log Repository
+# ═════════════════════════════════════════════════════════════════════════════
+
+
+class TradeLogRepository:
+    def __init__(self, conn: sqlite3.Connection | None = None):
+        self.conn = conn or get_connection()
+
+    def log(self, correlation_id: str, level: str, module: str,
+            message: str, metadata: dict | None = None) -> int:
+        self.conn.execute(
+            """INSERT INTO trade_logs (correlation_id, level, module, message, metadata_json)
+               VALUES (?, ?, ?, ?, ?)""",
+            (correlation_id, level, module, message, json_dumps(metadata or {})),
+        )
+        self.conn.commit()
+        return self.conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+
+    def get_by_correlation(self, correlation_id: str) -> list[dict]:
+        cursor = self.conn.execute(
+            "SELECT * FROM trade_logs WHERE correlation_id = ? ORDER BY created_at",
+            (correlation_id,),
+        )
+        return [dict(r) for r in cursor.fetchall()]
+
+    def get_by_level(self, level: str, limit: int = 50) -> list[dict]:
+        cursor = self.conn.execute(
+            "SELECT * FROM trade_logs WHERE level = ? ORDER BY created_at DESC LIMIT ?",
+            (level, limit),
+        )
+        return [dict(r) for r in cursor.fetchall()]
+
+    def get_by_module(self, module: str, limit: int = 50) -> list[dict]:
+        cursor = self.conn.execute(
+            "SELECT * FROM trade_logs WHERE module = ? ORDER BY created_at DESC LIMIT ?",
+            (module, limit),
+        )
+        return [dict(r) for r in cursor.fetchall()]
+
+    def get_recent(self, limit: int = 50) -> list[dict]:
+        cursor = self.conn.execute(
+            "SELECT * FROM trade_logs ORDER BY created_at DESC LIMIT ?",
+            (limit,),
+        )
+        return [dict(r) for r in cursor.fetchall()]
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Position Event Repository
+# ═════════════════════════════════════════════════════════════════════════════
+
+
+class PositionEventRepository:
+    def __init__(self, conn: sqlite3.Connection | None = None):
+        self.conn = conn or get_connection()
+
+    def save_event(self, position_id: int, event_type: str,
+                   details: str = "", metadata: dict | None = None) -> int:
+        self.conn.execute(
+            """INSERT INTO position_events (position_id, event_type, details, metadata_json)
+               VALUES (?, ?, ?, ?)""",
+            (position_id, event_type, details, json_dumps(metadata or {})),
+        )
+        self.conn.commit()
+        return self.conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+
+    def get_by_position(self, position_id: int) -> list[dict]:
+        cursor = self.conn.execute(
+            "SELECT * FROM position_events WHERE position_id = ? ORDER BY created_at",
+            (position_id,),
+        )
+        return [dict(r) for r in cursor.fetchall()]
+
+    def get_by_type(self, event_type: str, limit: int = 50) -> list[dict]:
+        cursor = self.conn.execute(
+            "SELECT * FROM position_events WHERE event_type = ? ORDER BY created_at DESC LIMIT ?",
+            (event_type, limit),
+        )
+        return [dict(r) for r in cursor.fetchall()]
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Config Snapshot Repository
+# ═════════════════════════════════════════════════════════════════════════════
+
+
+class ConfigSnapshotRepository:
+    def __init__(self, conn: sqlite3.Connection | None = None):
+        self.conn = conn or get_connection()
+
+    def save(self, config_hash: str, config_yaml: str,
+             app_version: str = "") -> int:
+        self.conn.execute(
+            """INSERT INTO config_snapshots (config_hash, config_yaml, app_version)
+               VALUES (?, ?, ?)""",
+            (config_hash, config_yaml, app_version),
+        )
+        self.conn.commit()
+        return self.conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+
+    def get_by_id(self, snap_id: int) -> dict | None:
+        cursor = self.conn.execute(
+            "SELECT * FROM config_snapshots WHERE id = ?", (snap_id,)
+        )
+        row = cursor.fetchone()
+        return dict(row) if row else None
+
+    def get_all(self, limit: int = 20) -> list[dict]:
+        cursor = self.conn.execute(
+            "SELECT * FROM config_snapshots ORDER BY created_at DESC LIMIT ?",
+            (limit,),
+        )
+        return [dict(r) for r in cursor.fetchall()]
