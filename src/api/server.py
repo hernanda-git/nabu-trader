@@ -745,8 +745,7 @@ async def execute_trade(payload: dict):
         tp_orders = []
         for tp in tp_prices[:3]:
             tp_side = "SELL" if direction == "LONG" else "BUY"
-            tp_order = await exchange.limit_sell(resolved_sym, quantity, tp) if tp_side == "SELL" \
-                else await exchange.limit_buy(resolved_sym, quantity, tp)
+            tp_order = await exchange.take_profit(resolved_sym, quantity, tp, tp_side)
             tp_orders.append({"price": tp, "order_id": tp_order.order_id, "status": tp_order.status})
 
         # ── SL via position manager (STOP_MARKET blocked for some contracts) ──

@@ -228,15 +228,12 @@ class OrderService:
             else:
                 log.warning("SL NOT placed for %s @ %s — position is UNPROTECTED", symbol, decision.sl_price)
 
-        # Place TP orders (only if SL placed or no SL configured)
+        # Place TP orders as conditional TAKE_PROFIT-LIMIT (only if SL placed or no SL configured)
         for i, tp_price in enumerate(decision.tp_prices[:3]):
             tp_side = "SELL" if decision.direction == "LONG" else "BUY"
-            if tp_side == "SELL":
-                tp_order = await self.exchange.limit_sell(symbol, quantity, tp_price)
-            else:
-                tp_order = await self.exchange.limit_buy(symbol, quantity, tp_price)
+            tp_order = await self.exchange.take_profit(symbol, quantity, tp_price, tp_side)
             if tp_order.order_id:
-                log.info("TP%d placed: %s @ %s", i + 1, symbol, tp_price)
+                log.info("TP%d placed: %s @ %s (conditional)", i + 1, symbol, tp_price)
 
         log.info("Position opened: %s %s %s qty=%.4f", decision.direction, symbol, decision.order_type, quantity)
 
@@ -349,10 +346,7 @@ class OrderService:
                 # Place TP orders
                 for tp_price in original_decision.tp_prices[:3]:
                     tp_side = "SELL" if original_decision.direction == "LONG" else "BUY"
-                    if tp_side == "SELL":
-                        await self.exchange.limit_sell(symbol, new_qty, tp_price)
-                    else:
-                        await self.exchange.limit_buy(symbol, new_qty, tp_price)
+                    await self.exchange.take_profit(symbol, new_qty, tp_price, tp_side)
 
                 return ExecutionResult(
                     success=True,
@@ -495,10 +489,7 @@ class OrderService:
             if tp_price <= 0:
                 continue
             tp_side = "SELL" if position.direction == "LONG" else "BUY"
-            if tp_side == "SELL":
-                tp_order = await self.exchange.limit_sell(symbol, position.quantity, tp_price)
-            else:
-                tp_order = await self.exchange.limit_buy(symbol, position.quantity, tp_price)
+            tp_order = await self.exchange.take_profit(symbol, position.quantity, tp_price, tp_side)
             if tp_order.order_id:
                 tp_placed += 1
                 log.info("New TP%d placed: %s @ %s", i + 1, symbol, tp_price)

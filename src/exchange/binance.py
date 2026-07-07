@@ -762,38 +762,40 @@ class BinanceExchange(Exchange):
 
     async def stop_loss(self, symbol: str, quantity: float, stop_price: float,
                         side: str = "SELL") -> OrderInfo:
-        """Place a stop loss order.
+        """Place a stop-loss as a conditional STOP-LIMIT order.
 
-        For futures 1000x contracts (1000BONKUSDT etc.), STOP orders are blocked
-        by Binance with error -4120 (Use Algo Order API). The Algo API endpoints
-        all return 404, so SL/TP cannot be placed as exchange orders for these
-        contracts. This method returns a special "UNPROTECTED" status so the
-        caller knows SL was not placed and should rely on position-manager
-        price monitoring instead.
+        Uses STOP (not STOP_MARKET) so it appears in the Conditional tab
+        and fills as a LIMIT order at the specified price — no slippage.
 
-        1000x contract order strategy:
-        - ENTRY: MARKET (works normally)
-        - TAKE PROFIT: LIMIT SELL above market (works as a resting order)
-        - STOP LOSS: Cannot be placed — use position_manager monitoring
-          (poll 1m klines or mark price, close via MARKET if SL breached)
-
-        Using LIMIT SELL below market as a stop-loss substitute DOES NOT WORK
-        because it fills instantly at a worse price than the market would.
+        For 1000x contracts where STOP is blocked (-4120), falls back to
+        position manager monitoring.
         """
         resolve_sym, _, _ = _resolve_futures_symbol(symbol)
-        # Check if this is a 1000x contract type
         is_1000x = resolve_sym.startswith("1000")
 
         if self.futures and is_1000x:
-            log.info("STOP orders blocked for %s (1000x contract). SL will be monitored by position manager.", resolve_sym)
+            log.info("STOP orders blocked for %s (1000x). SL monitored by position manager.", resolve_sym)
             return OrderInfo(
                 order_id="", symbol=symbol, side=side.upper(),
-                type="STOP_LOSS", quantity=quantity,
+                type="STOP", quantity=quantity,
                 status="UNPROTECTED",
-                error="STOP orders not supported for 1000x contracts; SL handled by position manager monitoring",
+                error="STOP not supported for 1000x; SL handled by position manager",
             )
 
-        return await self._place_order(symbol, side, "STOP_LOSS", quantity, stop_price=stop_price)
+        # STOP-LIMIT: triggers at stop_price, fills as LIMIT at stop_price
+        return await self._place_order(symbol, side, "STOP", quantity,
+                                       price=stop_price, stop_price=stop_price)
+
+    async def take_profit(self, symbol: str, quantity: float, tp_price: float,
+                          side: str = "SELL") -> OrderInfo:
+        """Place a take-profit as a conditional TAKE_PROFIT-LIMIT order.
+
+        Uses TAKE_PROFIT (not TAKE_PROFIT_MARKET) so it appears in the
+        Conditional tab and fills as a LIMIT order — no slippage.
+        """
+        # TAKE_PROFIT-LIMIT: triggers at tp_price, fills as LIMIT at tp_price
+        return await self._place_order(symbol, side, "TAKE_PROFIT", quantity,
+                                       price=tp_price, stop_price=tp_price)
 
     async def cancel_order(self, symbol: str, order_id: str) -> bool:
         resolve_sym, _, _ = _resolve_futures_symbol(symbol)

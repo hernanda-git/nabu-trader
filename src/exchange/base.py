@@ -81,6 +81,11 @@ class Exchange(ABC):
         """Place stop-loss order."""
 
     @abstractmethod
+    async def take_profit(self, symbol: str, quantity: float, tp_price: float,
+                          side: str = "SELL") -> OrderInfo:
+        """Place take-profit order."""
+
+    @abstractmethod
     async def cancel_order(self, symbol: str, order_id: str) -> bool:
         """Cancel an open order."""
 
