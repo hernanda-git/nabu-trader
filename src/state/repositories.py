@@ -273,9 +273,12 @@ class PositionRepository:
     def _row_to_position(self, row: sqlite3.Row) -> Position:
         d = dict(row)
         tp_raw = d.pop("tp_prices", None)
+        # Only pass fields the Position dataclass accepts
+        valid = {f.name for f in Position.__dataclass_fields__.values()}
+        filtered = {k: v for k, v in d.items() if k in valid and v is not None}
         return Position(
             tp_prices=json_loads(tp_raw) or [],
-            **{k: d[k] for k in d if d[k] is not None},
+            **filtered,
         )
 
 
