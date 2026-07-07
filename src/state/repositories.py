@@ -75,7 +75,7 @@ class SignalRepository:
         )
         self.conn.commit()
 
-    def claim(self, message_id: int, raw_text: str = "") -> bool:
+    def claim(self, message_id: int, raw_text: str = "", window_seconds: int = 300) -> bool:
         """Atomically reserve a message_id at the start of processing.
 
         Returns ``True`` if THIS call is the first/owner of the message (so it
@@ -83,21 +83,47 @@ class SignalRepository:
         already in-flight (so the caller must skip it to avoid duplicate work
         and duplicate Telegram notifications).
 
+        Two duplicate-delivery patterns are caught:
+
+          1. **Same message_id** — a channel post immediately followed by an
+             edit event on the *same* id (Telegram often emits both). The
+             ``message_id`` PK makes the second insert a no-op.
+
+          2. **Same content, different id** — the channel emits a new message_id
+             (edit/forward/republish) carrying the *identical* text within a
+             short window. These are near-simultaneous (seconds), so a time
+             window (default 5 min) reliably collapses them while still letting
+             legitimately identical text recur much later (e.g. a daily
+             greeting) be processed normally.
+
         The method is await-free, so under asyncio's single-threaded event loop
         it runs to completion without yielding — making it atomic with respect
-        to concurrent event handlers (e.g. a channel ``NewMessage`` and
-        ``MessageEdited`` event for the same ``message_id`` racing each other,
-        or a reconnect replaying an event). The first delivery claims the id
-        and proceeds; every later delivery for that id returns ``False`` and is
-        skipped before any LLM call or notification fires.
+        to concurrent event handlers and reconnect replays.
         """
         h = hashlib.sha256(raw_text.encode()).hexdigest()
+
+        # Pattern 1 — same message_id already claimed.
         cur = self.conn.execute(
+            "SELECT 1 FROM processed_signals WHERE message_id = ?", (message_id,)
+        )
+        if cur.fetchone():
+            return False
+
+        # Pattern 2 — identical content delivered from a different id recently.
+        cur = self.conn.execute(
+            "SELECT 1 FROM processed_signals "
+            "WHERE signal_hash = ? AND processed_at >= datetime('now', ?)",
+            (h, f"-{window_seconds} seconds"),
+        )
+        if cur.fetchone():
+            return False
+
+        self.conn.execute(
             "INSERT OR IGNORE INTO processed_signals (message_id, signal_hash) VALUES (?, ?)",
             (message_id, h),
         )
         self.conn.commit()
-        return cur.rowcount == 1
+        return True
 
 
 # ═════════════════════════════════════════════════════════════════════════════
