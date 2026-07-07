@@ -2,20 +2,51 @@
 
 Gate 1 (pre-LLM): idempotency, cooldown, pair whitelist → skip before LLM cost.
 Gate 2 (post-LLM): clamp position size, max concurrent, daily loss,
-                   min_notional scaling, dynamic leverage calculation.
+                   portfolio notional cap, dynamic leverage calculation.
+
+Key improvements over the original:
+  - Position value defaults to a fixed PORTION of balance (`max_port_pct`, default 10%).
+    No more tight-SL blowups — the position is always predictable.
+  - SL distance is used ONLY as a risk check: if SL hit would lose > risk_pct
+    of balance, the position is shrunk proportionally.
+  - Leverage is snapped to Binance-valid values (1, 2, 3, 5, 7, 10, 15, 20,
+    25, 30, 50, 75, 100, 125) — no more 17x or 43x.
+  - Leverage is applied ONLY when needed to meet margin or min notional.
+    At 1x, the full position stays in your margin budget.
+  - A portfolio notional cap (`max_portfolio_leverage`) prevents over-leveraging
+    the entire account across multiple open positions.
+  - The fallback path (no SL / no balance) also computes valid leverage.
 """
 
 from __future__ import annotations
 
 import logging
-import math
 from dataclasses import replace as dc_replace
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
+from typing import Any
 
 from src.domain.models import TradeDecision, TradeSignal
 from src.state.repositories import PositionRepository, SignalRepository
 
 log = logging.getLogger("agent.gate")
+
+# ─── Binance-compatible leverage values ──────────────────────────────────
+# USDⓈ-M Futures supports these discrete levels only.
+_BINANCE_VALID_LEVERAGES = sorted({1, 2, 3, 5, 7, 10, 15, 20, 25, 30, 50, 75, 100, 125})
+
+
+def _snap_leverage(leverage: float, max_lev: int) -> int:
+    """Snap a computed leverage to the nearest valid Binance level, rounding up.
+
+    Example: 4 → 5, 6 → 7, 12 → 15, 17 → 20, 3.2 → 5
+    """
+    if leverage <= 1:
+        return 1
+    clamped = min(leverage, max_lev)
+    for v in _BINANCE_VALID_LEVERAGES:
+        if v >= clamped:
+            return min(v, max_lev)
+    return max_lev
 
 
 class SafetyGate1:
@@ -57,23 +88,31 @@ class SafetyGate1:
 
 
 class SafetyGate2:
-    """Post-LLM gate: hard limits + dynamic leverage + risk-based sizing.
+    """Post-LLM gate: hard limits + dual-constraint sizing + portfolio cap.
 
-    The LLM suggests SL/TP/direction; this gate computes the OPTIMAL quantity
-    so that max loss (if SL hit) ≤ risk_per_trade_percent of balance.
+    DUAL CONSTRAINT SIZING — two rules, both must be satisfied:
 
-    Sizing formula:
-      max_loss     = balance × risk_per_trade_percent / 100
-      sl_distance  = |entry - SL| / entry
-      pos_value    = max_loss / sl_distance   ← can be much larger than balance
-      leverage     = ceil(pos_value / (balance × margin_usage_pct / 100))
-      quantity     = pos_value / entry
+      🎯 Risk constraint (primary): position sized so SL loss ≤ risk_pct of balance
+      🛑 Port cap (hard ceiling):   position never exceeds max_port_pct of balance
 
-    This allows positions large enough to pass Binance min notional (~$5)
-    while capping actual risk to 10% of balance. Leverage handles the gap
-    between position value and available margin.
+      The port cap is the WORST-CASE limit — it only activates when a very
+      tight SL would make the risk-based position unacceptably large.
+      For normal SL distances, the risk-based size wins.
 
-    Fallback (no SL or no balance): clamp to max_position_size_usdt.
+    ── Formula Chain ──
+
+      1. pos_risk     = max_loss / sl_distance         ← risk-based ideal
+      2. pos_cap      = balance × max_port_pct / 100   ← 10% worst-case ceiling
+      3. pos_value    = MIN(pos_risk, pos_cap)         ← never exceed either
+      4. pos_value    = MAX(pos_value, min_notional)   ← but always meet min trade
+      5. quantity     = pos_value / price
+      6. leverage     = snap(pos_value / margin_target) only if > margin_target
+      7. margin check: pos_value / leverage ≤ margin_target
+
+    Portfolio cap (cross-position): existing_notional + pos_value ≤
+      balance × max_portfolio_leverage.
+
+    Fallback (no SL / no balance): use max_port_pct as the fallback.
     """
 
     def __init__(self, config: dict, position_repo: PositionRepository):
@@ -81,32 +120,28 @@ class SafetyGate2:
         self.position_repo = position_repo
 
     def check(self, decision: TradeDecision, balance_usdt: float | None = None) -> tuple[bool, str, TradeDecision]:
-        """Returns (allowed: bool, reason: str, clamped_decision).
-
-        If balance_usdt is provided, position sizing is dynamically
-        clamped to balance * risk_per_trade_percent / 100, and
-        leverage is calculated automatically.
-        """
-        # ── RISK-BASED POSITION SIZING ──────────────────────────────────
-        # Goal: max loss if SL hit ≤ risk_per_trade_percent of balance.
-        # This lets position VALUE exceed balance (via leverage) while
-        # keeping actual dollar risk capped at ~10% of balance.
-        # ──────────────────────────────────────────────────────────────
+        """Returns (allowed: bool, reason: str, clamped_decision)."""
         risk = self.config.get("risk", {})
         price = decision.entry_price or 0.0
-        risk_pct = risk.get("risk_per_trade_percent", 10)
-        max_size_hard = risk.get("max_position_size_usdt", 100)
-        max_lev = risk.get("max_leverage", 20)
-        margin_usage = risk.get("margin_usage_pct", 50)
-        min_notional = risk.get("min_notional_usdt", 1.0)
 
-        # 1. Max concurrent positions
+        # ── Read risk params ──────────────────────────────────────────────
+        risk_pct = risk.get("risk_per_trade_percent", 10)
+        max_port_pct = risk.get("max_port_pct", 10)            # hard ceiling % of balance
+        max_size_hard = risk.get("max_position_size_usdt", 100)  # USD absolute ceiling
+        max_lev = risk.get("max_leverage", 20)
+        port_usdt = risk.get("port_usdt", 1.0)                # $ margin to use per trade
+        margin_usage = risk.get("margin_usage_pct", 50)       # absolute cap % of balance
+        min_notional = risk.get("min_notional_usdt", 1.0)
+        max_portfolio_lev = risk.get("max_portfolio_leverage", 10)
+        # -------------------------------------------------------------------
+
+        # ── 1. Max concurrent positions ───────────────────────────────────
         max_concurrent = risk.get("max_concurrent_positions", 2)
         open_count = self.position_repo.get_open_count()
         if open_count >= max_concurrent:
             return False, f"Max concurrent positions reached ({open_count}/{max_concurrent})", decision
 
-        # 2. Daily loss limit
+        # ── 2. Daily loss limit ───────────────────────────────────────────
         daily_loss_pct = risk.get("daily_loss_limit_percent", 10)
         if daily_loss_pct > 0:
             daily_pnl = self.position_repo.get_daily_pnl()
@@ -114,8 +149,18 @@ class SafetyGate2:
             if daily_pnl < 0 and abs(daily_pnl) / bal * 100 >= daily_loss_pct:
                 return False, f"Daily loss limit reached ({abs(daily_pnl):.2f} USDT)", decision
 
-        # 3. Compute quantity from risk (SL distance) + leverage
-        sizing_reason = ""
+        # ── 3. Portfolio notional exposure ────────────────────────────────
+        if balance_usdt is not None and balance_usdt > 0 and max_portfolio_lev > 0:
+            existing_notional = self.position_repo.get_total_notional_usdt()
+            portfolio_budget = balance_usdt * max_portfolio_lev
+            log.info("Gate2 portfolio: existing=$%.2f  budget=$%.2f (%.1fx)",
+                     existing_notional, portfolio_budget, max_portfolio_lev)
+        else:
+            existing_notional = 0.0
+            portfolio_budget = float("inf")
+
+        # ── 4. Dual-constraint position sizing ────────────────────────────
+        sizing_reason: list[str] = []
         can_risk_size = (
             balance_usdt is not None
             and balance_usdt > 0
@@ -125,68 +170,126 @@ class SafetyGate2:
         )
 
         if can_risk_size:
-            # Risk-based: size so SL hit = max_loss
-            max_loss = balance_usdt * risk_pct / 100  # e.g. $8.11 * 10% = $0.81
-            sl_distance_pct = abs(price - (decision.sl_price or 0.0)) / price
+            # ── Risk-budget inputs ──────────────────────────────────────
+            max_allowed_loss = balance_usdt * risk_pct / 100.0    # e.g. $10
+            sl = decision.sl_price or 0.0
+            port_cap = balance_usdt * max_port_pct / 100.0        # e.g. $10
+
+            # Direction-aware SL distance
+            if decision.direction == "SHORT":
+                sl_distance_pct = abs(sl - price) / price
+            else:
+                sl_distance_pct = abs(price - sl) / price
+
             if sl_distance_pct > 0:
-                # position value that makes loss = max_loss when SL hit
-                # NO position-value cap — leverage handles the margin gap.
-                # User constraint: "no need to clamp position size, just
-                # make the loss no more than 10%, adjust leverage and portion"
-                pos_value = max_loss / sl_distance_pct
-                # ensure meets min notional (scale up, user accepts higher risk)
+                # ── Step A: risk-based ideal size ────────────────────
+                pos_value_risk = max_allowed_loss / sl_distance_pct
+
+                # ── Step B: hard ceiling (never exceed port_pct of balance) ──
+                pos_value = min(pos_value_risk, port_cap)
+
+                # Track which constraint won
+                if pos_value < pos_value_risk:
+                    sizing_reason.append(
+                        f"capped by port {max_port_pct}% (risk=$"
+                        f"{pos_value_risk:.2f} > port=${port_cap:.2f})"
+                    )
+
+                # ── Step C: effective loss after ceiling ─────────────
+                effective_max_loss = pos_value * sl_distance_pct
+
+                # ── Step D: min notional floor ──────────────────────
                 if pos_value < min_notional:
                     pos_value = min_notional
-                    sizing_reason += f"scaled to min notional ${min_notional:.2f}; "
+                    effective_max_loss = pos_value * sl_distance_pct
+                    sizing_reason.append(
+                        f"floored to min notional ${min_notional:.2f} "
+                        f"(effective risk ${effective_max_loss:.2f})"
+                    )
+
+                # ── Step E: portfolio notional ──────────────────────
+                if existing_notional + pos_value > portfolio_budget:
+                    pos_value = max(min_notional, portfolio_budget - existing_notional)
+                    effective_max_loss = pos_value * sl_distance_pct
+                    sizing_reason.append(
+                        f"trimmed by portfolio cap (budget=${portfolio_budget:.2f}, "
+                        f"used=${existing_notional:.2f})"
+                    )
+
+                # ── Step F: compute quantity ──────────────────────────
                 quantity = pos_value / price
-                # leverage: enough so margin ≤ margin_usage% of balance
-                margin_target = balance_usdt * margin_usage / 100
-                if margin_target > 0 and pos_value > 0:
-                    leverage = max(1, math.ceil(pos_value / margin_target))
+
+                # ── Step G: leverage = pos_value / port_usdt ────────────
+                margin_budget = min(port_usdt, balance_usdt * margin_usage / 100.0)
+                if margin_budget > 0 and pos_value > 0:
+                    raw_lev = pos_value / margin_budget
+                    leverage = _snap_leverage(raw_lev, max_lev)
                 else:
                     leverage = 1
-                leverage = min(leverage, max_lev)
+
+                # ── Step H: margin sanity check ─────────────────────
+                margin_needed = pos_value / leverage
+                if margin_needed > margin_budget:
+                    scale = margin_budget / margin_needed
+                    quantity *= scale
+                    pos_value = quantity * price
+                    effective_max_loss = pos_value * sl_distance_pct
+                    leverage = _snap_leverage(pos_value / max(margin_budget, 0.01), max_lev)
+                    sizing_reason.append(
+                        f"margin-adjusted after lev snap: qty×{scale:.3f}"
+                    )
+
                 decision = dc_replace(
                     decision, quantity=quantity, leverage=leverage,
-                    reason=(decision.reason or "") + f" [risk-sized: max_loss=${max_loss:.2f}, "
-                            f"sl_dist={sl_distance_pct*100:.2f}%, pos_val=${pos_value:.2f}, lev={leverage}x]"
+                    reason=(decision.reason or "") + (
+                        f" [dual-constrained: max_loss=${effective_max_loss:.2f}, "
+                        f"sl_dist={sl_distance_pct*100:.2f}%, "
+                        f"pos_val=${pos_value:.2f}, lev={leverage}x, "
+                        f"margin_needed=${margin_needed:.2f}]"
+                    ),
                 )
-                log.info("Gate2 risk-sizing: balance=$%.2f max_loss=$%.2f sl_dist=%.2f%% "
-                         "pos_val=$%.2f qty=%.6f lev=%dx",
-                         balance_usdt, max_loss, sl_distance_pct * 100,
-                         pos_value, quantity, leverage)
+                log.info(
+                    "Gate2 dual-constraint: bal=$%.2f max_loss=$%.2f sl_dist=%.2f%% "
+                    "pos_risk=$%.2f port_cap=$%.2f → pos=$%.2f qty=%.6f lev=%d",
+                    balance_usdt, max_allowed_loss, sl_distance_pct * 100,
+                    pos_value_risk, port_cap, pos_value, quantity, leverage,
+                )
             else:
-                # SL == entry → zero distance, can't risk-size; fallback
-                decision = dc_replace(decision, quantity=max_size_hard / price if price > 0 else 0)
-                sizing_reason += "SL==entry (zero distance), fallback sizing; "
+                # SL == entry → zero distance → fallback to port cap
+                fallback_qty = port_cap / price if price > 0 else 0
+                decision = dc_replace(decision, quantity=fallback_qty)
+                sizing_reason.append("SL==entry (zero distance), fallback to port size")
         else:
-            # Fallback: no SL or no balance → clamp to max_size_hard
-            fallback_qty = (max_size_hard / price) if price > 0 else 0
+            # ── Fallback: no SL / no balance → port cap ────────────────
+            if balance_usdt is not None and balance_usdt > 0:
+                port_cap = balance_usdt * max_port_pct / 100.0
+            else:
+                port_cap = max_size_hard
+            fallback_qty = (port_cap / price) if price > 0 else 0
             decision = dc_replace(decision, quantity=fallback_qty)
-            sizing_reason += "no SL/balance, fallback to max_position_size; "
-            # Still calculate leverage if we have balance
+            sizing_reason.append(f"no SL/balance, fallback to port=${port_cap:.2f}")
+
+            # Still compute sensible leverage if we have balance
             if balance_usdt is not None and balance_usdt > 0 and price > 0:
+                margin_budget = min(port_usdt, balance_usdt * margin_usage / 100.0)
                 pos_value = decision.quantity * price
-                margin_target = balance_usdt * margin_usage / 100
-                if margin_target > 0 and pos_value > 0:
-                    leverage = max(1, math.ceil(pos_value / margin_target))
-                    leverage = min(leverage, max_lev)
+                if margin_budget > 0 and pos_value > 0:
+                    raw_lev = pos_value / margin_budget
+                    leverage = _snap_leverage(raw_lev, max_lev)
                     decision = dc_replace(decision, leverage=leverage)
-                    sizing_reason += f"lev={leverage}x; "
+                    sizing_reason.append(f"lev={leverage}x")
 
-        # 4. Validate quantity > 0
+        # ── 5. Validate quantity > 0 ─────────────────────────────────────
         if decision.quantity <= 0:
-            log.info("Gate2 rejected: invalid quantity %.6f (reason: %s)", decision.quantity, decision.reason)
-            return False, f"{decision.reason}", decision
+            log.info("Gate2 rejected: invalid quantity %.6f", decision.quantity)
+            return False, f"Invalid quantity {decision.quantity:.6f}", decision
 
-        # 5. Validate SL is on correct side of entry price
+        # ── 6. Validate SL is on correct side of entry price ─────────────
         if decision.sl_price and decision.entry_price and decision.action == "ENTER":
             if decision.direction == "LONG" and decision.sl_price >= decision.entry_price:
                 return False, f"SL {decision.sl_price} >= entry {decision.entry_price} for LONG", decision
             if decision.direction == "SHORT" and decision.sl_price <= decision.entry_price:
                 return False, f"SL {decision.sl_price} <= entry {decision.entry_price} for SHORT", decision
 
-        # Compose final reason
-        gate_reason = sizing_reason.rstrip("; ") if sizing_reason else ""
-
+        gate_reason = "; ".join(sizing_reason) if sizing_reason else ""
         return True, gate_reason, decision

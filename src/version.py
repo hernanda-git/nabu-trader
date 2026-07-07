@@ -1,3 +1,3 @@
 """Package version — updated automatically during deploy."""
 
-__version__ = "v40"
+__version__ = "v43"

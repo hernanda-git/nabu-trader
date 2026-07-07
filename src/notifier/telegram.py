@@ -132,6 +132,8 @@ class TelegramNotifier:
                 "commands": [
                     {"command": "balance", "description": "Show futures account balance"},
                     {"command": "positions", "description": "Show all open futures positions"},
+                    {"command": "setport", "description": "Set margin $ per trade (lev auto)"},
+                    {"command": "getport", "description": "Show current margin per trade"},
                     {"command": "version", "description": "Show bot version"},
                     {"command": "help", "description": "Show available commands"},
                 ],

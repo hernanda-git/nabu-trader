@@ -38,6 +38,7 @@ from src.config.validator import validate_config
 from src.events.bus import EventBus
 from src.exchange.binance import BinanceExchange
 from src.exchange.paper import PaperExchange
+from src.exchange.symbol_registry import SymbolRegistry, set_registry
 from src.execution.order_service import OrderService
 from src.execution.position_manager import PositionManager
 from src.listener import SignalListener
@@ -93,6 +94,15 @@ async def main():
 
     # ── Database ─────────────────────────────────────────────────────────
     conn = get_connection()
+
+    # ── Symbol Registry ─────────────────────────────────────────────────
+    # Dynamic pair resolution from live exchangeInfo. Falls back to seed data.
+    seed_path = str(ROOT / "data" / "symbols_seed.json")
+    symbol_registry = SymbolRegistry(seed_path=seed_path)
+    await symbol_registry.initialize()
+    set_registry(symbol_registry)  # makes it available to parser and other modules
+    symbol_registry.start_background_refresh(interval_minutes=15)
+    log.info("Symbol registry ready: %d pairs cached", symbol_registry.symbol_count)
 
     # ── Repositories ─────────────────────────────────────────────────────
     signal_repo = SignalRepository(conn)
@@ -168,7 +178,6 @@ async def main():
 
     if bot_token:
         log.info("Telegram notifier ready (chat_id=%s)", notify_chat_id)
-        await notifier.notify_startup(version=version_str or None)
         await notifier.set_commands()
     else:
         log.warning("TELEGRAM_BOT_TOKEN not set — notifications disabled")
@@ -228,7 +237,8 @@ async def main():
     position_manager._orchestrator = orchestrator
 
     # ── Listener ─────────────────────────────────────────────────────────
-    listener = SignalListener(orchestrator, cfg, exchange=exchange, version=version_str or None)
+    listener = SignalListener(orchestrator, cfg, exchange=exchange,
+                              version=version_str or None, notifier=notifier)
 
     # ── Start ────────────────────────────────────────────────────────────
     try:
@@ -245,6 +255,7 @@ async def main():
                 await api_task
             except (asyncio.CancelledError, Exception):
                 pass
+        await symbol_registry.stop()
         conn.close()
         log.info("Goodbye.")
 

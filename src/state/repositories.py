@@ -210,6 +210,16 @@ class PositionRepository:
         cursor = self.conn.execute("SELECT COUNT(*) FROM positions WHERE status = 'OPEN'")
         return cursor.fetchone()[0]
 
+    def get_total_notional_usdt(self) -> float:
+        """Sum the notional value (entry_price × quantity) of all open positions.
+
+        Used by SafetyGate2 to enforce a portfolio-level notional cap.
+        """
+        cursor = self.conn.execute(
+            "SELECT COALESCE(SUM(entry_price * quantity), 0) FROM positions WHERE status = 'OPEN'"
+        )
+        return cursor.fetchone()[0]
+
     def _row_to_position(self, row: sqlite3.Row) -> Position:
         d = dict(row)
         tp_raw = d.pop("tp_prices", None)

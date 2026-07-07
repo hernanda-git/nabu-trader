@@ -9,6 +9,7 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 from telethon import TelegramClient, events
+from telethon.sessions import StringSession
 
 from src.exchange.base import Exchange
 from src.config.loader import get_session_dir
@@ -20,7 +21,7 @@ log = logging.getLogger("listener")
 class SignalListener:
     """Telethon-based listener that forwards messages to the orchestrator."""
 
-    def __init__(self, orchestrator: TradeOrchestrator, config: dict, exchange: Exchange | None = None, version: str | None = None):
+    def __init__(self, orchestrator: TradeOrchestrator, config: dict, exchange: Exchange | None = None, version: str | None = None, notifier: "TelegramNotifier | None" = None):
         self.orchestrator = orchestrator
         self.config = config
         self.exchange = exchange or getattr(orchestrator, 'exchange', None)
@@ -35,7 +36,20 @@ class SignalListener:
         session_dir.mkdir(parents=True, exist_ok=True)
 
         self.channel = channel
-        self.client = TelegramClient(str(session_dir / "nabu"), api_id, api_hash)
+        self.notifier = notifier
+        self.version = version
+
+        # Session: prefer a StringSession secret (for headless/container
+        # deployments) so we never fall back to an interactive login prompt,
+        # which crashes the process when there is no TTY.
+        session_str = os.getenv("SESSION_STRING", "")
+        if session_str:
+            session = StringSession(session_str)
+            log.info("Using StringSession from SESSION_STRING secret")
+        else:
+            session = str(session_dir / "nabu")
+            log.info("Using file session at %s", session)
+        self.client = TelegramClient(session, api_id, api_hash)
 
     async def start(self):
         """Start listening."""
@@ -45,9 +59,22 @@ class SignalListener:
         log.info("Auto-trade: %s", self.config.get("agent", {}).get("auto_trade", False))
         log.info("=" * 60)
 
-        await self.client.start()
+        # Connect WITHOUT an interactive prompt (headless-safe). Then verify
+        # the session is actually authorized; if not, fail fast with a clear
+        # message instead of crashing on a hidden login prompt.
+        await self.client.connect()
+        if not await self.client.is_user_authorized():
+            raise RuntimeError(
+                "Telethon session is NOT authorized. Set the SESSION_STRING Fly "
+                "secret (generate once via `python scripts/gen_session.py`)."
+            )
         me = await self.client.get_me()
         log.info("Connected as: %s (ID: %s)", me.first_name, me.id)
+
+        # Announce "Online" ONLY after a successful connection, so a crash
+        # during startup can never spam the deployment notification.
+        if self.notifier is not None:
+            await self.notifier.notify_startup(version=self.version)
 
         # Verify channel access
         try:
@@ -99,6 +126,10 @@ class SignalListener:
                 await self._handle_help(event)
             elif cmd == "/version":
                 await self._handle_version(event)
+            elif cmd.startswith("/setport"):
+                await self._handle_setport(event)
+            elif cmd == "/getport":
+                await self._handle_getport(event)
 
         await self.client.run_until_disconnected()
 
@@ -167,12 +198,16 @@ class SignalListener:
 
     async def _handle_help(self, event):
         """Handle /help — list available commands."""
+        port = self.config.get("risk", {}).get("port_usdt", 1.0)
         await event.reply(
             "📋 **Available Commands**\n\n"
             "  /balance    — Show futures account balance\n"
             "  /positions  — Show all open futures positions\n"
+            "  /setport N  — Set margin per trade to $N (e.g. /setport 2)\n"
+            "  /getport    — Show current margin per trade\n"
             "  /version    — Show bot version\n"
             "  /help       — Show this message\n\n"
+            f"Current port setting: `$ {port:.2f}` per trade\n\n"
             "The bot automatically processes signals from @YOUR_SIGNAL_CHANNEL and\n"
             "executes trades on Binance Futures when conditions are met."
         )
@@ -185,4 +220,45 @@ class SignalListener:
             f"Version: `{ver}`\n"
             f"Mode: `{'🚀 YOLO auto-trade' if self.config.get('agent', {}).get('auto_trade') else '🔍 Dry run (no trades)'}`\n\n"
             f"_Deployed on Fly.io (Singapore)_"
+        )
+
+    async def _handle_setport(self, event):
+        """Handle /setport N — change margin per trade to $N."""
+        parts = (event.message.text or "").strip().split()
+        if len(parts) < 2:
+            current = self.config.get("risk", {}).get("port_usdt", 1.0)
+            await event.reply(
+                f"⚠️ **Usage:** `/setport <value>`\n"
+                f"Current port: `$ {current:.2f}` per trade\n\n"
+                f"Example: `/setport 2` → use $2 margin per trade"
+            )
+            return
+        try:
+            new_port = float(parts[1])
+            if new_port <= 0:
+                await event.reply("❌ Port must be a positive number (e.g. `/setport 1`).")
+                return
+            if new_port > 100:
+                await event.reply("⚠️ Port > $100 is unusually high. Set it again to confirm.")
+                return
+            self.config.setdefault("risk", {})["port_usdt"] = new_port
+            log.info("Port per trade changed to $%.2f", new_port)
+            await event.reply(
+                f"✅ **Port updated**\n"
+                f"Margin per trade: `$ {new_port:.2f}`\n\n"
+                f"Leverage will auto-adjust on the next trade:\n"
+                f"  `pos_value / ${new_port:.2f} = lev`"
+            )
+        except ValueError:
+            await event.reply(f"❌ Invalid number: `{parts[1]}`. Use e.g. `/setport 2`.")
+
+    async def _handle_getport(self, event):
+        """Handle /getport — show current margin per trade."""
+        port = self.config.get("risk", {}).get("port_usdt", 1.0)
+        await event.reply(
+            f"💰 **Current Margin Per Trade**\n\n"
+            f"Port: `$ {port:.2f}`\n\n"
+            f"This is the margin budget per trade.\n"
+            f"Leverage = position value ÷ ${port:.2f}\n\n"
+            f"Change it with `/setport <value>`"
         )

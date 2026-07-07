@@ -52,6 +52,8 @@ from src.state.repositories import (
 
 from src.api.webhook import emit_event
 
+from src.exchange.symbol_registry import get_registry
+
 log = logging.getLogger("orchestrator")
 
 import hashlib
@@ -188,9 +190,30 @@ class TradeOrchestrator:
             signal = parse_signal(message_id, channel, raw_text, has_media)
             log.info("Parsed signal: pair=%s dir=%s entry=%s",
                      signal.pair, signal.direction, signal.entry_price)
+
+            # Enrich with symbol metadata from SymbolRegistry
+            sym_meta = {}
+            if signal.pair:
+                registry = get_registry()
+                if registry and registry.is_ready:
+                    info = registry.get_symbol_info(signal.pair)
+                    if info:
+                        sym_meta = {
+                            "base_asset": info.base_asset,
+                            "display_pair": info.display_symbol(),
+                            "is_1000x": info.is_1000x,
+                            "price_precision": info.price_precision,
+                            "quantity_precision": info.quantity_precision,
+                            "min_notional": info.min_notional,
+                            "tick_size": info.tick_size,
+                            "step_size": info.step_size,
+                            "contract_type": info.contract_type,
+                        }
+
             self._log(correlation_id, "INFO", "orchestrator",
                       f"Signal received: pair={signal.pair} dir={signal.direction}",
-                      {"message_id": message_id, "pair": signal.pair, "direction": signal.direction})
+                      {"message_id": message_id, "pair": signal.pair,
+                       "direction": signal.direction, "symbol_meta": sym_meta})
 
             if self.event_bus:
                 self.event_bus.emit(Event("SignalReceived", {

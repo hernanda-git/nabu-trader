@@ -503,6 +503,49 @@ async def proxy_balance():
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# SYMBOLS (cached by SymbolRegistry)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+@app.get("/api/v1/symbols")
+async def list_symbols(
+    search: str | None = Query(None, description="Filter by symbol name"),
+    is_1000x: bool | None = Query(None, description="Filter 1000x contracts only"),
+):
+    """List all cached trading pairs from the dynamic SymbolRegistry.
+
+    Populated from live Binance Futures exchangeInfo at startup,
+    refreshed every 15 minutes. No hardcoded coin lists.
+    """
+    try:
+        from src.exchange.symbol_registry import get_registry
+        registry = get_registry()
+        if not registry or not registry.is_ready:
+            return {"symbols": [], "count": 0, "status": "not_ready",
+                    "message": "SymbolRegistry not yet initialized"}
+
+        symbols = registry.to_dict()
+        if search:
+            search_upper = search.upper()
+            symbols = [s for s in symbols if search_upper in s["symbol"].upper()
+                       or search_upper in s["base_asset"].upper()
+                       or search_upper in s["display"]]
+        if is_1000x is not None:
+            symbols = [s for s in symbols if s["is_1000x"] == is_1000x]
+
+        return {
+            "symbols": symbols,
+            "count": len(symbols),
+            "total_cached": registry.symbol_count,
+            "last_refresh": registry.last_refresh.isoformat() if registry.last_refresh else None,
+            "status": "ready",
+        }
+    except Exception as e:
+        log.exception("Symbols query failed")
+        raise HTTPException(HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # SEARCH
 # ═══════════════════════════════════════════════════════════════════════════════
 

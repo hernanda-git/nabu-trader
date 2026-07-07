@@ -74,19 +74,41 @@ class OrderService:
         client_id = self._generate_client_id(decision_id)
         side = "BUY" if decision.direction == "LONG" else "SELL"
 
-        # Set futures leverage before placing the entry order
+        # Set futures leverage and margin type before placing the entry order
         if decision.leverage > 1:
             await self.exchange.set_symbol_leverage(symbol, decision.leverage)
-            await self.exchange.set_margin_type(symbol, "ISOLATED")
+            margin_type = self.config.get("risk", {}).get("margin_type", "ISOLATED")
+            await self.exchange.set_margin_type(symbol, margin_type)
+
+        # ─── Pre-flight: leverage sanity check ──────────────────────────
+        # Gate2 already validates this, but double-check before hitting the API
+        if decision.leverage > 1:
+            try:
+                bal = await self.exchange.get_balance()
+                margin_budget = bal.free_usdt * (
+                    self.config.get("risk", {}).get("margin_usage_pct", 50) / 100.0
+                )
+                notional_value = decision.quantity * (decision.entry_price or 0)
+                margin_needed = notional_value / decision.leverage
+                if margin_needed > margin_budget * 1.1:  # 10% tolerance
+                    log.warning(
+                        "Pre-flight margin check: needed=$%.2f budget=$%.2f (%.1f%% over)",
+                        margin_needed, margin_budget,
+                        (margin_needed / margin_budget - 1) * 100,
+                    )
+            except Exception as e:
+                log.debug("Pre-flight balance check skipped: %s", e)
 
         # Validate minimum notional (Binance requirement)
         price_ref = decision.entry_price or 0
         min_notional = self.config.get("risk", {}).get("min_notional_usdt", 1.0)
-        if quantity * max(price_ref, 1.0) < min_notional:
-            return ExecutionResult(
-                success=False, status="REJECTED",
-                error=f"Order below min notional: {quantity} * {price_ref} < {min_notional} USDT",
-            )
+        notional_check = quantity * price_ref
+        if notional_check < min_notional and notional_check > 0:
+            # For low-price coins, scale quantity up to meet min notional
+            scale = min_notional / notional_check
+            quantity = quantity * scale
+            log.info("Scaled quantity by %.4fx to meet min notional $%.2f (was $%.2f)",
+                     scale, min_notional, notional_check)
 
         # Place entry order
         if decision.order_type == "MARKET":

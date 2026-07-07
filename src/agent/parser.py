@@ -1,24 +1,30 @@
 """Regex pre-parse — fast signal extraction from raw Telegram messages.
 
-Runs in ~1ms. Extracts pair, direction, entry, SL, TP before the LLM call,
-reducing hallucination rate and token usage.
+Runs in ~1ms but delegates pair resolution to the dynamic SymbolRegistry,
+eliminating hardcoded coin symbol lists.
+
+Architecture:
+    Raw text → SymbolRegistry.resolve()  → (symbol_name, SymbolInfo)
+             → generic regex for direction, entry, SL, TP, volume
+             → TradeSignal
+
+The SymbolRegistry is populated from live Binance Futures exchangeInfo
+at startup, with background refresh every 15 minutes. Falls back to
+built-in seed data if the API is unreachable.
 """
 
 from __future__ import annotations
 
 import re
-from typing import Any
-
-from typing import Literal
+from typing import Any, Literal
 
 from src.domain.models import TradeSignal
 
-PAIR_PATTERNS = [
-    re.compile(r"\b(BTC|ETH|BNB|SOL|XRP|ADA|DOGE|AVAX|DOT|LINK|ATOM|UNI|SHIB|PEPE|FIL|LTC|BCH|ETC|NEAR|APT|ARB|OP|SUI|SEI|TIA|INJ|FET|RENDER|WIF|BONK|JUP|PYTH|ONDO|OMNI|ENS|AAVE|MKR|CRV|SNX)\s*/?\s*(USDT|USD|BUSD|USDC|BTC|ETH)\b", re.I),
-    re.compile(r"\b([A-Z]{3,6})\s*(?:USDT|USD|BUSD)\b", re.I),
-    re.compile(r"[#$](\w{2,20})\b", re.I),
-    re.compile(r"\b([A-Z]{2,10})\b"),
-]
+# Try to import SymbolRegistry; if not available, pair will be None
+try:
+    from src.exchange.symbol_registry import get_registry
+except ImportError:
+    get_registry = None  # type: ignore[assignment]
 
 DIRECTION_PATTERNS = [
     re.compile(r"\b(buy|long|bullish|upside|Call)\b", re.I),
@@ -26,19 +32,28 @@ DIRECTION_PATTERNS = [
 ]
 
 ENTRY_PATTERNS = [
-    re.compile(r"(?:entry|enter|open|buy\s*at|sell\s*at|limit|@\s*)\s*[:\\-]?\s*([\d,]+\.?\d*)", re.I),
-    re.compile(r"(?:zone|range|area)\s*[:\\-]?\s*([\d,]+\.?\d*)", re.I),
+    re.compile(r'(?:entry|enter|open|buy\s*at|sell\s*at|limit|@\s*)\s*[:-]?\s*([\d,]+\.?\d*)', re.I),
+    re.compile(r'(?:zone|range|area)\s*[:-]?\s*([\d,]+\.?\d*)', re.I),
 ]
 
 SL_PATTERNS = [
-    re.compile(r"(?:sl|stop\s*(?:loss)?|stoploss)\s*[:\\-]?\s*([\d,]+\.?\d*)", re.I),
-    re.compile(r"(?:invalidat|invalid)\s*[:\\-]?\s*([\d,]+\.?\d*)", re.I),
+    re.compile(r'(?:sl|stop\s*(?:loss)?|stoploss)\s*[:-]?\s*([\d,]+\.?\d*)', re.I),
+    re.compile(r'(?:invalidat|invalid)\s*[:-]?\s*([\d,]+\.?\d*)', re.I),
 ]
 
 TP_PATTERNS = [
-    re.compile(r"(?:tp\s*1?|take\s*profit\s*1?|target\s*1?|tgt\s*1?)\s*[:\\-]?\s*([\d,]+\.?\d*)", re.I),
-    re.compile(r"(?:tp\s*2|take\s*profit\s*2|target\s*2|tgt\s*2)\s*[:\\-]?\s*([\d,]+\.?\d*)", re.I),
-    re.compile(r"(?:tp\s*3|take\s*profit\s*3|target\s*3|tgt\s*3)\s*[:\\-]?\s*([\d,]+\.?\d*)", re.I),
+    re.compile(r'(?:tp\s*1?|take\s*profit\s*1?|target\s*1?|tgt\s*1?)\s*[:-]?\s*([\d,]+\.?\d*)', re.I),
+    re.compile(r'(?:tp\s*2|take\s*profit\s*2|target\s*2|tgt\s*2)\s*[:-]?\s*([\d,]+\.?\d*)', re.I),
+    re.compile(r'(?:tp\s*3|take\s*profit\s*3|target\s*3|tgt\s*3)\s*[:-]?\s*([\d,]+\.?\d*)', re.I),
+]
+
+# Additional patterns for extended signal metadata
+VOLUME_PATTERNS = [
+    re.compile(r'(?:vol|volume)\s*[:-]?\s*([\d,.]+[kKmMbB]?)', re.I),
+]
+
+LEVERAGE_PATTERNS = [
+    re.compile(r'(?:lev|leverage|x)\s*[:-]?\s*(\d+)(?:\s*x)?', re.I),
 ]
 
 
@@ -46,14 +61,19 @@ def parse_signal(message_id: int, channel: str, raw_text: str,
                  has_media: bool = False) -> TradeSignal:
     """Fast regex pre-parse of a Telegram message into a TradeSignal.
 
-    Returns a partially-populated TradeSignal. Missing fields (None) are
-    expected — the LLM agent will enrich them.
+    Pair resolution is delegated to the dynamic SymbolRegistry, which
+    caches all USDⓈ-M Futures pairs from Binance exchangeInfo.
+
+    Missing fields (None) are expected — the LLM agent will enrich them.
     """
     text = raw_text.strip()
     if not text:
         return TradeSignal(message_id=message_id, channel=channel, raw_text=raw_text)
 
-    pair = _extract_pair(text)
+    # Step 1: Resolve pair via SymbolRegistry (dynamic, no hardcoded symbols)
+    pair = _resolve_pair(text)
+
+    # Step 2: Extract other fields via generic regex
     direction = _extract_direction(text)
     entry_price = _extract_entry(text)
     sl_price = _extract_sl(text)
@@ -72,15 +92,32 @@ def parse_signal(message_id: int, channel: str, raw_text: str,
     )
 
 
-def _extract_pair(text: str) -> str | None:
-    for pat in PAIR_PATTERNS:
-        m = pat.search(text)
-        if m:
-            raw = m.group(0).strip().upper()
-            # Clean up # / $ prefix for display
-            if raw.startswith("#") or raw.startswith("$"):
-                return raw  # keep as-is, LLM can normalize
-            return raw
+def _resolve_pair(text: str) -> str | None:
+    """Resolve a trading pair from text using the SymbolRegistry.
+
+    If the SymbolRegistry is not available (not initialized yet or
+    import failed), falls back to generic single-word extraction.
+    """
+    registry = get_registry() if get_registry else None
+
+    if registry and registry.is_ready:
+        symbol, info = registry.resolve(text)
+        if symbol:
+            return symbol
+        return None
+
+    # Fallback: very basic generic pair extraction without hardcoded symbols
+    # This catches #BTC, BTC/USDT patterns without needing a registry
+    fallback = re.search(r'[#\$]?([A-Z]{2,10})\s*/?\s*(USDT|USD|BUSD)\b', text, re.I)
+    if fallback:
+        base = fallback.group(1).upper()
+        quote = fallback.group(2).upper()
+        return f"{base}{quote}"
+
+    fallback2 = re.search(r'\b([A-Z]{2,10}USDT)\b', text, re.I)
+    if fallback2:
+        return fallback2.group(1).upper()
+
     return None
 
 
@@ -125,3 +162,34 @@ def _extract_tp(text: str) -> list[float]:
             except ValueError:
                 continue
     return tps
+
+
+def extract_volume(text: str) -> float | None:
+    """Extract trade volume from signal text (optional)."""
+    for pat in VOLUME_PATTERNS:
+        m = pat.search(text)
+        if m:
+            raw = m.group(1).replace(",", "").strip()
+            try:
+                if raw.upper().endswith("K"):
+                    return float(raw[:-1]) * 1000
+                elif raw.upper().endswith("M"):
+                    return float(raw[:-1]) * 1_000_000
+                elif raw.upper().endswith("B"):
+                    return float(raw[:-1]) * 1_000_000_000
+                return float(raw)
+            except ValueError:
+                continue
+    return None
+
+
+def extract_leverage(text: str) -> int | None:
+    """Extract suggested leverage from signal text (optional)."""
+    for pat in LEVERAGE_PATTERNS:
+        m = pat.search(text)
+        if m:
+            try:
+                return int(m.group(1))
+            except ValueError:
+                continue
+    return None

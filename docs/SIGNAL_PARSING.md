@@ -1,52 +1,96 @@
 # Signal Parsing
 
-## Regex Pre-Parse
+## Dynamic Symbol Registry — No Hardcoded Symbols
 
-The first step in the pipeline is a fast (~1ms) regex extraction of structured fields from the raw signal text. Located in `src/agent/parser.py`.
+The **first step** in the pipeline is pair resolution via the **SymbolRegistry** (`src/exchange/symbol_registry.py`), which dynamically caches all tradable USDⓈ-M Futures pairs from Binance at startup.
 
-### Supported Signal Formats
+**Old approach (removed):** ~40 hardcoded coin symbols in `PAIR_PATTERNS` regex.  
+**New approach:** Live `exchangeInfo` fetch → inverted index → multi-strategy matching.
 
-The parser handles various signal formats commonly used in crypto Telegram channels:
+### Architecture
 
-**Standard format:**
 ```
-BUY / LONG
-Entry: 65000
-SL: 64000
-TP1: 66000
-TP2: 67000
+Signal Text [#BTC/USDT LONG 🟢]
+         │
+         ▼
+┌────────────────────────────────────┐
+│  extract_candidates()              │  Generic regex: any #tag, $ticker,
+│  (agnostic — no hardcoded coins)   │  PAIR/USDT format, or PAIRUSDT
+└──────────────┬─────────────────────┘
+               │ candidates: ["BTC", "BTCUSDT", "BTC/USDT"]
+               ▼
+┌────────────────────────────────────┐
+│  SymbolRegistry._lookup()          │  Multi-strategy match against cache
+│                                    │
+│  Strategy 1: Exact match           │  ⚡ O(1) — BTCUSDT → BTCUSDT
+│  Strategy 2: Base asset            │  "BTC" → matches baseAsset="BTC"
+│  Strategy 3: USDT suffix           │  "BONK" → adds USDT → 1000BONKUSDT
+│  Strategy 4: 1000x prefix          │  "BONK" → baseAsset="1000BONK" → auto
+│  Strategy 5: Fuzzy (last resort)   │  Levenshtein ≤ 2 for typos
+│                                    │
+│  All strategies are sub-millisecond │
+└──────────────┬─────────────────────┘
+               │ resolved pair + metadata
+               ▼
+┌────────────────────────────────────┐
+│  Regex Extraction (existing)       │  Direction, Entry, SL, TP
+│  parser.py                         │  via generic patterns (unchanged)
+└──────────────┬─────────────────────┘
+               │ TradeSignal
+               ▼
+            Gate 1 → LLM → ...
 ```
 
-**Inline format:**
-```
-LONG BTCUSDT Entry 65000 SL 64000 TP 66000-67000
-```
+### What Changed
 
-**Short format:**
-```
-#BTC/USDT
-LONG
-Entry: 65000
-Targets: 66000, 67000
-Stop: 64000
-```
+| Aspect | Before | After |
+|--------|--------|-------|
+| Pair matching | 40 hardcoded symbols in `PAIR_PATTERNS` | Dynamic from Binance `exchangeInfo` (all ~300 USDⓈ-M pairs) |
+| New token support | Manual code change | Auto-picked up on next 15-min refresh |
+| 1000x handling | Hardcoded `SYMBOL_MAP` in `binance.py` | Auto-detected: baseAsset starting with "1000" + letters |
+| Cache lifetime | Permanent (code level) | 15 minutes (background refresh) |
+| Startup fallback | Old hardcoded list | Built-in seed data + optional seed file |
+| Symbol metadata | None (precision fetched separately) | Cached: tickSize, stepSize, minNotional, minQty |
 
-### Extracted Fields
+### Startup Flow
 
-| Field | Source | Example |
-|-------|--------|---------|
-| `pair` | #BTC, BTCUSDT, BTC/USDT | `BTCUSDT` |
-| `direction` | LONG, BUY, SHORT, SELL | `LONG` |
-| `entry_price` | Entry, Enter, Price | `65400.00` |
-| `sl_price` | SL, Stop, Stop Loss | `64000.00` |
-| `tp_prices` | TP, Target, Take Profit | `[66000.00, 67000.00]` |
+1. `main.py` creates `SymbolRegistry(seed_path="data/symbols_seed.json")`
+2. Calls `await registry.initialize()` → fetches `https://fapi.binance.com/fapi/v1/exchangeInfo`
+3. Builds inverted index: `symbols["BTCUSDT"]`, `symbols["btcusdt"]`, `by_base["BTC"]`
+4. Sets global singleton via `set_registry(registry)` — parser auto-picks it up
+5. Starts background refresh loop (every 15 min)
+6. On shutdown: `await registry.stop()`
+
+If the exchangeInfo fetch fails (API down, no network), it falls back to:
+1. Seed JSON file at `data/symbols_seed.json` (persisted from previous successful fetch)
+2. Built-in seed data in `symbol_registry.py` (major USDⓈ-M pairs)
+
+### Cache Population (`symbol_registry.py`)
+
+```python
+# Filter: only TRADING symbols with quoteAsset="USDT"
+for s in exchange_info["symbols"]:
+    if s["status"] != "TRADING": continue
+    if s["quoteAsset"] != "USDT": continue
+    self._add_symbol(s)
+
+# For each symbol, index:
+self._symbols[name] = info           # "BTCUSDT" → SymbolInfo
+self._symbols[name.lower()] = info    # "btcusdt" → SymbolInfo
+self._by_base[base_asset].append(name)  # "BTC" → ["BTCUSDT"]
+
+# 1000x auto-detection:
+if base starts with "1000" + letters:
+    clean = strip_numeric_prefix
+    self._by_base[clean].append(name)  # "BONK" → ["1000BONKUSDT"]
+```
 
 ### Signal Quality Heuristics
 
 | Criteria | Decision |
 |----------|----------|
 | Valid pair + direction + entry + SL | Likely ENTER |
-| Missing pair or direction | SKIP |
+| Missing pair or direction | SKIP (saves LLM cost) |
 | Entry price too far from current market | LLM decides |
 | SL too wide (>50% from entry) | LLM decides |
 | Media without text | SKIP (can't parse) |
@@ -54,7 +98,7 @@ Stop: 64000
 
 ## LLM Signal Analysis
 
-After the regex pre-parse, the **Agent Brain** (LLM) performs deep analysis:
+After the regex pre-parse, the **Agent Brain** (LLM) performs deep analysis.
 
 ### What the LLM sees
 
@@ -72,6 +116,11 @@ TP2: 67000
   Entry: 65400.0
   SL: 64800.0
   TP: [66200.0, 67000.0]
+  Symbol Info:
+    Base: BTC
+    Precision: price=2, qty=5
+    Tick: 0.01 / Step: 0.001
+    Min Notional: 5.0
 
 ## Open Positions
   LONG BTCUSDT @ 65100 qty=0.0005
@@ -98,24 +147,6 @@ TP2: 67000
 }
 ```
 
-### Quantity Calculation
-
-The LLM is instructed to calculate:
-
-```
-quantity = (balance × risk_per_trade_percent / 100) / abs(entry_price - sl_price)
-```
-
-Example with $10.58 balance, 10% risk, BTC entry $65400, SL $64800:
-```
-max_loss = $10.58 × 0.10 = $1.058
-SL_distance = |65400 - 64800| = $600
-quantity = $1.058 / $600 = 0.00176 BTC
-position_value = 0.00176 × 65400 = $115
-```
-
-Gate 2 then clamps: $115 > $5 max_size → clamped to $5 → qty = 0.000076 BTC
-
 ### Action Types
 
 | Action | Meaning | Next Step |
@@ -123,6 +154,8 @@ Gate 2 then clamps: $115 > $5 max_size → clamped to $5 → qty = 0.000076 BTC
 | `ENTER` | Open new position | Gate 2 → Order Service |
 | `CLOSE` | Close existing position | Order Service (market sell/buy) |
 | `SKIP` | Insufficient quality | Log and skip |
+| `MODIFY` | Adjust SL/TP on open position | Order Service (cancel + replace) |
+| `CONDITIONAL` | Setup signal — monitor price | PendingSignal → PositionManager loop |
 
 ### When the LLM says CLOSE
 

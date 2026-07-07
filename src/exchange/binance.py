@@ -93,6 +93,9 @@ SYMBOL_MAP: dict[str, tuple[str, float, float]] = {
 def _resolve_futures_symbol(raw_symbol: str) -> tuple[str, float, float]:
     """Resolve a user-facing symbol to the actual Binance Futures symbol + multipliers.
 
+    Uses the dynamic SymbolRegistry first (populated from live exchangeInfo),
+    falling back to the static SYMBOL_MAP for known 1000x contracts.
+
     1000x contracts (e.g. 1000BONKUSDT, 1000PEPEUSDT):
     - The "1000" prefix is a CONTRACT MULTIPLIER for PnL calculation only.
     - PRICE is quoted in base asset terms (e.g. BONK = 0.0044), NOT multiplied by 1000.
@@ -107,9 +110,25 @@ def _resolve_futures_symbol(raw_symbol: str) -> tuple[str, float, float]:
         (resolved_symbol, price_multiplier, qty_divisor)
         - price_multiplier: always 1.0 (price stays in base asset terms)
         - qty_divisor: always 1.0 (quantity stays in base asset terms)
-          The "1000" is ONLY the contract multiplier for PnL — no price/qty conversion needed.
     """
     s = raw_symbol.upper().strip()
+
+    # Try dynamic SymbolRegistry first (live exchangeInfo data)
+    try:
+        from src.exchange.symbol_registry import get_registry
+        registry = get_registry()
+        if registry and registry.is_ready:
+            info = registry.get_symbol_info(s)
+            if info:
+                return info.symbol, 1.0, 1.0
+            # Try resolving via the registry's resolve text-based method
+            resolved_symbol, resolved_info = registry.resolve(s)
+            if resolved_symbol and resolved_info:
+                return resolved_symbol, 1.0, 1.0
+    except Exception:
+        pass
+
+    # Fall back to static SYMBOL_MAP for known 1000x contracts
     if s in SYMBOL_MAP:
         mapped, pm, qd = SYMBOL_MAP[s]
         return mapped, pm, qd

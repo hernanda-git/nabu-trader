@@ -5,7 +5,8 @@ Real-time Telegram channel monitor → LLM-powered signal analysis → **Automat
 > **Branch:** `feature/auto-trade`  
 > **Channel:** `@YOUR_SIGNAL_CHANNEL`  
 > **Exchange:** Binance USDⓈ-M Futures (dynamic leverage)  
-> **Brain:** OpenCode Go / deepseek-v4-flash  
+| **LLM** | OpenCode Go / deepseek-v4-flash |
+| **Symbol Registry** | Dynamic via Binance Futures exchangeInfo (auto-refreshed every 15m) |
 > **Safety:** Hard-coded risk gates (LLM cannot override)
 
 ---

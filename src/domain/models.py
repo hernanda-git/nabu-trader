@@ -169,7 +169,51 @@ class PositionEvent:
     created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 
 
+# ─── Symbol Info ──────────────────────────────────────────────────────────
+
+
+@dataclass(frozen=True)
+class SymbolInfo:
+    """Resolved symbol information from exchange exchangeInfo.
+
+    Used by SymbolRegistry to cache trading pair metadata,
+    eliminating the need for hardcoded symbol lists.
+    """
+    symbol: str                          # e.g. BTCUSDT, 1000BONKUSDT
+    base_asset: str                      # e.g. BTC, 1000BONK
+    quote_asset: str                     # e.g. USDT
+    price_precision: int = 8             # from exchangeInfo.pricePrecision
+    quantity_precision: int = 8          # from exchangeInfo.quantityPrecision
+    min_notional: float = 5.0            # from MIN_NOTIONAL filter
+    tick_size: float = 0.001             # from PRICE_FILTER.tickSize
+    step_size: float = 0.001             # from LOT_SIZE.stepSize
+    min_qty: float = 0.001               # from LOT_SIZE.minQty
+    max_qty: float = 1_000_000           # from LOT_SIZE.maxQty
+    contract_type: str = "PERPETUAL"     # PERPETUAL, CURRENT_MONTH, etc.
+    onboard_date: str = ""               # timestamp when listed
+    is_1000x: bool = False               # True if base_asset starts with "1000" + letters
+
+    def clean_base(self) -> str:
+        """Return the display-friendly base asset (strip 1000 prefix).
+
+        Example: '1000BONK' → 'BONK', 'BTC' → 'BTC'
+        """
+        if self.is_1000x and self.base_asset.startswith("1000"):
+            remaining = self.base_asset[4:]
+            if remaining.isalpha():
+                return remaining
+        return self.base_asset
+
+    def display_symbol(self) -> str:
+        """Return a human-readable symbol for display/LLM context.
+
+        Example: '1000BONKUSDT' → 'BONKUSDT'
+        """
+        return self.symbol.replace(f"{self.base_asset}", f"{self.clean_base()}", 1)
+
+
 # ─── Config Snapshot ─────────────────────────────────────────────────────────
+
 
 @dataclass(frozen=True)
 class ConfigSnapshot:
