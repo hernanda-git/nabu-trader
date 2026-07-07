@@ -22,6 +22,8 @@ import os
 import sys
 from pathlib import Path
 
+# Used in shutdown for api_task cancellation
+
 # Ensure project root is on path
 ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
@@ -43,12 +45,16 @@ from src.notifier.telegram import TelegramNotifier
 from src.orchestrator import TradeOrchestrator
 from src.state.database import get_connection
 from src.state.repositories import (
+    ConfigSnapshotRepository,
     DecisionRepository,
     EventRepository,
+    LLMInteractionRepository,
     OrderRepository,
     PendingSignalRepository,
+    PositionEventRepository,
     PositionRepository,
     SignalRepository,
+    TradeLogRepository,
 )
 
 log = logging.getLogger("main")
@@ -95,6 +101,10 @@ async def main():
     position_repo = PositionRepository(conn)
     event_repo = EventRepository(conn)
     pending_signal_repo = PendingSignalRepository(conn)
+    llm_repo = LLMInteractionRepository(conn)
+    trade_log_repo = TradeLogRepository(conn)
+    position_event_repo = PositionEventRepository(conn)
+    config_snapshot_repo = ConfigSnapshotRepository(conn)
 
     # ── Event Bus ────────────────────────────────────────────────────────
     event_bus = EventBus()
@@ -166,7 +176,29 @@ async def main():
     # ── Position Manager ─────────────────────────────────────────────────
     position_manager = PositionManager(exchange, cfg, position_repo,
                                        pending_signal_repo=pending_signal_repo,
+                                       position_event_repo=position_event_repo,
                                        notifier=notifier)
+
+    # ── API Server (background task) ──────────────────────────────────────
+    api_task = None
+    if cfg.get("api", {}).get("enabled", True):
+        try:
+            import asyncio
+            import uvicorn
+            from src.api.server import app as api_app
+
+            api_host = cfg.get("api", {}).get("host", "0.0.0.0")
+            api_port = cfg.get("api", {}).get("port", 9090)
+
+            async def start_api():
+                config = uvicorn.Config(api_app, host=api_host, port=api_port, log_level="info")
+                server = uvicorn.Server(config)
+                await server.serve()
+
+            api_task = asyncio.create_task(start_api())
+            log.info("API bridge starting on %s:%d", api_host, api_port)
+        except Exception as e:
+            log.warning("API bridge not started: %s", e)
 
     # ── Orchestrator ─────────────────────────────────────────────────────
     orchestrator = TradeOrchestrator(
@@ -183,8 +215,13 @@ async def main():
         order_repo=order_repo,
         position_repo=position_repo,
         event_repo=event_repo,
+        llm_repo=llm_repo,
+        trade_log_repo=trade_log_repo,
+        position_event_repo=position_event_repo,
+        config_snapshot_repo=config_snapshot_repo,
         event_bus=event_bus,
         pending_signal_repo=pending_signal_repo,
+        app_version=version_str or "",
     )
 
     # Wire orchestrator to position manager for trigger auto-entry
@@ -202,6 +239,12 @@ async def main():
     finally:
         await listener.stop()
         await position_manager.stop()
+        if api_task:
+            api_task.cancel()
+            try:
+                await api_task
+            except (asyncio.CancelledError, Exception):
+                pass
         conn.close()
         log.info("Goodbye.")
 

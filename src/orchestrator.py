@@ -21,22 +21,56 @@ from typing import Any
 from src.agent.agent import AgentBrain
 from src.agent.gate import SafetyGate1, SafetyGate2
 from src.agent.parser import parse_signal
-from src.domain.models import Event, ExecutionResult, PendingSignal, TradeDecision, TradeSignal
+from src.domain.models import (
+    ConfigSnapshot,
+    Event,
+    ExecutionResult,
+    LLMInteraction,
+    PendingSignal,
+    PositionEvent,
+    TradeDecision,
+    TradeLogEntry,
+    TradeSignal,
+)
 from src.events.bus import EventBus
 from src.exchange.base import Exchange
 from src.execution.order_service import OrderService
 from src.execution.position_manager import PositionManager
 from src.notifier.telegram import TelegramNotifier
 from src.state.repositories import (
+    ConfigSnapshotRepository,
     DecisionRepository,
     EventRepository,
+    LLMInteractionRepository,
     OrderRepository,
     PendingSignalRepository,
+    PositionEventRepository,
     PositionRepository,
     SignalRepository,
+    TradeLogRepository,
 )
 
+from src.api.webhook import emit_event
+
 log = logging.getLogger("orchestrator")
+
+import hashlib
+import json as json_mod
+import uuid
+
+
+def _generate_correlation_id() -> str:
+    """Generate a unique correlation ID for a pipeline run."""
+    return uuid.uuid4().hex[:12]
+
+
+def _config_hash(config: dict) -> str:
+    """Compute a hash of the effective config (excluding secrets)."""
+    # Strip secrets for hashing
+    safe = dict(config)
+    if "exchange" in safe:
+        safe["exchange"] = {k: v for k, v in safe["exchange"].items() if k != "binance"}
+    return hashlib.sha256(json_mod.dumps(safe, sort_keys=True, default=str).encode()).hexdigest()[:16]
 
 
 class TradeOrchestrator:
@@ -57,8 +91,13 @@ class TradeOrchestrator:
         order_repo: OrderRepository,
         position_repo: PositionRepository,
         event_repo: EventRepository,
-        event_bus: EventBus,
+        llm_repo: LLMInteractionRepository | None = None,
+        trade_log_repo: TradeLogRepository | None = None,
+        position_event_repo: PositionEventRepository | None = None,
+        config_snapshot_repo: ConfigSnapshotRepository | None = None,
+        event_bus: EventBus | None = None,
         pending_signal_repo: PendingSignalRepository | None = None,
+        app_version: str = "",
     ):
         self.config = config
         self.exchange = exchange
@@ -73,9 +112,58 @@ class TradeOrchestrator:
         self.order_repo = order_repo
         self.position_repo = position_repo
         self.event_repo = event_repo
+        self.llm_repo = llm_repo
+        self.trade_log_repo = trade_log_repo
+        self.position_event_repo = position_event_repo
+        self.config_snapshot_repo = config_snapshot_repo
         self.event_bus = event_bus
         self.pending_signal_repo = pending_signal_repo
+        self.app_version = app_version
         self._dry_run = not config.get("agent", {}).get("auto_trade", False)
+
+    def _log(self, correlation_id: str, level: str, module: str,
+             message: str, metadata: dict | None = None) -> None:
+        """Write a structured trade log entry if the repo is available."""
+        if self.trade_log_repo:
+            self.trade_log_repo.log(correlation_id, level, module, message, metadata)
+
+    def _save_llm_interaction(self, decision_db_id: int) -> None:
+        """Save the last LLM interaction from the agent brain into the DB."""
+        if not self.llm_repo:
+            return
+        li = getattr(self.agent, '_last_interaction', None)
+        if not li:
+            return
+        self.llm_repo.save(LLMInteraction(
+            decision_id=decision_db_id,
+            model=li.get("model", ""),
+            system_prompt=li.get("system_prompt", ""),
+            user_prompt=li.get("user_prompt", ""),
+            raw_response=li.get("raw_response", ""),
+            parsed_decision_json=li.get("parsed_decision_json", "{}"),
+            prompt_tokens=li.get("prompt_tokens", 0),
+            completion_tokens=li.get("completion_tokens", 0),
+            latency_ms=li.get("latency_ms", 0),
+            success=li.get("success", True),
+            error=li.get("error"),
+        ))
+
+    def _save_config_snapshot(self, correlation_id: str) -> int | None:
+        """Save a snapshot of the current config. Returns snapshot ID or None."""
+        if not self.config_snapshot_repo:
+            return None
+        cfg_hash = _config_hash(self.config)
+        import yaml
+        cfg_yaml = yaml.safe_dump(self.config, default_flow_style=False, sort_keys=False)
+        snap_id = self.config_snapshot_repo.save(
+            config_hash=cfg_hash,
+            config_yaml=cfg_yaml,
+            app_version=self.app_version,
+        )
+        self._log(correlation_id, "INFO", "orchestrator",
+                  f"Config snapshot saved (id={snap_id}, hash={cfg_hash})",
+                  {"snap_id": snap_id, "config_hash": cfg_hash, "version": self.app_version})
+        return snap_id
 
     async def handle_signal(self, message_id: int, channel: str,
                             raw_text: str, has_media: bool = False) -> dict[str, Any]:
@@ -91,15 +179,23 @@ class TradeOrchestrator:
             "error": None,
         }
 
+        # Generate a unique correlation ID for this pipeline run
+        correlation_id = _generate_correlation_id()
+        result["correlation_id"] = correlation_id
+
         try:
             # ── Step 1: Regex Pre-Parse ────────────────────────────────────
             signal = parse_signal(message_id, channel, raw_text, has_media)
             log.info("Parsed signal: pair=%s dir=%s entry=%s",
                      signal.pair, signal.direction, signal.entry_price)
+            self._log(correlation_id, "INFO", "orchestrator",
+                      f"Signal received: pair={signal.pair} dir={signal.direction}",
+                      {"message_id": message_id, "pair": signal.pair, "direction": signal.direction})
 
-            self.event_bus.emit(Event("SignalReceived", {
-                "message_id": message_id, "pair": signal.pair,
-            }))
+            if self.event_bus:
+                self.event_bus.emit(Event("SignalReceived", {
+                    "message_id": message_id, "pair": signal.pair,
+                }))
 
             # ── Step 2: Safety Gate 1 (pre-LLM) ────────────────────────────
             allowed, reason = self.gate1.check(signal)
@@ -108,6 +204,9 @@ class TradeOrchestrator:
                 result["action"] = "skipped"
                 result["skipped"] = True
                 result["reason"] = reason
+                self._log(correlation_id, "INFO", "gate1",
+                          f"Gate1 rejected: {reason}",
+                          {"reason": reason, "pair": signal.pair})
                 self.signal_repo.mark_processed(message_id, raw_text)
                 # Gate1 rejections are expected noise from unparseable/vague messages
                 # — do NOT notify Telegram for these to avoid spam
@@ -136,16 +235,32 @@ class TradeOrchestrator:
             decision = self.agent.decide(signal, open_positions, balance)
             log.info("Decision: %s %s (conf=%.2f, reason=%s)",
                      decision.action, decision.pair, decision.confidence, decision.reason)
+            self._log(correlation_id, "INFO", "orchestrator",
+                      f"Decision: {decision.action} {decision.pair} conf={decision.confidence:.2f}",
+                      {"action": decision.action, "pair": decision.pair,
+                       "direction": decision.direction, "confidence": decision.confidence,
+                       "reason": decision.reason})
 
-            self.event_bus.emit(Event("DecisionCreated", {
-                "action": decision.action, "pair": decision.pair,
-            }))
+            if self.event_bus:
+                self.event_bus.emit(Event("DecisionCreated", {
+                    "action": decision.action, "pair": decision.pair,
+                }))
+
+            # ── Step 4b: Save decision + LLM interaction ─────────────────
+            decision_db_id = self.decision_repo.save(signal_db_id, decision)
+            self._save_llm_interaction(decision_db_id)
 
             # ── Step 5: Handle MODIFY action (position management) ────────
             if decision.action == "MODIFY":
                 log.info("Decision: MODIFY %s (SL=%s, TP=%s, reason=%s)",
                          decision.pair, decision.sl_price, decision.tp_prices, decision.reason)
-                exec_result = await self.order_service.execute(signal_db_id, decision)
+                self._log(correlation_id, "INFO", "orchestrator",
+                          f"MODIFY {decision.pair}: SL={decision.sl_price} TP={decision.tp_prices}",
+                          {"action": "MODIFY", "pair": decision.pair,
+                           "sl_price": decision.sl_price, "tp_prices": decision.tp_prices,
+                           "reason": decision.reason})
+                exec_result = await self.order_service.execute(
+                    signal_db_id, decision, decision_id=decision_db_id)
                 result["action"] = "modified"
                 result["reason"] = decision.reason
                 if exec_result.success:
@@ -160,15 +275,20 @@ class TradeOrchestrator:
                         f"Error: {exec_result.error}"
                     )
                 self.signal_repo.mark_processed(message_id, raw_text)
-                self.event_bus.emit(Event("PositionModified", {
-                    "pair": decision.pair, "reason": decision.reason,
-                }))
+                if self.event_bus:
+                    self.event_bus.emit(Event("PositionModified", {
+                        "pair": decision.pair, "reason": decision.reason,
+                    }))
                 return result
 
             # ── Step 5b: Handle CONDITIONAL action (setup/alert signals) ──
             if decision.action == "CONDITIONAL":
                 log.info("Decision: CONDITIONAL %s (trigger=%.6f, reason=%s)",
                          decision.pair, decision.entry_price or 0, decision.reason)
+                self._log(correlation_id, "INFO", "orchestrator",
+                          f"CONDITIONAL {decision.pair} @ {decision.entry_price}",
+                          {"action": "CONDITIONAL", "pair": decision.pair,
+                           "trigger_price": decision.entry_price, "reason": decision.reason})
                 # Determine condition type from direction + reason
                 cond_type = "close_above" if decision.direction == "LONG" else "close_below"
                 # Extract timeframe from reason or default to 4h
@@ -203,9 +323,10 @@ class TradeOrchestrator:
                         f"`{decision.pair}` `{decision.direction}` trigger={decision.entry_price}"
                     )
                 self.signal_repo.mark_processed(message_id, raw_text)
-                self.event_bus.emit(Event("ConditionalSignalSaved", {
-                    "pair": decision.pair, "trigger": decision.entry_price, "timeframe": timeframe,
-                }))
+                if self.event_bus:
+                    self.event_bus.emit(Event("ConditionalSignalSaved", {
+                        "pair": decision.pair, "trigger": decision.entry_price, "timeframe": timeframe,
+                    }))
                 return result
 
             # ── Step 6: Early exit for SKIP / CLOSE (LLM declined) ─────
@@ -214,6 +335,10 @@ class TradeOrchestrator:
                 result["action"] = decision.action.lower()
                 result["skipped"] = True
                 result["reason"] = decision.reason
+                self._log(correlation_id, "INFO", "orchestrator",
+                          f"{decision.action} {decision.pair}: {decision.reason[:100]}",
+                          {"action": decision.action, "pair": decision.pair,
+                           "reason": decision.reason})
                 if decision.action == "SKIP":
                     reason_text = decision.reason or "no reason provided"
                     pos_lines = "\n".join(
@@ -247,6 +372,9 @@ class TradeOrchestrator:
                 log.info("Gate2 rejected: %s", reason)
                 result["action"] = "rejected"
                 result["reason"] = reason
+                self._log(correlation_id, "WARNING", "gate2",
+                          f"Gate2 rejected {decision.pair}: {reason[:200]}",
+                          {"action": "ENTER", "pair": decision.pair, "reason": reason})
                 self.signal_repo.mark_processed(message_id, raw_text)
                 pos_lines = "\n".join(
                     f"  • `{p['pair']}` {p['direction']} @ `{p['entry_price']}` × `{p['quantity']}`"
@@ -268,12 +396,24 @@ class TradeOrchestrator:
                 await self.notifier.send_message(reject_text)
                 return result
             decision = clamped_decision
+            self._log(correlation_id, "INFO", "gate2",
+                      f"Gate2 passed: {decision.pair} qty={decision.quantity:.4f} lev={decision.leverage}x",
+                      {"pair": decision.pair, "quantity": decision.quantity,
+                       "leverage": decision.leverage, "sl": decision.sl_price,
+                       "tp": decision.tp_prices})
+
+            # ── Step 6b: Snapshot config on ENTER ─────────────────────────
+            config_snap_id = self._save_config_snapshot(correlation_id)
+            if config_snap_id is not None and self.position_repo:
+                # Store config_snapshot_id for the upcoming position
+                pass  # We'll update the position after it's created
 
             # ── Step 7: Notify decision ────────────────────────────────────
             await self.notifier.notify_decision(signal, decision)
 
-            # ── Step 7: Execute via exchange ───────────────────────────────
-            exec_result = await self.order_service.execute(signal_db_id, decision)
+            # ── Step 8: Execute via exchange ───────────────────────────────
+            exec_result = await self.order_service.execute(
+                signal_db_id, decision, decision_id=decision_db_id)
             result["execution"] = {
                 "success": exec_result.success,
                 "order_id": exec_result.order_id,
@@ -282,24 +422,81 @@ class TradeOrchestrator:
                 "quantity": exec_result.filled_quantity,
             }
 
-            # ── Step 8: Notify execution result ────────────────────────────
+            # ── Step 9: Notify execution result ────────────────────────────
             await self.notifier.notify_execution(signal, exec_result)
 
             if exec_result.success:
                 result["action"] = "entered"
-                self.event_bus.emit(Event("PositionOpened", {
-                    "pair": exec_result.symbol,
-                    "price": exec_result.avg_price,
-                    "quantity": exec_result.filled_quantity,
-                }))
+                if self.event_bus:
+                    self.event_bus.emit(Event("PositionOpened", {
+                        "pair": exec_result.symbol,
+                        "price": exec_result.avg_price,
+                        "quantity": exec_result.filled_quantity,
+                    }))
+                self._log(correlation_id, "INFO", "orchestrator",
+                          f"Position opened: {decision.direction} {exec_result.symbol} "
+                          f"qty={exec_result.filled_quantity:.4f} @ {exec_result.avg_price:.8f}",
+                          {"pair": exec_result.symbol, "direction": decision.direction,
+                           "quantity": exec_result.filled_quantity,
+                           "price": exec_result.avg_price,
+                           "order_id": exec_result.order_id,
+                           "sl": decision.sl_price, "tp": decision.tp_prices,
+                           "leverage": decision.leverage})
+                # Log position event for the opened position
+                if self.position_event_repo:
+                    try:
+                        open_pos = self.position_repo.get_open_by_pair(exec_result.symbol)
+                        if open_pos and open_pos.id:
+                            self.position_event_repo.save_event(
+                                position_id=open_pos.id,
+                                event_type="POSITION_OPENED",
+                                details=f"Entered {decision.direction} @ {exec_result.avg_price:.8f} qty={exec_result.filled_quantity:.4f}",
+                                metadata={
+                                    "pair": exec_result.symbol,
+                                    "direction": decision.direction,
+                                    "entry_price": exec_result.avg_price,
+                                    "quantity": exec_result.filled_quantity,
+                                    "sl": decision.sl_price,
+                                    "tp": decision.tp_prices,
+                                    "leverage": decision.leverage,
+                                    "config_snapshot_id": config_snap_id,
+                                    "correlation_id": correlation_id,
+                                },
+                            )
+                    except Exception as e:
+                        log.debug("Failed to log position event: %s", e)
+
+                # Emit webhook for position opened
+                try:
+                    await emit_event(
+                        "TRADE_ENTERED",
+                        {
+                            "pair": exec_result.symbol,
+                            "direction": decision.direction,
+                            "entry_price": exec_result.avg_price,
+                            "quantity": exec_result.filled_quantity,
+                            "sl": decision.sl_price,
+                            "tp": decision.tp_prices,
+                            "leverage": decision.leverage,
+                            "order_id": exec_result.order_id,
+                        },
+                        correlation_id=correlation_id,
+                        config=self.config,
+                    )
+                except Exception as e:
+                    log.debug("Webhook emit failed (non-blocking): %s", e)
             else:
                 result["action"] = "failed"
                 result["error"] = exec_result.error
+                self._log(correlation_id, "ERROR", "orchestrator",
+                          f"Order failed for {exec_result.symbol}: {exec_result.error}",
+                          {"pair": exec_result.symbol, "error": exec_result.error,
+                           "order_id": exec_result.order_id})
 
-            # ── Step 9: Mark processed (idempotency) ───────────────────────
+            # ── Step 10: Mark processed (idempotency) ──────────────────────
             self.signal_repo.mark_processed(message_id, raw_text)
 
-            # ── Step 10: Log event ─────────────────────────────────────────
+            # ── Step 11: Log event ─────────────────────────────────────────
             self.event_repo.save_event("PipelineComplete", result)
 
         except Exception as e:

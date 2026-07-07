@@ -143,9 +143,14 @@ nabu-trader/
 │   │   ├── order_service.py   Decision → exchange + SL/TP
 │   │   └── position_manager.py Background monitor
 │   ├── state/
-│   │   ├── database.py        SQLite (10 tables, WAL mode)
-│   │   └── repositories.py    Repository pattern CRUD
-│   ├── domain/models.py       Typed dataclasses
+│   │   ├── database.py        SQLite (14 tables, WAL mode, auto-migration)
+│   │   └── repositories.py    Repository pattern (11 repos)
+│   ├── api/
+│   │   ├── __init__.py        API package
+│   │   ├── auth.py            API key + HMAC auth + rate limiter
+│   │   ├── server.py          FastAPI server (15 endpoints)
+│   │   └── webhook.py         Trade event webhook emitter
+│   ├── domain/models.py       Typed dataclasses (12 models)
 │   ├── events/bus.py          In-process pub/sub
 │   ├── notifier/telegram.py   Bot API notifications
 │   ├── config/loader.py       Config.yaml + .env merger
@@ -211,6 +216,36 @@ print(f'{decision.action} {decision.pair} conf={decision.confidence}')
 3. **Session File** — The Telethon session (`sessions/nabu.session`) is essential. Back it up.
 4. **Start Small** — With $10.58 balance, max $5 positions, and dynamic leverage, the system is designed for safety.
 5. **LLM Costs** — OpenCode Go charges per token. Each signal = ~1 LLM call. Monitor usage.
+
+---
+
+## 🔌 API Bridge
+
+The bot exposes a secure HTTP API on port 9090 for Hermes to query trades, LLM interactions, position events, and more.
+
+```bash
+# Stats dashboard
+curl -s -H "X-API-Key: $API_KEY" \
+  https://nabu-trader.fly.dev/api/v1/stats
+
+# Full trade trace (includes LLM interaction, position events, trade logs)
+curl -s -H "X-API-Key: $API_KEY" \
+  https://nabu-trader.fly.dev/api/v1/trades/1
+
+# Search LLM decisions
+curl -s -H "X-API-Key: $API_KEY" \
+  "https://nabu-trader.fly.dev/api/v1/llm/search?q=SKIP"
+
+# Pipeline trace by correlation ID
+curl -s -H "X-API-Key: $API_KEY" \
+  https://nabu-trader.fly.dev/api/v1/logs/abc123def456
+```
+
+**Security**: API key auth (`X-API-Key` header), HMAC-SHA256 signing for write ops, rate limiting (30 req/min/IP).
+
+**Setup**: `flyctl secrets set API_KEY=<openssl rand -hex 32> --app nabu-trader`
+
+Full docs: [`src/api/server.py`](src/api/server.py), [`fly-trade-bridge` skill](https://hermes-agent.nousresearch.com/skills/fly-trade-bridge)
 
 ---
 

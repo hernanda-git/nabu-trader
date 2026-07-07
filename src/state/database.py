@@ -132,6 +132,68 @@ CREATE TABLE IF NOT EXISTS pending_signals (
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     triggered_at TIMESTAMP
 );
+
+-- Full LLM request/response capture for every agent brain call
+CREATE TABLE IF NOT EXISTS llm_interactions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    decision_id INTEGER REFERENCES decisions(id),
+    model TEXT NOT NULL DEFAULT '',
+    system_prompt TEXT NOT NULL DEFAULT '',
+    user_prompt TEXT NOT NULL DEFAULT '',
+    raw_response TEXT NOT NULL DEFAULT '',
+    parsed_decision_json TEXT NOT NULL DEFAULT '',
+    prompt_tokens INTEGER DEFAULT 0,
+    completion_tokens INTEGER DEFAULT 0,
+    latency_ms INTEGER DEFAULT 0,
+    success INTEGER DEFAULT 1,
+    error TEXT,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Structured log entries with correlation IDs for cross-component tracing
+CREATE TABLE IF NOT EXISTS trade_logs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    correlation_id TEXT NOT NULL DEFAULT '',
+    level TEXT NOT NULL DEFAULT 'INFO',
+    module TEXT NOT NULL DEFAULT '',
+    message TEXT NOT NULL DEFAULT '',
+    metadata_json TEXT NOT NULL DEFAULT '{}',
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_trade_logs_correlation ON trade_logs(correlation_id);
+CREATE INDEX IF NOT EXISTS idx_trade_logs_level ON trade_logs(level);
+CREATE INDEX IF NOT EXISTS idx_trade_logs_module ON trade_logs(module);
+
+-- Lifecycle events for each position — SL placed, TP hit, modified, closed, etc.
+CREATE TABLE IF NOT EXISTS position_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    position_id INTEGER NOT NULL REFERENCES positions(id),
+    event_type TEXT NOT NULL DEFAULT '',
+    details TEXT NOT NULL DEFAULT '',
+    metadata_json TEXT NOT NULL DEFAULT '{}',
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_position_events_position ON position_events(position_id);
+CREATE INDEX IF NOT EXISTS idx_position_events_type ON position_events(event_type);
+
+-- Point-in-time config snapshots tied to trades
+CREATE TABLE IF NOT EXISTS config_snapshots (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    config_hash TEXT NOT NULL DEFAULT '',
+    config_yaml TEXT NOT NULL DEFAULT '',
+    app_version TEXT NOT NULL DEFAULT '',
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+"""
+
+MIGRATIONS_SQL = """
+-- Add correlation_id and config_snapshot_id columns (safe IF NOT EXISTS via try/except)
+ALTER TABLE signals ADD COLUMN correlation_id TEXT DEFAULT '';
+ALTER TABLE decisions ADD COLUMN correlation_id TEXT DEFAULT '';
+ALTER TABLE decisions ADD COLUMN llm_interaction_id INTEGER REFERENCES llm_interactions(id);
+ALTER TABLE orders ADD COLUMN correlation_id TEXT DEFAULT '';
+ALTER TABLE positions ADD COLUMN correlation_id TEXT DEFAULT '';
+ALTER TABLE positions ADD COLUMN config_snapshot_id INTEGER REFERENCES config_snapshots(id);
 """
 
 
@@ -139,6 +201,7 @@ def get_connection(db_path: str | Path | None = None) -> sqlite3.Connection:
     """Get a SQLite connection with proper settings.
 
     Creates the data directory and initializes schema if needed.
+    Includes backward-compatible migrations for new columns.
     """
     db_path = Path(db_path) if db_path else DB_PATH
     db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -151,8 +214,33 @@ def get_connection(db_path: str | Path | None = None) -> sqlite3.Connection:
     conn.executescript(SCHEMA_SQL)
     conn.commit()
 
+    # Run backward-compatible migrations (safe on existing DBs)
+    _run_migrations(conn)
+
     log.info("Database ready at %s", db_path)
     return conn
+
+
+def _run_migrations(conn: sqlite3.Connection) -> None:
+    """Apply backward-compatible column additions.
+
+    Each ALTER TABLE ... ADD COLUMN is wrapped in a try/except to
+    handle the case where the column already exists (sqlite doesn't
+    support IF NOT EXISTS for ALTER TABLE).
+    """
+    for stmt in MIGRATIONS_SQL.strip().split("\n"):
+        stmt = stmt.strip()
+        if not stmt:
+            continue
+        try:
+            conn.execute(stmt)
+            conn.commit()
+            log.debug("Migration applied: %s", stmt[:60])
+        except sqlite3.OperationalError as e:
+            if "duplicate column" in str(e).lower():
+                log.debug("Migration skipped (already exists): %s", stmt[:60])
+            else:
+                log.warning("Migration failed: %s — %s", stmt[:60], e)
 
 
 def json_dumps(obj: Any) -> str:

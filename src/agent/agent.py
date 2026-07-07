@@ -181,22 +181,67 @@ class AgentBrain:
 
         # Try 1: normal call
         response = ""
+        self._last_interaction: dict | None = None
         try:
-            response = self._call_llm(prompt)
+            response, tokens_in, tokens_out, latency = self._call_llm(prompt)
             decision = _parse_decision(response)
+            self._last_interaction = {
+                "model": self.model,
+                "system_prompt": SYSTEM_PROMPT,
+                "user_prompt": prompt,
+                "raw_response": response,
+                "parsed_decision_json": json.dumps({
+                    "action": decision.action if decision else "SKIP",
+                    "pair": decision.pair if decision else "",
+                    "direction": decision.direction if decision else "LONG",
+                }, default=str) if decision else "{}",
+                "prompt_tokens": tokens_in,
+                "completion_tokens": tokens_out,
+                "latency_ms": latency,
+                "success": decision is not None,
+                "error": None,
+            }
         except Exception as e:
             log.error("LLM call failed: %s", e)
             decision = None
+            self._last_interaction = {
+                "model": self.model,
+                "system_prompt": SYSTEM_PROMPT,
+                "user_prompt": prompt,
+                "raw_response": response or str(e),
+                "parsed_decision_json": "{}",
+                "prompt_tokens": 0,
+                "completion_tokens": 0,
+                "latency_ms": 0,
+                "success": False,
+                "error": str(e),
+            }
 
         # Try 2: retry with reinforced prompt if first attempt failed to parse
         if decision is None:
             log.warning("LLM response invalid, retrying with reinforced prompt...")
             reinforce = self._build_reinforce_prompt(prompt, response or "(no response)")
             try:
-                response2 = self._call_llm(reinforce)
+                response2, tokens_in2, tokens_out2, latency2 = self._call_llm(reinforce)
                 decision = _parse_decision(response2)
                 if decision is not None:
                     log.info("Retry succeeded — LLM returned valid JSON on second attempt")
+                    self._last_interaction = {
+                        "model": self.model,
+                        "system_prompt": SYSTEM_PROMPT,
+                        "user_prompt": reinforce,
+                        "raw_response": response2,
+                        "parsed_decision_json": json.dumps({
+                            "action": decision.action,
+                            "pair": decision.pair,
+                            "direction": decision.direction,
+                        }, default=str),
+                        "prompt_tokens": tokens_in2,
+                        "completion_tokens": tokens_out2,
+                        "latency_ms": latency2,
+                        "success": True,
+                        "error": None,
+                    }
             except Exception as e:
                 log.error("LLM retry also failed: %s", e)
                 decision = None
@@ -227,8 +272,12 @@ class AgentBrain:
 
         return decision
 
-    def _call_llm(self, prompt: str) -> str:
-        """Call the LLM via OpenAI-compatible chat completions endpoint."""
+    def _call_llm(self, prompt: str) -> tuple[str, int, int, int]:
+        """Call the LLM via OpenAI-compatible chat completions endpoint.
+
+        Returns (response_text, prompt_tokens, completion_tokens, latency_ms).
+        """
+        import time
         headers = {"Content-Type": "application/json"}
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
@@ -245,15 +294,20 @@ class AgentBrain:
         }
 
         log.info("Calling LLM: %s with model %s", self.api_url, self.model)
+        t0 = time.monotonic()
         with httpx.Client(timeout=self.timeout) as client:
             resp = client.post(self.api_url, json=payload, headers=headers)
             resp.raise_for_status()
             data = resp.json()
+            latency = int((time.monotonic() - t0) * 1000)
+            usage = data.get("usage", {})
+            prompt_tokens = usage.get("prompt_tokens", 0)
+            completion_tokens = usage.get("completion_tokens", 0)
             msg = data["choices"][0]["message"]
             # Reasoning models may put JSON in content or reasoning_content
             content = msg.get("content", "") or ""
             rc = msg.get("reasoning_content", "") or ""
             # Try content first (it's the actual response), fall back to full text
             if content.strip():
-                return content
-            return content + "\n" + rc
+                return content, prompt_tokens, completion_tokens, latency
+            return content + "\n" + rc, prompt_tokens, completion_tokens, latency

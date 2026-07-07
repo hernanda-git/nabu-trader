@@ -118,3 +118,64 @@ class PendingSignal:
     status: Literal["PENDING", "TRIGGERED", "EXPIRED", "CANCELLED"] = "PENDING"
     created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     triggered_at: datetime | None = None
+
+
+# ─── LLM Interaction ─────────────────────────────────────────────────────────
+
+@dataclass(frozen=True)
+class LLMInteraction:
+    """Every LLM call — full request/response for future traceability."""
+    id: int = 0
+    decision_id: int = 0
+    model: str = ""
+    system_prompt: str = ""
+    user_prompt: str = ""
+    raw_response: str = ""
+    parsed_decision_json: str = ""  # The JSON that was parsed from response
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    latency_ms: int = 0
+    success: bool = True
+    error: str | None = None
+    created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+
+
+# ─── Trade Log Entry ─────────────────────────────────────────────────────────
+
+@dataclass(frozen=True)
+class TradeLogEntry:
+    """Structured log entry with correlation ID for cross-component tracing."""
+    id: int = 0
+    correlation_id: str = ""
+    level: str = "INFO"  # DEBUG, INFO, WARNING, ERROR
+    module: str = ""
+    message: str = ""
+    metadata_json: str = "{}"  # JSON blob for structured data
+    created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+
+
+# ─── Position Event ──────────────────────────────────────────────────────────
+
+@dataclass(frozen=True)
+class PositionEvent:
+    """A lifecycle event for a position — SL set, TP hit, SL modified, closed, etc."""
+    id: int = 0
+    position_id: int = 0
+    event_type: str = ""  # POSITION_OPENED, SL_PLACED, TP_PLACED, SL_MODIFIED,
+                          # TP_MODIFIED, SL_HIT, TP_HIT, PARTIAL_EXIT,
+                          # POSITION_CLOSED, TIME_EXIT, AUTO_DETECTED_CLOSE
+    details: str = ""
+    metadata_json: str = "{}"
+    created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+
+
+# ─── Config Snapshot ─────────────────────────────────────────────────────────
+
+@dataclass(frozen=True)
+class ConfigSnapshot:
+    """Point-in-time snapshot of the effective config, tied to a trade."""
+    id: int = 0
+    config_hash: str = ""
+    config_yaml: str = ""
+    app_version: str = ""
+    created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))

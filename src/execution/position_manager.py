@@ -8,7 +8,11 @@ from typing import Any
 
 from src.domain.models import PendingSignal, Position
 from src.exchange.base import Exchange
-from src.state.repositories import PendingSignalRepository, PositionRepository
+from src.state.repositories import (
+    PendingSignalRepository,
+    PositionEventRepository,
+    PositionRepository,
+)
 
 log = logging.getLogger("execution.position_manager")
 
@@ -24,12 +28,14 @@ class PositionManager:
     def __init__(self, exchange: Exchange, config: dict,
                  position_repo: PositionRepository,
                  pending_signal_repo: PendingSignalRepository | None = None,
+                 position_event_repo: PositionEventRepository | None = None,
                  notifier=None,  # TelegramNotifier
                  orchestrator=None):  # TradeOrchestrator — for trigger execution
         self.exchange = exchange
         self.config = config
         self.position_repo = position_repo
         self.pending_signal_repo = pending_signal_repo
+        self.position_event_repo = position_event_repo
         self._notifier = notifier
         self._orchestrator = orchestrator
         self._running = False
@@ -195,6 +201,30 @@ class PositionManager:
                     pos.id, exit_price=order.avg_price or 0,
                     pnl=pnl, reason=reason, closed_by=closed_by,
                 )
+
+                # Log position event
+                if self.position_event_repo:
+                    event_type = {
+                        "MANUAL": "POSITION_CLOSED",
+                        "SL": "SL_HIT",
+                        "TP": "TP_HIT",
+                        "TRIGGER": "POSITION_CLOSED",
+                        "SYSTEM": "AUTO_DETECTED_CLOSE",
+                    }.get(closed_by, "POSITION_CLOSED")
+                    self.position_event_repo.save_event(
+                        position_id=pos.id,
+                        event_type=event_type,
+                        details=f"Closed {pos.direction} @ {order.avg_price:.8f} PnL={pnl:.2f} ({reason})",
+                        metadata={
+                            "pair": pos.pair,
+                            "direction": pos.direction,
+                            "exit_price": order.avg_price,
+                            "pnl": pnl,
+                            "reason": reason,
+                            "closed_by": closed_by,
+                        },
+                    )
+
                 log.info("Position closed: %s %s PnL=%.2f (%s)", pos.direction, pos.pair, pnl, closed_by)
                 return True
             else:
