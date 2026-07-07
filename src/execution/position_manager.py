@@ -184,13 +184,42 @@ class PositionManager:
 
     async def _close_position(self, pos: Position, reason: str,
                               closed_by: str = "MANUAL") -> bool:
-        """Internal: close a position."""
+        """Internal: close a position via LIMIT order."""
         side = "SELL" if pos.direction == "LONG" else "BUY"
         try:
+            # Fetch current price for LIMIT close
+            close_price = await self.exchange.get_mark_price(pos.pair)
+            if not close_price or close_price <= 0:
+                log.error("Cannot determine close price for %s", pos.pair)
+                return False
+
             if side == "SELL":
-                order = await self.exchange.market_sell(pos.pair, pos.quantity)
+                order = await self.exchange.limit_sell(pos.pair, pos.quantity, close_price)
             else:
-                order = await self.exchange.market_buy(pos.pair, pos.quantity)
+                order = await self.exchange.limit_buy(pos.pair, pos.quantity, close_price)
+
+            # Wait for fill (up to 30s)
+            if order.order_id and order.status != "FILLED":
+                import asyncio as _aio
+                for _ in range(15):
+                    await _aio.sleep(2)
+                    try:
+                        check = await self.exchange.get_order(pos.pair, order.order_id)
+                        if check.status == "FILLED":
+                            order = check
+                            break
+                        if check.status in ("CANCELED", "EXPIRED", "REJECTED"):
+                            log.error("Close order %s for %s", check.status, pos.pair)
+                            return False
+                    except Exception:
+                        pass
+                else:
+                    try:
+                        await self.exchange.cancel_order(pos.pair, order.order_id)
+                    except Exception:
+                        pass
+                    log.error("Close LIMIT not filled within 30s for %s", pos.pair)
+                    return False
 
             if order.status in ("FILLED", "NEW"):
                 entry_cost = pos.entry_price * pos.quantity

@@ -110,19 +110,71 @@ class OrderService:
             log.info("Scaled quantity by %.4fx to meet min notional $%.2f (was $%.2f)",
                      scale, min_notional, notional_check)
 
-        # Place entry order
-        if decision.order_type == "MARKET":
-            order = await self.exchange.market_buy(symbol, quantity) if side == "BUY" \
-                else await self.exchange.market_sell(symbol, quantity)
-        else:
-            price = decision.entry_price or 0
-            order = await self.exchange.limit_buy(symbol, quantity, price) if side == "BUY" \
-                else await self.exchange.limit_sell(symbol, quantity, price)
+        # ─── Entry order (always LIMIT, never MARKET) ───────────────────
+        entry_price = decision.entry_price
+        if not entry_price or entry_price <= 0:
+            # No entry price provided — use current mark price
+            try:
+                entry_price = await self.exchange.get_mark_price(symbol)
+            except Exception:
+                entry_price = None
+            if not entry_price or entry_price <= 0:
+                return ExecutionResult(
+                    success=False, status="FAILED",
+                    error=f"Cannot determine entry price for {symbol}",
+                )
+
+        # Ensure LIMIT price is fillable: for BUY, price must be >= current;
+        # for SELL, price must be <= current. Otherwise the order waits forever.
+        try:
+            current = await self.exchange.get_mark_price(symbol)
+            if current and current > 0:
+                if side == "BUY" and entry_price < current:
+                    log.info("Entry price %.8f < current %.8f — adjusting to current",
+                             entry_price, current)
+                    entry_price = current
+                elif side == "SELL" and entry_price > current:
+                    log.info("Entry price %.8f > current %.8f — adjusting to current",
+                             entry_price, current)
+                    entry_price = current
+        except Exception:
+            pass
+
+        order = await self.exchange.limit_buy(symbol, quantity, entry_price) if side == "BUY" \
+            else await self.exchange.limit_sell(symbol, quantity, entry_price)
+
+        # Wait for LIMIT fill (up to 30s, poll every 2s)
+        if order.order_id and order.status != "FILLED":
+            import asyncio as _aio
+            for _attempt in range(15):
+                await _aio.sleep(2)
+                try:
+                    check = await self.exchange.get_order(symbol, order.order_id)
+                    if check.status == "FILLED":
+                        order = check
+                        break
+                    if check.status in ("CANCELED", "EXPIRED", "REJECTED"):
+                        return ExecutionResult(
+                            success=False, status=check.status,
+                            error=f"Entry order {check.status}: {check.error or ''}",
+                        )
+                except Exception:
+                    pass
+            else:
+                # Timeout — cancel and fail
+                try:
+                    await self.exchange.cancel_order(symbol, order.order_id)
+                except Exception:
+                    pass
+                return ExecutionResult(
+                    success=False, status="TIMEOUT",
+                    error=f"Entry LIMIT not filled within 30s for {symbol} @ {entry_price}",
+                )
 
         # Save order
         order_db_id = self.order_repo.save(
             decision_id=decision_id, exchange=self.exchange.name,
-            symbol=symbol, side=side, order_type=decision.order_type,
+            symbol=symbol, side=side, order_type="LIMIT",
             quantity=quantity, price=order.price,
             client_order_id=client_id,
         )
@@ -194,8 +246,47 @@ class OrderService:
                                    error=f"No open position for {symbol}")
 
         side = "SELL" if position.direction == "LONG" else "BUY"
-        order = await self.exchange.market_sell(symbol, position.quantity) if side == "SELL" \
-            else await self.exchange.market_buy(symbol, position.quantity)
+
+        # Always LIMIT close — fetch current price for the LIMIT
+        try:
+            close_price = await self.exchange.get_mark_price(symbol)
+        except Exception:
+            close_price = None
+        if not close_price or close_price <= 0:
+            return ExecutionResult(
+                success=False, status="FAILED",
+                error=f"Cannot determine close price for {symbol}",
+            )
+
+        order = await self.exchange.limit_sell(symbol, position.quantity, close_price) if side == "SELL" \
+            else await self.exchange.limit_buy(symbol, position.quantity, close_price)
+
+        # Wait for close fill (up to 30s)
+        if order.order_id and order.status != "FILLED":
+            import asyncio as _aio
+            for _ in range(15):
+                await _aio.sleep(2)
+                try:
+                    check = await self.exchange.get_order(symbol, order.order_id)
+                    if check.status == "FILLED":
+                        order = check
+                        break
+                    if check.status in ("CANCELED", "EXPIRED", "REJECTED"):
+                        return ExecutionResult(
+                            success=False, status=check.status,
+                            error=f"Close order {check.status}",
+                        )
+                except Exception:
+                    pass
+            else:
+                try:
+                    await self.exchange.cancel_order(symbol, order.order_id)
+                except Exception:
+                    pass
+                return ExecutionResult(
+                    success=False, status="TIMEOUT",
+                    error=f"Close LIMIT not filled within 30s for {symbol}",
+                )
 
         # Calculate P&L
         entry_cost = position.entry_price * position.quantity
