@@ -104,14 +104,22 @@ class TelegramNotifier:
             )
         await self.send_message(text)
 
-    async def notify_startup(self):
+    async def notify_startup(self, version: str | None = None):
         """Notify that a new version has been deployed and is running."""
-        text = (
-            "🟢 **LearnerNoLearner — Online**\n\n"
-            "New version deployed and running.\n\n"
-            "Type / to see available commands."
-        )
-        await self.send_message(text)
+        lines = [
+            "🚀 **Crypto Signal Auto-Trade • Online**",
+        ]
+        if version:
+            lines.append(f"📦 Version: `{version}`")
+        lines += [
+            "",
+            "The latest deployment has completed successfully.",
+            "🟢 System Status: Operational",
+            "⚡️ Ready to execute trades.",
+            "",
+            "Type / to access the available commands.",
+        ]
+        await self.send_message("\n".join(lines))
 
     async def set_commands(self):
         """Register bot slash commands so they appear in Telegram's command menu."""
@@ -124,6 +132,7 @@ class TelegramNotifier:
                 "commands": [
                     {"command": "balance", "description": "Show futures account balance"},
                     {"command": "positions", "description": "Show all open futures positions"},
+                    {"command": "version", "description": "Show bot version"},
                     {"command": "help", "description": "Show available commands"},
                 ],
                 "scope": {"type": "default"},

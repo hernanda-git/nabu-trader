@@ -136,9 +136,23 @@ async def main():
     # ── Notifier ─────────────────────────────────────────────────────────
     notifier = TelegramNotifier(bot_token=bot_token, chat_id=notify_chat_id)
 
+    # Determine version: Fly.io release version, or git commit hash
+    app_version = os.environ.get("FLY_RELEASE_VERSION") or os.environ.get("SOURCE_VERSION", "")
+    if not app_version:
+        try:
+            import subprocess
+            result = subprocess.run(
+                ["git", "-C", str(Path(__file__).resolve().parent.parent), "rev-parse", "--short", "HEAD"],
+                capture_output=True, text=True, timeout=5,
+            )
+            app_version = result.stdout.strip()
+        except Exception:
+            app_version = ""
+    version_str = f"v{app_version}" if app_version and not app_version.startswith("v") else app_version
+
     if bot_token:
         log.info("Telegram notifier ready (chat_id=%s)", notify_chat_id)
-        await notifier.notify_startup()
+        await notifier.notify_startup(version=version_str or None)
         await notifier.set_commands()
     else:
         log.warning("TELEGRAM_BOT_TOKEN not set — notifications disabled")
@@ -171,7 +185,7 @@ async def main():
     position_manager._orchestrator = orchestrator
 
     # ── Listener ─────────────────────────────────────────────────────────
-    listener = SignalListener(orchestrator, cfg, exchange=exchange)
+    listener = SignalListener(orchestrator, cfg, exchange=exchange, version=version_str or None)
 
     # ── Start ────────────────────────────────────────────────────────────
     try:
