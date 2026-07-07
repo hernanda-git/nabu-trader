@@ -478,6 +478,18 @@ class TradeOrchestrator:
 
             if exec_result.success:
                 result["action"] = "entered"
+
+                # Notify user — include fallback info if LLM-corrected
+                if exec_result.status == "FILLED_FALLBACK" and exec_result.error:
+                    await self.notifier.send_message(
+                        f"✅ **Trade entered (LLM fallback)** — {exec_result.symbol}\n"
+                        f"   ├ Qty: `{exec_result.filled_quantity:,.0f}`\n"
+                        f"   ├ Entry: `{exec_result.avg_price:.8f}`\n"
+                        f"   ├ SL: `{decision.sl_price or '—'}`\n"
+                        f"   ├ TP: `{decision.tp_prices or '—'}`\n\n"
+                        f"{exec_result.error}"
+                    )
+
                 if self.event_bus:
                     self.event_bus.emit(Event("PositionOpened", {
                         "pair": exec_result.symbol,
@@ -653,16 +665,29 @@ class TradeOrchestrator:
 
             if exec_result.success:
                 result["action"] = "entered"
-                await self.notifier.send_message(
-                    f"🚀 **Trigger ENTERED — {exec_result.symbol}**\n"
-                    f"   ├ Direction: `{decision.direction}`\n"
-                    f"   ├ Entry: `{exec_result.avg_price:.8f}`\n"
-                    f"   ├ Qty: `{exec_result.filled_quantity:.6f}`\n"
-                    f"   ├ SL: `{decision.sl_price}`\n"
-                    f"   ├ TP: `{decision.tp_prices}`\n"
-                    f"   ├ Leverage: `{decision.leverage}x`\n"
-                    f"   └ Reason: {decision.reason[:200]}"
-                )
+
+                if exec_result.status == "FILLED_FALLBACK" and exec_result.error:
+                    await self.notifier.send_message(
+                        f"🚀 **Trigger ENTERED (LLM fallback)** — {exec_result.symbol}\n"
+                        f"   ├ Direction: `{decision.direction}`\n"
+                        f"   ├ Entry: `{exec_result.avg_price:.8f}`\n"
+                        f"   ├ Qty: `{exec_result.filled_quantity:,.0f}`\n"
+                        f"   ├ SL: `{decision.sl_price}`\n"
+                        f"   ├ TP: `{decision.tp_prices}`\n"
+                        f"   ├ Leverage: `{decision.leverage}x`\n\n"
+                        f"{exec_result.error}"
+                    )
+                else:
+                    await self.notifier.send_message(
+                        f"🚀 **Trigger ENTERED — {exec_result.symbol}**\n"
+                        f"   ├ Direction: `{decision.direction}`\n"
+                        f"   ├ Entry: `{exec_result.avg_price:.8f}`\n"
+                        f"   ├ Qty: `{exec_result.filled_quantity:.6f}`\n"
+                        f"   ├ SL: `{decision.sl_price}`\n"
+                        f"   ├ TP: `{decision.tp_prices}`\n"
+                        f"   ├ Leverage: `{decision.leverage}x`\n"
+                        f"   └ Reason: {decision.reason[:200]}"
+                    )
                 self.event_bus.emit(Event("TriggerEntered", {
                     "pair": exec_result.symbol, "price": exec_result.avg_price,
                     "quantity": exec_result.filled_quantity,

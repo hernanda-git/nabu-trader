@@ -2,13 +2,17 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import uuid
-from typing import Any
+from typing import Any, TYPE_CHECKING
 
-from src.domain.models import ExecutionResult, OrderRequest, TradeDecision
+from src.domain.models import ExecutionResult, OrderRequest, TradeSignal, TradeDecision
 from src.exchange.base import Exchange
 from src.state.repositories import DecisionRepository, OrderRepository, PositionRepository, SignalRepository
+
+if TYPE_CHECKING:
+    from src.agent.agent import AgentBrain
 
 log = logging.getLogger("execution.order_service")
 
@@ -24,13 +28,15 @@ class OrderService:
                  signal_repo: SignalRepository,
                  decision_repo: DecisionRepository,
                  order_repo: OrderRepository,
-                 position_repo: PositionRepository):
+                 position_repo: PositionRepository,
+                 agent: "AgentBrain | None" = None):
         self.exchange = exchange
         self.config = config
         self.signal_repo = signal_repo
         self.decision_repo = decision_repo
         self.order_repo = order_repo
         self.position_repo = position_repo
+        self.agent = agent
         self._max_retries = config.get("execution", {}).get("max_retries", 3)
 
     def _generate_client_id(self, decision_id: int) -> str:
@@ -181,6 +187,16 @@ class OrderService:
 
         if order.status in ("FAILED", "REJECTED", "EXPIRED"):
             self.order_repo.update_status(order_db_id, order.status, order.order_id)
+
+            # ── LLM Fallback: let the agent analyze the error and retry ──
+            if self.agent:
+                fallback = await self._llm_fallback(
+                    symbol, side, decision, order.error or "Order rejected",
+                    entry_price, quantity,
+                )
+                if fallback and fallback.success:
+                    return fallback
+
             return ExecutionResult(
                 success=False, status=order.status, error=order.error or "Order rejected",
             )
@@ -232,6 +248,135 @@ class OrderService:
             avg_price=order.avg_price or decision.entry_price or 0,
             status="FILLED",
         )
+
+    async def _llm_fallback(self, symbol: str, side: str,
+                            original_decision: TradeDecision,
+                            error_message: str,
+                            attempted_price: float | None,
+                            attempted_qty: float) -> ExecutionResult | None:
+        """Let the LLM analyze a failed order and retry with corrected parameters.
+
+        Returns ExecutionResult if the retry succeeded, None if the LLM
+        couldn't fix it or the retry also failed.
+        """
+        if not self.agent:
+            return None
+
+        try:
+            # Build a focused prompt for the LLM
+            bal_info = ""
+            try:
+                bal = await self.exchange.get_balance()
+                bal_info = f"Free balance: ${bal.free_usdt:.4f} USDT"
+            except Exception:
+                bal_info = "Balance: unavailable"
+
+            prompt = (
+                "You are a Binance Futures order repair agent. An order just FAILED.\n"
+                "Analyze the error and return a CORRECTED set of parameters as JSON.\n\n"
+                f"## Failed Order\n"
+                f"  Symbol: {symbol}\n"
+                f"  Side: {side}\n"
+                f"  Direction: {original_decision.direction}\n"
+                f"  Attempted quantity: {attempted_qty}\n"
+                f"  Attempted price: {attempted_price}\n"
+                f"  Leverage: {original_decision.leverage}\n\n"
+                f"## Error\n{error_message}\n\n"
+                f"## Account\n{bal_info}\n\n"
+                "## Your Task\n"
+                "1. Identify the ROOT CAUSE from the error code/message\n"
+                "2. Compute corrected parameters that WILL pass Binance validation\n"
+                "3. Return ONLY a JSON object:\n"
+                '{"action":"RETRY","quantity":<float>,"price":<float>,"leverage":<int>,'
+                '"reason":"<root cause>","fix":"<what you changed and why>"}\n\n'
+                "Common fixes:\n"
+                "- -4164 (notional too small): increase quantity or leverage\n"
+                "- -1111 (precision): round quantity/price to correct step size\n"
+                "- -2019 (insufficient margin): reduce quantity or leverage\n"
+                "- -4120 (order type blocked): cannot fix, return action=ABORT\n\n"
+                "If you CANNOT fix it, return: {\"action\":\"ABORT\",\"reason\":\"...\"}\n\n"
+                "Output ONLY the JSON object:"
+            )
+
+            response, _, _, _ = self.agent._call_llm(prompt)
+            data = json.loads(response.strip().strip("`").strip())
+
+            if data.get("action") != "RETRY":
+                log.info("LLM fallback: ABORT — %s", data.get("reason", "no reason"))
+                return None
+
+            new_qty = float(data.get("quantity", 0))
+            new_price = float(data.get("price", 0))
+            new_lev = int(data.get("leverage", original_decision.leverage))
+            reason = data.get("reason", "")
+            fix = data.get("fix", "")
+
+            if new_qty <= 0 or new_price <= 0:
+                log.warning("LLM fallback returned invalid params: qty=%.4f price=%.4f", new_qty, new_price)
+                return None
+
+            log.info("LLM fallback: retry with qty=%.4f price=%.6f lev=%d (fix: %s)",
+                     new_qty, new_price, new_lev, fix)
+
+            # Set new leverage if changed
+            if new_lev != original_decision.leverage:
+                try:
+                    await self.exchange.set_symbol_leverage(symbol, new_lev)
+                except Exception:
+                    pass
+
+            # Retry the order
+            retry_order = await self.exchange.limit_buy(symbol, new_qty, new_price) if side == "BUY" \
+                else await self.exchange.limit_sell(symbol, new_qty, new_price)
+
+            if retry_order.status == "FILLED":
+                log.info("LLM fallback SUCCESS: %s %s qty=%.4f @ %.6f",
+                         symbol, side, new_qty, new_price)
+
+                # Save position
+                from src.domain.models import Position
+                pos = Position(
+                    pair=symbol, direction=original_decision.direction,
+                    entry_price=retry_order.avg_price or new_price,
+                    quantity=retry_order.filled_quantity or new_qty,
+                    sl_price=original_decision.sl_price,
+                    tp_prices=original_decision.tp_prices,
+                    entry_order_id=retry_order.order_id,
+                )
+                self.position_repo.create(pos)
+
+                # Place TP orders
+                for tp_price in original_decision.tp_prices[:3]:
+                    tp_side = "SELL" if original_decision.direction == "LONG" else "BUY"
+                    if tp_side == "SELL":
+                        await self.exchange.limit_sell(symbol, new_qty, tp_price)
+                    else:
+                        await self.exchange.limit_buy(symbol, new_qty, tp_price)
+
+                return ExecutionResult(
+                    success=True,
+                    order_id=retry_order.order_id,
+                    symbol=symbol,
+                    side=side,
+                    filled_quantity=retry_order.filled_quantity or new_qty,
+                    avg_price=retry_order.avg_price or new_price,
+                    status="FILLED_FALLBACK",
+                    error=(
+                        f"⚠️ **Fallback trade — LLM-corrected**\n"
+                        f"   ├ Original error: {error_message}\n"
+                        f"   ├ Root cause: {reason}\n"
+                        f"   ├ Fix applied: {fix}\n"
+                        f"   └ Retried with qty={new_qty}, price={new_price}, lev={new_lev}x"
+                    ),
+                )
+
+            # Retry also failed
+            log.warning("LLM fallback retry also failed: %s", retry_order.error)
+            return None
+
+        except Exception as e:
+            log.warning("LLM fallback failed: %s", e)
+            return None
 
     async def _close_position(self, decision_id: int,
                               decision: TradeDecision) -> ExecutionResult:

@@ -151,7 +151,7 @@ async def main():
     gate2 = SafetyGate2(cfg, position_repo)
 
     # ── Order Service ────────────────────────────────────────────────────
-    order_service = OrderService(exchange, cfg, signal_repo, decision_repo, order_repo, position_repo)
+    order_service = OrderService(exchange, cfg, signal_repo, decision_repo, order_repo, position_repo, agent=agent)
 
     # ── Notifier ─────────────────────────────────────────────────────────
     notifier = TelegramNotifier(bot_token=bot_token, chat_id=notify_chat_id)
