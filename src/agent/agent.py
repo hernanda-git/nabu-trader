@@ -39,7 +39,8 @@ Example:
 
 
 def _build_prompt(signal: TradeSignal, open_positions: list[dict],
-                  balance: dict[str, Any] | None = None) -> str:
+                  balance: dict[str, Any] | None = None,
+                  ta_context: str | None = None) -> str:
     """Build a concise prompt for the LLM with all relevant context."""
     lines = [
         "## Signal Text",
@@ -53,6 +54,11 @@ def _build_prompt(signal: TradeSignal, open_positions: list[dict],
         f"  TP: {signal.tp_prices}",
         "",
     ]
+
+    # Inject real market structure when the signal has no SL/TP
+    if ta_context:
+        lines.append(ta_context)
+        lines.append("")
 
     if open_positions:
         lines.append("## Open Positions")
@@ -175,9 +181,10 @@ class AgentBrain:
 
     def decide(self, signal: TradeSignal,
                open_positions: list[dict] | None = None,
-               balance: dict[str, Any] | None = None) -> TradeDecision:
+               balance: dict[str, Any] | None = None,
+               ta_context: str | None = None) -> TradeDecision:
         """Analyze a signal and return a trade decision."""
-        prompt = _build_prompt(signal, open_positions or [], balance)
+        prompt = _build_prompt(signal, open_positions or [], balance, ta_context)
 
         # Try 1: normal call
         response = ""

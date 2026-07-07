@@ -482,6 +482,30 @@ class BinanceExchange(Exchange):
 
     # ─── Price / Candles ──────────────────────────────────────────────────
 
+    async def get_klines(self, symbol: str, interval: str = "4h",
+                         limit: int = 100) -> list[list]:
+        """Get full OHLCV klines from Binance Futures.
+
+        Each candle: [open_time, open, high, low, close, volume, close_time,
+                      quote_vol, trades, taker_buy_vol, taker_buy_quote_vol, ignore].
+
+        Returns the raw Binance array (excluding the still-forming last candle).
+        """
+        resolve_sym, _, _ = _resolve_futures_symbol(symbol)
+        try:
+            params = {"symbol": resolve_sym, "interval": interval, "limit": limit + 1}
+            resp = await self._public_request(
+                "GET",
+                "/fapi/v1/klines" if self.futures else "/api/v3/klines",
+                params,
+            )
+            # Drop the last candle (still forming) — only closed candles
+            data = resp if isinstance(resp, list) else []
+            return data[:-1] if len(data) > 1 else data
+        except Exception as e:
+            log.warning("Failed to fetch klines for %s %s: %s", symbol, interval, e)
+            return []
+
     async def get_klines_close(self, symbol: str, interval: str = "4h") -> float | None:
         """Get the latest closed candle close price from Binance Futures klines.
 

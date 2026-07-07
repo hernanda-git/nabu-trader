@@ -21,6 +21,7 @@ from typing import Any
 from src.agent.agent import AgentBrain
 from src.agent.gate import SafetyGate1, SafetyGate2
 from src.agent.parser import parse_signal
+from src.agent.ta_context import fetch_ta_context
 from src.domain.models import (
     ConfigSnapshot,
     Event,
@@ -267,7 +268,23 @@ class TradeOrchestrator:
             signal_db_id = self.signal_repo.save(signal)
 
             # ── Step 4: Agent Brain (1 LLM call) ────────────────────────────
-            decision = self.agent.decide(signal, open_positions, balance)
+            # Fetch technical context only when the signal has no SL/TP
+            # so the LLM can anchor on real support/resistance/ATR levels
+            # instead of guessing from training-data heuristics.
+            ta_ctx: str | None = None
+            if signal.sl_price is None or not signal.tp_prices:
+                try:
+                    ta_ctx = await fetch_ta_context(
+                        self.exchange, signal.pair or "", timeframe="4h"
+                    )
+                    if ta_ctx:
+                        log.info("TA context fetched for %s (%d chars)",
+                                 signal.pair, len(ta_ctx))
+                except Exception:
+                    log.warning("Failed to fetch TA context for %s", signal.pair,
+                                exc_info=True)
+
+            decision = self.agent.decide(signal, open_positions, balance, ta_ctx)
             log.info("Decision: %s %s (conf=%.2f, reason=%s)",
                      decision.action, decision.pair, decision.confidence, decision.reason)
             self._log(correlation_id, "INFO", "orchestrator",
@@ -580,7 +597,23 @@ class TradeOrchestrator:
                 log.warning("Failed to fetch balance for trigger entry")
 
             # LLM decides (ENTER / SKIP / CLOSE with sizing)
-            decision = self.agent.decide(signal, open_positions, balance)
+            # The trigger already has entry_price but may lack SL/TP —
+            # fetch TA context using the pending signal's timeframe.
+            ta_ctx: str | None = None
+            if signal.sl_price is None or not signal.tp_prices:
+                try:
+                    ta_ctx = await fetch_ta_context(
+                        self.exchange, signal.pair or "",
+                        timeframe=pending.timeframe or "4h",
+                    )
+                    if ta_ctx:
+                        log.info("TA context fetched for trigger %s (%d chars)",
+                                 signal.pair, len(ta_ctx))
+                except Exception:
+                    log.warning("Failed to fetch TA context for trigger %s",
+                                signal.pair, exc_info=True)
+
+            decision = self.agent.decide(signal, open_positions, balance, ta_ctx)
             log.info("Trigger decision: %s %s (conf=%.2f, reason=%s)",
                      decision.action, decision.pair, decision.confidence, decision.reason)
 

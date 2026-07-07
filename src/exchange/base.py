@@ -92,6 +92,12 @@ class Exchange(ABC):
     async def get_open_orders(self, symbol: str | None = None) -> list[OrderInfo]:
         """Get all open orders."""
 
+    async def get_klines(self, symbol: str, interval: str = "4h",
+                         limit: int = 100) -> list[list]:
+        """Get full OHLCV klines. Each candle: [open_time, open, high, low, close, volume, ...].
+        Returns [] if not supported."""
+        return []
+
     async def get_klines_close(self, symbol: str, interval: str = "4h") -> float | None:
         """Get the latest closed candle close price.
         Returns None if not supported by this exchange."""
