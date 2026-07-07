@@ -230,9 +230,87 @@ The event bus (`src/events/bus.py`) provides in-process pub/sub:
 
 ## Database Schema
 
-10 tables in `data/trades.db`:
-- `signals`, `decisions`, `orders`, `positions`
-- `processed_signals` (idempotency)
-- `events` (audit log)
-- `config`, `position_snapshots`, `pnl_history`
-- `schema_version` (migrations)
+14 tables in `data/trades.db`:
+
+### Core Pipeline
+
+| Table | Records | Key Columns |
+|-------|---------|-------------|
+| `signals` | Raw Telegram signals | message_id (unique), pair, direction, entry_price, sl_price, tp_prices, correlation_id |
+| `decisions` | LLM outputs | signal_id (FK), action, pair, quantity, confidence, reason, correlation_id, llm_interaction_id |
+| `orders` | Exchange orders | decision_id (FK), symbol, side, type, quantity, status, exchange_order_id, correlation_id |
+| `positions` | Open/closed positions | pair, direction, entry_price, quantity, sl_price, tp_prices, pnl, correlation_id, config_snapshot_id |
+| `executions` | Order fills | order_id (FK), filled_quantity, price, fee |
+
+### Traceability (New)
+
+| Table | Records | Key Columns |
+|-------|---------|-------------|
+| `llm_interactions` | Full LLM request/response | decision_id (FK), model, system_prompt, user_prompt, raw_response, prompt_tokens, completion_tokens, latency_ms |
+| `trade_logs` | Structured pipeline logs | correlation_id (indexed), level, module, message, metadata_json |
+| `position_events` | Position lifecycle events | position_id (FK), event_type (SL_HIT, POSITION_OPENED, etc.), details, metadata_json |
+| `config_snapshots` | Point-in-time config | config_hash, config_yaml (full dump), app_version |
+
+### Support
+
+| Table | Purpose |
+|-------|---------|
+| `processed_signals` | Idempotency tracking (message_id + hash) |
+| `events` | Generic audit trail |
+| `daily_stats` | Daily aggregated metrics |
+| `pending_signals` | Conditional signals awaiting price triggers |
+
+### Migrations
+
+All new columns are added via `_run_migrations()` using `try/except` for `ALTER TABLE ADD COLUMN`, so existing databases are upgraded automatically without data loss.
+
+## API Bridge (`src/api/`)
+
+A FastAPI server running on port 9090 provides secure remote access to the database:
+
+### Auth Flow
+
+```
+Client                          Fly.io Edge                     API Server
+  │                                │                               │
+  ├─ HTTPS GET /api/v1/stats ─────►├─ Forward to :9090 ──────────►│
+  │   X-API-Key: <key>            │  (TLS terminated)             │  ├─ Constant-time key compare
+  │                                │                               │  ├─ Rate limit check (30/min)
+  │                                │                               │  └─ Return JSON
+  │◄──── JSON response ◄──────────┤◄──────────────────────────────┤
+```
+
+For POST/PUT/DELETE: additional `X-Signature: <HMAC-SHA256>` header required.
+
+### 15 Query Endpoints
+
+| Endpoint | Returns |
+|----------|---------|
+| `GET /health` | Health check (no auth) |
+| `GET /api/v1/auth/verify` | API key validation |
+| `GET /api/v1/stats` | Dashboard (PnL, positions, signals, LLM tokens) |
+| `GET /api/v1/trades` | Paginated trade list |
+| `GET /api/v1/trades/{id}` | Full trace (trade + decision + LLM + events + logs) |
+| `GET /api/v1/positions` | Open positions with lifecycle events |
+| `GET /api/v1/llm/recent` | Recent LLM interactions |
+| `GET /api/v1/llm/search?q=` | Semantic search across LLM prompts/responses |
+| `GET /api/v1/logs/{correlation_id}` | Full pipeline trace |
+| `GET /api/v1/config/snapshots` | Config version history |
+| `GET /api/v1/events/recent` | Position lifecycle events |
+| `GET /api/v1/signals/recent` | Recent signals with decisions |
+| `GET /api/v1/search/trades?q=` | Trade search by pair/reason |
+| `GET /api/v1/exchange/balance` | Live Binance balance (proxy) |
+
+### Webhook (Push Notifications)
+
+When a trade executes, the orchestrator calls `emit_event()` which POSTs to a configurable URL:
+
+```json
+{
+  "event_type": "TRADE_ENTERED",
+  "correlation_id": "a1b2c3d4e5f6",
+  "data": { "pair": "BTCUSDT", "direction": "LONG", "entry_price": 65000, ... }
+}
+```
+
+Headers: `X-Signature: <hmac-sha256>` (if secret configured)

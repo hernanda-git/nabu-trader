@@ -48,9 +48,14 @@ python src/main.py
                       │            4. LLM decide        httpx.AsyncClient
                       │            5. Gate 2 (clamp)
                       ▼            6. Execute order     ▼
-                 Telegram Bot       7. Notify         SQLite DB
-                 (notifier)                              │
-                                                  /data/data/trades.db
+                 Telegram Bot       7. Notify ─────► SQLite DB (14 tables)
+                 (notifier)          8. LLM log          │
+                                      9. Config snap   /data/data/trades.db
+                                     10. Trade logs        │
+                                     11. Position events   │
+                                                            ▼
+                                                   FastAPI (port 9090)
+                                                   Hermes ←→ API Bridge
 ```
 
 ### Directory Layout
@@ -58,8 +63,13 @@ python src/main.py
 ```
 src/
 ├── main.py                      # Entry point — wires everything
-├── orchestrator.py              # Pipeline coordinator
+├── orchestrator.py              # Pipeline coordinator + structured logging
 ├── listener.py                  # Telethon Telegram listener
+├── api/
+│   ├── __init__.py              # API package
+│   ├── auth.py                  # API key + HMAC auth + rate limiter
+│   ├── server.py                # FastAPI server (15 endpoints)
+│   └── webhook.py               # Trade event webhook emitter
 ├── agent/
 │   ├── agent.py                 # LLM brain (OpenCode Go)
 │   ├── gate.py                  # Safety Gate 1 + Gate 2
@@ -74,10 +84,10 @@ src/
 ├── notifier/
 │   └── telegram.py              # Telegram Bot API notifications
 ├── state/
-│   ├── database.py              # SQLite setup + schema
-│   └── repositories.py          # DAO layer per entity
+│   ├── database.py              # SQLite setup + schema + migrations
+│   └── repositories.py          # DAO layer per entity (11 repos)
 ├── domain/
-│   └── models.py                # Frozen dataclasses + Position
+│   └── models.py                # Frozen dataclasses (12 models)
 ├── events/
 │   └── bus.py                   # In-process pub/sub
 └── config/
@@ -124,13 +134,20 @@ src/
 - Prompt includes: raw text, regex pre-parse, open positions, account balance
 - `response_format: {"type": "json_object"}` enforces structured output
 - Response parsed by `_parse_decision()` with 3 fallback strategies (direct JSON → code-fence → regex)
+- **Full interaction captured**: Every LLM call records prompt, response, token counts, latency to DB (`llm_interactions` table)
 - Dry-run: `agent.auto_trade: false` logs decisions without executing
 
 ### Repository Pattern
 - Business logic NEVER touches SQL directly
-- Each entity has its own repository class
+- Each entity has its own repository class (11 total)
 - All repositories accept an optional `sqlite3.Connection` in constructor
 - One connection per process (created in `main.py`, passed to all repos)
+- **New repos**: `LLMInteractionRepository`, `TradeLogRepository`, `PositionEventRepository`, `ConfigSnapshotRepository`
+
+### Correlation ID Tracing
+- Every pipeline run generates a unique `correlation_id` (12-char hex)
+- The ID flows through: signal → decision → order → position → trade logs → position events
+- Query full pipeline trace: `GET /api/v1/logs/{correlation_id}` or `SELECT * FROM trade_logs WHERE correlation_id = ?`
 
 ---
 
@@ -147,6 +164,12 @@ src/
 | **1000x LIMIT SL fills instantly** | Position closed immediately | LIMIT SELL below market is NOT a valid SL — use position manager monitoring or MARKET |
 | **1000x filter cache miss** | `-1111 Precision over maximum` for low-price coins | Fixed: `_round_quantity()` now lazy-loads filters on miss, falls back to integer rounding |
 | **Windows/WSL out of sync** | Deploy pushes old code | Always `cp` changed files to Windows path before `flyctl deploy` |
+| **API_KEY not set on Fly.io** | API returns 401 for all requests | `flyctl secrets set API_KEY=<key> --app nabu-trader` then restart |
+| **HMAC signing mismatch** | POST requests return 401 | Ensure client and server use same API_HMAC_SECRET |
+| **Rate limited by API bridge** | 429 Too Many Requests | Wait 60s or reduce query frequency (30 req/min per IP) |
+| **DB migration skipped columns** | New columns show as NULL | Safe — `_run_migrations()` uses try/except for ALTER TABLE |
+| **Webhook URL not set** | Trade events not pushed | Set `WEBHOOK_URL` env var on Fly.io; push is fire-and-forget |
+| **uvicorn fails to start** | API bridge not available | Check port conflicts; bot continues without API, log shows "API bridge not started" |
 
 ### ⚠️ 1000x Contract Compatibility
 
@@ -234,8 +257,43 @@ flyctl secrets list --app nabu-trader
 
 ### 7. Check Binance Futures Balance
 ```bash
-powershell.exe -NoProfile -Command "& flyctl ssh console --app nabu-trader -C 'python -c \"import os; os.chdir(\"/app\"); from src.exchange.binance import BinanceExchange; import asyncio; e=BinanceExchange(os.environ[\"BINANCE_API_KEY\"], os.environ[\"BINANCE_API_SECRET\"], futures=True, testnet=False); b=asyncio.run(e.get_balance()); print(f\"Free: \${b.free_usdt}, Total: \${b.total_usdt}\")\"'"
+powershell.exe -NoProfile -Command "& flyctl ssh console --app nabu-trader -C 'python -c \"import os; os.chdir(\\\"/app\\\"); from src.exchange.binance import BinanceExchange; import asyncio; e=BinanceExchange(os.environ[\\\"BINANCE_API_KEY\\\"], os.environ[\\\"BINANCE_API_SECRET\\\"], futures=True, testnet=False); b=asyncio.run(e.get_balance()); print(f\\\"Free: \\${b.free_usdt}, Total: \\${b.total_usdt}\\\")\\\"'\""
 ```
+
+### 8. Query Trades via API Bridge
+The bot exposes a secure HTTP API on port 9090. Once deployed with `API_KEY` set:
+
+```bash
+# Stats dashboard
+curl -s -H "X-API-Key: $API_KEY" \
+  https://nabu-trader.fly.dev/api/v1/stats
+
+# Full trade trace
+curl -s -H "X-API-Key: $API_KEY" \
+  https://nabu-trader.fly.dev/api/v1/trades/1
+
+# Search LLM decisions
+curl -s -H "X-API-Key: $API_KEY" \
+  "https://nabu-trader.fly.dev/api/v1/llm/search?q=SKIP"
+```
+
+### 9. Pipeline Trace via Correlation ID
+Every pipeline run generates a correlation ID. Use it to reconstruct the full execution:
+
+```bash
+curl -s -H "X-API-Key: $API_KEY" \
+  https://nabu-trader.fly.dev/api/v1/logs/{correlation_id}
+```
+
+Returns: all structured logs + signal + decision + positions for that run.
+
+### 10. Agentic Post-Mortem
+When investigating a failed trade:
+1. `GET /api/v1/trades/{id}` — full trade with LLM interaction + position events
+2. Check `trade_logs[]` for ERROR entries
+3. Examine `llm_interaction.user_prompt` to see what the LLM was told
+4. Compare with `config_snapshot` to see what risk settings were active
+5. Load `fly-trade-bridge` skill for structured query workflows
 
 ---
 
@@ -276,7 +334,7 @@ CHANNEL_USERNAME
 ### Persistent Data
 | Path | Contents |
 |------|----------|
-| `/data/data/trades.db` | SQLite (signals, decisions, orders, positions) |
+| `/data/data/trades.db` | SQLite (14 tables: signals, decisions, orders, positions, llm_interactions, trade_logs, position_events, config_snapshots, etc.) |
 | `/data/sessions/nabu.session` | Telethon session (auth persistence) |
 | `/data/logs/trading.log` | Debug logs |
 
@@ -318,10 +376,14 @@ print(f'{decision.action} {decision.pair} conf={decision.confidence}')
 |------|---------|
 | [`README.md`](README.md) | Project overview, features, quick start |
 | [`config.yaml`](config.yaml) | All configuration |
-| [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | Full architecture + data flow |
-| [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md) | Fly.io + local deployment |
+| [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | Full architecture + data flow + DB schema |
+| [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md) | Fly.io + local deployment + API key setup |
 | [`docs/RISK_MANAGEMENT.md`](docs/RISK_MANAGEMENT.md) | Safety gates + risk rules |
+| [`docs/API.md`](docs/API.md) | Exchange adapter API reference |
 | [`docs/SIGNAL_PARSING.md`](docs/SIGNAL_PARSING.md) | Regex patterns for signal formats |
 | [`docs/Fly-health-check.md`](docs/Fly-health-check.md) | Quick health check reference |
+| [`src/api/server.py`](src/api/server.py) | API bridge server (15 endpoints) |
+| [`src/api/auth.py`](src/api/auth.py) | Auth middleware + rate limiter |
+| [`docs/CHANGELOG.md`](CHANGELOG.md) | Version history |
 | [`PLAN.md`](PLAN.md) | Original design plan |
 | [`PLAN_REVISE.md`](PLAN_REVISE.md) | Revised plan |

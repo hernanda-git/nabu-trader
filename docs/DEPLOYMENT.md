@@ -23,6 +23,10 @@ cd /mnt/c/"Working Folder/Research/nabu-trader"
 fly launch --name nabu-trader --now --region sin --no-deploy
 
 # Set secrets (never commit .env!)
+
+### Core Secrets
+
+```bash
 fly secrets set \
   TG_API_ID=12345678 \
   TG_API_HASH=abc123... \
@@ -32,11 +36,33 @@ fly secrets set \
   BINANCE_API_SECRET=xxx \
   OPENCODE_GO_API_KEY=sk-... \
   CHANNEL_USERNAME=YOUR_SIGNAL_CHANNEL
+```
 
-# Upload Telegram session file (needed for auth)
+### API Bridge Secrets
+
+```bash
+fly secrets set \
+  API_KEY="$(openssl rand -hex 32)" \
+  API_HMAC_SECRET="$(openssl rand -hex 32)"
+```
+
+### Webhook (optional)
+
+```bash
+fly secrets set \
+  WEBHOOK_URL="https://your-hermes-endpoint/webhook" \
+  WEBHOOK_HMAC_SECRET="$(openssl rand -hex 32)"
+```
+
+### Upload Telegram Session
+
+```bash
 flyctl sftp upload sessions/nabu.session /data/sessions/
+```
 
-# Deploy
+### Deploy
+
+```bash
 fly deploy
 ```
 
@@ -45,9 +71,14 @@ fly deploy
 ```dockerfile
 FROM python:3.11-slim
 WORKDIR /app
+RUN apt-get update && apt-get install -y --no-install-recommends sqlite3 ca-certificates && rm -rf /var/lib/apt/lists/*
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
-COPY . .
+COPY .env.example .env.example
+COPY config.yaml .
+COPY src/ src/
+RUN mkdir -p /data/sessions /data/logs
+ENV FLY_MODE=1 DATA_ROOT=/data PYTHONUNBUFFERED=1
 CMD ["python", "src/main.py"]
 ```
 
