@@ -9,6 +9,7 @@ from typing import Any, TYPE_CHECKING
 
 from src.domain.models import ExecutionResult, OrderRequest, TradeSignal, TradeDecision
 from src.exchange.base import Exchange
+from src.exchange.validation import validate_order
 from src.state.repositories import DecisionRepository, OrderRepository, PositionRepository, SignalRepository
 
 if TYPE_CHECKING:
@@ -42,6 +43,21 @@ class OrderService:
     def _generate_client_id(self, decision_id: int) -> str:
         """Generate a unique, idempotent client order ID."""
         return f"lnr_{decision_id}_{uuid.uuid4().hex[:8]}"
+
+    async def _get_filters(self, symbol: str) -> dict | None:
+        """Load exchange filters for a symbol (delegates to the exchange adapter).
+
+        Returns the filter dict (with tickSize/minPrice/maxPrice/stepSize/
+        minQty/minNotional) or None if unavailable (validation is then skipped
+        rather than blocking — the exchange is the final authority).
+        """
+        try:
+            loader = getattr(self.exchange, "_load_futures_filters", None)
+            if loader is not None:
+                return await loader(symbol)
+        except Exception as e:
+            log.debug("Could not load filters for %s: %s", symbol, e)
+        return None
 
     async def execute(self, signal_id: int, decision: TradeDecision,
                       decision_id: int | None = None) -> ExecutionResult:
@@ -125,6 +141,19 @@ class OrderService:
             quantity = quantity * scale
             log.info("Scaled quantity by %.4fx to meet min notional $%.2f (was $%.2f)",
                      scale, min_notional, notional_check)
+
+        # ─── Pre-submission validation gate (Task 5) ───────────────────
+        # Never send an order that violates the symbol's exchange filters.
+        # This guarantees "no order submitted without passing validation".
+        filters = await self._get_filters(symbol)
+        val_err = validate_order(symbol, side, decision.entry_price, quantity, filters or {})
+        if val_err:
+            log.warning("Validation gate BLOCKED entry %s %s %s qty=%.4f @ %.8f: %s",
+                        symbol, side, decision.order_type, quantity, decision.entry_price, val_err)
+            return ExecutionResult(
+                success=False, status="VALIDATION_SKIP", error=val_err,
+                symbol=symbol, side=side,
+            )
 
         # ─── Entry order (always LIMIT, never MARKET) ───────────────────
         entry_price = decision.entry_price
@@ -231,20 +260,28 @@ class OrderService:
         sl_placed = False
         if decision.sl_price:
             sl_side = "SELL" if decision.direction == "LONG" else "BUY"
-            sl_order = await self.exchange.stop_loss(symbol, quantity, decision.sl_price, sl_side)
-            if sl_order.order_id:
-                sl_placed = True
-                log.info("SL placed: %s @ %s (conditional)", symbol, decision.sl_price)
-            elif sl_order.status == "UNPROTECTED":
-                log.warning("SL NOT placed for %s @ %s — position monitored by position manager",
-                            symbol, decision.sl_price)
+            sl_err = validate_order(symbol, sl_side, decision.sl_price, quantity, filters or {})
+            if sl_err:
+                log.warning("Validation gate SKIPPED SL %s @ %s: %s", symbol, decision.sl_price, sl_err)
             else:
-                log.warning("SL NOT placed for %s @ %s — position UNPROTECTED (%s)",
-                            symbol, decision.sl_price, sl_order.error)
+                sl_order = await self.exchange.stop_loss(symbol, quantity, decision.sl_price, sl_side)
+                if sl_order.order_id:
+                    sl_placed = True
+                    log.info("SL placed: %s @ %s (conditional)", symbol, decision.sl_price)
+                elif sl_order.status == "UNPROTECTED":
+                    log.warning("SL NOT placed for %s @ %s — position monitored by position manager",
+                                symbol, decision.sl_price)
+                else:
+                    log.warning("SL NOT placed for %s @ %s — position UNPROTECTED (%s)",
+                                symbol, decision.sl_price, sl_order.error)
 
         # Place TP orders (conditional TAKE_PROFIT-LIMIT, fallback to Basic LIMIT)
         for i, tp_price in enumerate(decision.tp_prices[:3]):
             tp_side = "SELL" if decision.direction == "LONG" else "BUY"
+            tp_err = validate_order(symbol, tp_side, tp_price, quantity, filters or {})
+            if tp_err:
+                log.warning("Validation gate SKIPPED TP%d %s @ %s: %s", i + 1, symbol, tp_price, tp_err)
+                continue
             tp_order = await self.exchange.take_profit(symbol, quantity, tp_price, tp_side)
             if tp_order.order_id:
                 log.info("TP%d placed: %s @ %s (conditional)", i + 1, symbol, tp_price)
