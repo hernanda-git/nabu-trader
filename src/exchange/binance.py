@@ -501,7 +501,17 @@ class BinanceExchange(Exchange):
                 self._invalid_symbols[resolve_sym] = now
                 log.info("Binance futures symbol not found: %s (from %s)", resolve_sym, symbol)
                 return None
-            s = rules[0]
+            # Match the requested symbol by resolved name, then exact raw
+            # symbol, then fall back to the first element. NEVER blindly take
+            # rules[0] — for APEUSDT the response's first element was BTCUSDT,
+            # which produced a wrong minPrice and triggered Binance -1111.
+            s = None
+            for cand in rules:
+                if cand.get("symbol") == resolve_sym:
+                    s = cand
+                    break
+            if s is None:
+                s = next((c for c in rules if c.get("symbol") == symbol.upper()), rules[0])
             out = {"_updated": now, "valid": True}
             for f in s.get("filters", []):
                 ft = f.get("filterType")
@@ -517,6 +527,11 @@ class BinanceExchange(Exchange):
                     out["mktMinQty"] = float(f.get("minQty", 0))
                     out["mktMaxQty"] = float(f.get("maxQty", 0))
                     out["mktStepSize"] = float(f.get("stepSize", 1))
+                elif ft == "MIN_NOTIONAL":
+                    # Some pairs expose "notional", older ones "minNotional".
+                    mn = f.get("notional", f.get("minNotional", 0))
+                    if mn:
+                        out["minNotional"] = float(mn)
             status = s.get("status")
             out["status"] = status
             if status != "TRADING":
