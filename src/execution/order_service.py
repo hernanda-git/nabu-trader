@@ -80,6 +80,16 @@ class OrderService:
         client_id = self._generate_client_id(decision_id)
         side = "BUY" if decision.direction == "LONG" else "SELL"
 
+        # ─── Idempotency: never place a second active entry for the same decision ──
+        existing = self.order_repo.get_active_for_decision(decision_id, symbol, side)
+        if existing:
+            log.info("Idempotency: decision %d already has active %s %s order %s (%s) — skip",
+                     decision_id, symbol, side, existing.get("exchange_order_id"), existing.get("status"))
+            return ExecutionResult(success=True, status="DUPLICATE_SKIPPED",
+                                   order_id=existing.get("exchange_order_id"),
+                                   symbol=symbol, side=side,
+                                   error=f"Duplicate entry skipped: decision {decision_id} already has active order")
+
         # Set futures leverage and margin type before placing the entry order
         if decision.leverage > 1:
             await self.exchange.set_symbol_leverage(symbol, decision.leverage)

@@ -183,6 +183,25 @@ class OrderRepository:
             self.conn.execute("UPDATE orders SET status = ? WHERE id = ?", (status, order_id))
         self.conn.commit()
 
+    def get_active_for_decision(self, decision_id: int, symbol: str, side: str) -> dict | None:
+        """Return the most recent active entry order for a (decision, symbol, side).
+
+        Active = not yet terminal (PENDING / NEW / FILLED). A FILLED entry means
+        the position is open, so re-entry is still blocked until the position is
+        closed (status moves out of this set). Returns None if no active order —
+        i.e. it's safe to place a new entry.
+
+        Used by OrderService to make entry idempotent: the same decision can
+        never produce two resting LIMIT orders.
+        """
+        cur = self.conn.execute(
+            "SELECT * FROM orders WHERE decision_id=? AND symbol=? AND side=? "
+            "AND status IN ('PENDING','NEW','FILLED') ORDER BY id DESC LIMIT 1",
+            (decision_id, symbol, side),
+        )
+        row = cur.fetchone()
+        return dict(row) if row else None
+
 
 # ═════════════════════════════════════════════════════════════════════════════
 # Position Repository
