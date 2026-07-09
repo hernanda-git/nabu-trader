@@ -4,7 +4,22 @@ All notable changes to this project are documented here.
 
 - **Failure alert now delivers**: the "Failed to place order" alert was wrapped in nested backticks, which Telegram rejected with *"can't parse entities"* — so failed-trade alerts were silently **undelivered** in prod. Now uses a fenced code block for the raw error. Added markdown-safety tests.
 
-- **Telegram alerts now render reliably**: added `_md_escape()` and applied it to all dynamic content (signal preview, decision reason, etc.) so raw signal/agent text with `*`, `_`, `` ` `` no longer breaks Markdown parsing. This eliminates the pre-existing "can't parse entities" delivery failures across *all* notifications, not just the failure alert.
+## Trade Execution Reliability Pass — 2026-07-09 (APE-1111)
+
+### Fixed
+- **Wrong-symbol filter match (`s = rules[0]`)**: `_load_futures_filters` now matches the exchangeInfo entry by the resolved futures symbol (then raw symbol, then first) and captures `minNotional`. This was the root cause of APEUSDT inheriting BTCUSDT's `tickSize`/`minNotional` and getting rejected with `-1111`.
+- **`_round_price` magnitude-flip inflation**: the old clamp forced a valid price up to `minPrice` (e.g. `0.162 → 100`) when `minPrice` was bogus. It now only clamps down when `minPrice` is within ~10× the requested price.
+- **`_round_quantity` ignored `minNotional`**: now (a) rounds to the symbol's `stepSize` + integer lots, and (b) loops increasing qty until `qty × price ≥ minNotional` using the **real** filter value, so low-priced coins no longer get `-4164`.
+- **Non-idempotent LIMIT**: `OrderRepository.get_active_for_decision` + a dedup guard in `_enter_position` guarantee one active entry per decision. (The `client_order_id UNIQUE` constraint remains as a DB backstop.)
+
+### Added
+- **Pre-submission validation gate** (`src/exchange/validation.py`, `validate_order`): every order is checked for price precision, min/max price, minQty, integer lots, and minNotional, and wired into `order_service` before entry/SL/TP. Invalid orders are skipped (`VALIDATION_SKIP`), never sent.
+- **Dynamic leverage** from the real exchange `minNotional` + `config.risk`: `port_usdt`, `max_leverage` (ceiling 50), `max_leverage_increase_pct` (cap at `baseline×(1+pct%)`). No hardcoded 5/1/50 literals in the sizing math.
+- **Deterministic repair** (`_repair_order`): replaces the removed LLM fallback. On rejection it re-derives qty/price from filters, recomputes leverage, validates, and resubmits exactly once; gives up with `VALIDATION_SKIP` if it still can't validate. **The LLM bypass (security/randomness risk) is gone.**
+- **Pair-matrix regression** (`tests/exchange/test_pair_matrix.py`): BTC/ETH/APE/DOGE/1000PEPE all flow through the same validated pipeline.
+- **AGENTS.md runbook** documenting the single deterministic execution path, config knobs, and the deploy note.
+
+
 
 - **Guaranteed alert delivery**: `send_message` now retries as **plain text** if Telegram rejects the Markdown ("can't parse entities"). No notification is ever silently dropped again — this was the root cause of failed-trade alerts not reaching you.
 

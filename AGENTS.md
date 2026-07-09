@@ -370,6 +370,58 @@ print(f'{decision.action} {decision.pair} conf={decision.confidence}')
 
 ---
 
+## 🛡 Trade Execution Reliability Runbook (APE-1111 fixes)
+
+Every order passes through ONE deterministic, fully-validated pipeline. No LLM
+involvement in repair. After the 2026-07-09 reliability pass:
+
+### Execution pipeline (single path)
+1. Resolve the futures symbol (`BinanceExchange._resolve_futures_symbol`).
+2. Load the symbol's **real** exchange filters by symbol
+   (`_load_futures_filters`) — NOT `rules[0]`. Captures `tickSize`, `minPrice`,
+   `maxPrice`, `stepSize`, `minQty`, `minNotional`.
+3. Round price to the symbol's `tickSize`, qty to its `stepSize` + integer lots
+   (`_round_price`, `_round_quantity`). `_round_quantity` loops until
+   `qty × price ≥ minNotional` using the **real** filter.
+4. `SafetyGate2.check` sizes qty/leverage from `config.risk`
+   (`port_usdt`, `max_leverage`, `max_leverage_increase_pct`, exchange
+   `minNotional`). No hardcoded 5/1/50 literals in the math.
+5. **Pre-submission gate** `validate_order` (in `src/exchange/validation.py`)
+   checks precision, min/max price, minQty, minNotional, integer lots — must
+   return `None` or the order is **skipped** (`VALIDATION_SKIP`), never sent.
+6. Entry is a **LIMIT** order. Before placing, `OrderRepository.get_active_for_decision`
+   dedupes — a decision can only ever have one active entry (idempotent).
+7. If the exchange rejects, `_repair_order` deterministically re-derives
+   qty/price from filters, recomputes leverage, validates, and resubmits **once**.
+   If it still can't validate → `VALIDATION_SKIP`. **The LLM fallback was removed.**
+
+### Config knobs
+| Key | Default | Purpose |
+|-----|---------|---------|
+| `risk.port_usdt` | 1.0 | margin per trade; `leverage = pos_value / port_usdt` |
+| `risk.max_leverage` | 50 | hard ceiling for dynamic leverage |
+| `risk.max_leverage_increase_pct` | 10 | cap dynamic lev at `baseline×(1+pct%)` |
+| `risk.min_notional_usdt` | 5.0 | floor; overridden by the symbol's real `minNotional` |
+| `risk.margin_usage_pct` | 80 | % of balance usable as margin per trade |
+
+### How to verify before deploying
+```bash
+# from repo root, using the project venv
+.venv/Scripts/python -m pytest tests/ -q      # WIN: use .venv interpreter
+# or: uv run pytest tests/ -q
+```
+All pairs (BTC/ETH/APE/DOGE/1000PEPE) are covered by `tests/exchange/test_pair_matrix.py`.
+
+### Deploy note
+No DB schema change in this pass (tables already had `status DEFAULT 'PENDING'`
+and `client_order_id UNIQUE`). Config-only + code changes are safe to deploy
+with a rolling `fly deploy`. After deploy, confirm the order path by sending a
+test signal in paper mode and checking the Telegram notification says either
+`LIMIT order placed`, `Trade entered (repaired)`, or a `VALIDATION_SKIP`
+(rejection) — never an unvalidated fill.
+
+---
+
 ## 🔗 Quick Links
 
 | File | Purpose |
