@@ -545,11 +545,19 @@ class BinanceExchange(Exchange):
             log.debug("exchangeInfo lookup failed for %s: %s", symbol, e)
             return None
 
-    async def _round_quantity(self, symbol: str, quantity: float) -> tuple[float, dict | None]:
+    async def _round_quantity(self, symbol: str, quantity: float,
+                             price_ref: float | None = None) -> tuple[float, dict | None]:
         """Round quantity to exchange precision for symbol.
 
         Lazily loads filters on cache miss (async) for reliability.
         Falls back to integer rounding for low-price coins if filters unavailable.
+
+        Args:
+            symbol: Trading symbol.
+            quantity: Desired quantity.
+            price_ref: Reference price used to enforce the exchange MIN_NOTIONAL
+                       filter (qty * price_ref >= minNotional). Optional; when
+                       omitted the minNotional loop is skipped.
 
         Returns (rounded_quantity, rules_or_None).
         """
@@ -579,6 +587,14 @@ class BinanceExchange(Exchange):
             rounded = max(rounded, rules["minQty"])
         if "mktMinQty" in rules:
             rounded = max(rounded, rules["mktMinQty"])
+        # Meet the exchange MIN_NOTIONAL using the real filter value, not a
+        # hardcoded constant. Bump the lot until qty * price_ref >= minNotional.
+        mn = rules.get("minNotional")
+        if mn and price_ref and price_ref > 0:
+            guard = 0
+            while rounded * price_ref < mn and guard < 1_000_000:
+                rounded += step
+                guard += 1
         prec = max(0, -int(round(log10(step))) if step < 1 else 0)
         rounded = float(f"{rounded:.{prec}f}")
         return rounded, rules
@@ -810,7 +826,7 @@ class BinanceExchange(Exchange):
 
         qty = quantity
         if self.futures:
-            qty, rules = await self._round_quantity(symbol_key, qty)
+            qty, rules = await self._round_quantity(symbol_key, qty, price_ref=price)
             # Round price to tick-size precision (prevents -1111 precision rejections)
             if price is not None:
                 price, _ = await self._round_price(symbol_key, price)
