@@ -83,6 +83,20 @@ async def build_health_report(listener: Any) -> tuple[list[str], int, int]:
     else:
         checks.append(("💱 Exchange", "FAIL", "no exchange configured"))
 
+    # ── 4b. Portfolio — open positions + margin-per-trade (port) ─────
+    cfg = getattr(getattr(listener, "orchestrator", None), "config", None) \
+        or getattr(listener, "config", None) or {}
+    port_usdt = cfg.get("risk", {}).get("port_usdt", None)
+    port_detail = f"margin/trade ${port_usdt:.2f}" if isinstance(port_usdt, (int, float)) else "margin/trade unset"
+    n_open = 0
+    try:
+        if listener.exchange is not None:
+            positions = await listener.exchange.get_positions()
+            n_open = len(positions) if positions else 0
+    except Exception:  # noqa: BLE001 — portfolio count is informational
+        pass
+    checks.append(("💼 Portfolio", "OK", f"{n_open} open · {port_detail}"))
+
     # ── 5. Symbol registry ────────────────────────────────────────
     try:
         from src.exchange.symbol_registry import get_registry
