@@ -1,316 +1,184 @@
-# Architecture
+# Architecture & End-to-End Trade Flow
 
-## System Overview
+> Companion to `AGENTS.md` (runbook) and `CHANGELOG.md`. Describes how the
+> `nabu-trader` auto-trader is wired together and exactly what
+> happens from the moment a Telegram message arrives to the moment an order is
+> filled on Binance Futures.
 
-The nabu-trader is a **real-time Telegram signal listener → LLM-powered analysis → automated Binance Futures trading** pipeline. It monitors a Telegram channel, parses trade signals using regex, analyzes them via an LLM (OpenCode Go), applies hard safety gates, and executes trades on Binance USDⓈ-M Futures.
+---
 
-```
-┌─────────────────────────────────────────────────────────────┐
-│                    Telegram Channel                          │
-│                    @YOUR_SIGNAL_CHANNEL                             │
-└─────────────────────────┬───────────────────────────────────┘
-                          │ raw message
-                          ▼
-┌─────────────────────────────────────────────────────────────┐
-│  SignalListener (Telethon)                                   │
-│  ┌──────────────────────────────────────────────────────┐   │
-│  │  • Connects to Telegram as user session               │   │
-│  │  • Listens for new + edited messages                  │   │
-│  │  • Forwards to orchestrator.handle_signal()           │   │
-│  └────────────────────┬─────────────────────────────────┘   │
-└───────────────────────┼─────────────────────────────────────┘
-                        │
-                        ▼
-┌─────────────────────────────────────────────────────────────┐
-│  TradeOrchestrator (Pipeline Coordinator)                    │
-│                                                              │
-│  1. Regex Pre-Parse (1ms)                                    │
-│     └─ parser.py → TradeSignal                              │
-│                                                              │
-│  2. Safety Gate 1 (pre-LLM)                                 │
-│     └─ Idempotency, cooldown, whitelist                     │
-│                                                              │
-│  3. Fetch Balance from Exchange                              │
-│                                                              │
-│  4. Agent Brain (1 LLM call)                                 │
-│     └─ agent.py → TradeDecision via OpenCode Go              │
-│                                                              │
-│  5. Safety Gate 2 (post-LLM)                                 │
-│     └─ Clamp, scale, leverage, daily loss                   │
-│                                                              │
-│  6. Order Service (execute)                                  │
-│     └─ order_service.py → Exchange order + SL/TP            │
-│                                                              │
-│  7. Notify via Telegram Bot                                  │
-│     └─ notifier/telegram.py                                  │
-└─────────────────────────────────────────────────────────────┘
-```
+## 1. System Architecture
 
-## Core Components
-
-### 1. Listener (`src/listener.py`)
-- Uses **Telethon** (MTProto, not Bot API) to monitor a Telegram channel
-- Default channel: `@YOUR_SIGNAL_CHANNEL` (configurable via `CHANNEL_USERNAME` env var)
-- Two event handlers: `NewMessage` + `MessageEdited` (for signal updates)
-- Deduplication via DB `processed_signals` table + Gate1 `get_by_message_id()` check
-- Requires a user account session (not a bot) — authenticated via Telegram client
-
-### 2. Orchestrator (`src/orchestrator.py`)
-The central pipeline coordinator. Wires all components together:
-```
-handle_signal(msg) →
-  1. Regex parse → TradeSignal
-  2. Gate 1 check (fast reject)
-  3. Save signal to DB
-  4. Fetch balance from exchange
-  5. Agent Brain → TradeDecision
-  6. Gate 2 check (clamp + leverage)
-  7. Notify decision
-  8. Execute via OrderService
-  9. Notify result
- 10. Emit events
-```
-
-### 3. Agent Brain (`src/agent/agent.py`)
-- Single LLM call via **OpenCode Go** (`deepseek-v4-flash` or compatible)
-- System prompt: instructs the LLM to calculate position sizing based on risk%
-- Prompt includes: raw signal text, regex pre-parse fields, open positions, account balance
-- Output: structured JSON (`TradeDecision`) with action, pair, direction, quantity, prices
-- Supports reasoning models (handles both `content` and `reasoning_content` response fields)
-- Dry-run mode: `auto_trade: false` logs without executing
-
-### 4. Safety Gates (`src/agent/gate.py`)
-
-**Gate 1 (pre-LLM)** — lightweight checks that skip before the LLM call:
-| Check | Purpose |
-|-------|---------|
-| Idempotency | Prevents re-processing signals after restart/crash |
-| Pair whitelist | Only trade allowed pairs (`*` = all) |
-| Cooldown | Prevents re-entry on same pair within N minutes |
-
-**Gate 2 (post-LLM)** — hard limits the LLM cannot override:
-| Check | Purpose |
-|-------|---------|
-| Max concurrent | Limits number of open positions |
-| Position value clamp | Caps position in USDT (dynamic via balance) |
-| Daily loss limit | Stops trading if daily P&L exceeds threshold |
-| Quantity validation | Rejects zero/negative quantities |
-| Min notional scaling | Scales up to exchange minimum if needed |
-| Leverage calculation | Dynamic per-trade leverage for margin efficiency |
-| SL sanity | Rejects SL on wrong side of entry (would trigger immediately) |
-
-### 5. Exchange Layer (`src/exchange/`)
-
-| Adapter | Use Case |
-|---------|----------|
-| `base.py` | Abstract interface (ABC) with all exchange methods |
-| `paper.py` | Simulated trading — no real money, instant fills |
-| `binance.py` | Real Binance REST API — supports Spot + USDⓈ-M Futures |
-
-**Binance Futures features:**
-- Dynamic leverage per symbol (set before each order)
-- Isolated margin mode
-- STOP_MARKET orders for stop-loss
-- Leverage endpoint (`/fapi/v1/leverage`)
-- Balance from futures wallet (`/fapi/v2/account`)
-
-### 6. Order Service (`src/execution/order_service.py`)
-Translates a `TradeDecision` into actual exchange orders:
-1. Sets futures leverage + margin type
-2. Places entry order (MARKET or LIMIT)
-3. Places STOP_MARKET (stop-loss) order
-4. Places LIMIT take-profit orders
-5. Records everything to DB (idempotency keys)
-
-### 7. Position Manager (`src/execution/position_manager.py`)
-Background loop that monitors open positions:
-- Fills from SL/TP orders (via Binance reconciliation)
-- Time-based auto-close (>48h configurable)
-- Stale position cleanup
-- Event-driven notifications
-
-### 8. State Layer (`src/state/`)
-- **SQLite** database with 10 tables
-- Repository pattern for each entity (Signal, Decision, Order, Position, Event)
-- WAL mode for concurrent reads
-- Auto-created at first run
-
-## Data Flow (Detailed)
-
-### Signal → Trade
+### 1.1 Components
 
 ```
-Message on @YOUR_SIGNAL_CHANNEL
-  │
-  ▼
-SignalListener.on_new_message()
-  │ message_id, channel, raw_text, has_media
-  ▼
-TradeOrchestrator.handle_signal()
-  │
-  ├─ 1. parse_signal(raw_text) → TradeSignal
-  │      Regex: pair, direction, entry, SL, TP
-  │      ~1ms, no network
-  │
-  ├─ 2. SafetyGate1.check(signal)
-  │      ├─ Already processed?       → SKIP
-  │      ├─ Pair whitelisted?        → SKIP
-  │      └─ Cooldown active?         → SKIP
-  │
-  ├─ 3. exchange.get_balance() → BalanceInfo
-  │      Futures wallet balance (USDT)
-  │
-  ├─ 4. AgentBrain.decide(signal, positions, balance)
-  │      ├─ Build prompt with context
-  │      ├─ LLM call (OpenCode Go)
-  │      └─ Parse response → TradeDecision
-  │
-  ├─ 5. SafetyGate2.check(decision, balance)
-  │      ├─ Clamp position value to max_size
-  │      ├─ Scale up for min_notional if needed
-  │      ├─ Calculate dynamic leverage
-  │      └─ Validate SL side
-  │
-  ├─ 6. OrderService.execute(decision)
-  │      ├─ Set leverage & margin type
-  │      ├─ Place entry order
-  │      ├─ Place SL order (STOP_MARKET)
-  │      ├─ Place TP orders (LIMIT)
-  │      └─ Save position to DB
-  │
-  └─ 7. TelegramNotifier (decision + execution)
+                         ┌─────────────────────────────────────────────────────────┐
+                         │                      Fly.io (Singapore)                    │
+                         │                                                             │
+  @YOUR_SIGNAL_CHANNEL  ───────▶│  Telegram API                                              │
+  (signal channel)       │       │                                                     │
+                         │       ▼                                                     │
+                         │  ┌──────────────────┐    message_id + raw_text            │
+                         │  │   SignalListener  │──────────────────────────┐         │
+                         │  │  (Telethon user   │                           │         │
+                         │  │   session, private│                           │         │
+                         │  │   chat = commands)│                           │         │
+                         │  └──────────────────┘                           │         │
+                         │          │  handle_signal()                     │         │
+                         │          ▼                                      │         │
+                         │  ┌──────────────────────────────────────────────────────┐ │
+                         │  │              TradeOrchestrator (core pipeline)        │ │
+                         │  │  claim → parse → Gate1 → AgentBrain → Gate2 → execute │ │
+                         │  └───────────────┬───────────────┬──────────────┬────────┘ │
+                         │                  │               │              │          │
+                         │         ┌────────▼───┐   ┌───────▼──────┐ ┌──────▼───────┐  │
+                         │         │ AgentBrain │   │ SafetyGate1  │ │ SafetyGate2  │  │
+                         │         │ (LLM via    │   │ (pre-LLM     │ │ (post-LLM    │  │
+                         │         │  OpenCode Go)│   │  regex/risk) │ │  sizing/lev) │  │
+                         │         └────────────┘   └──────────────┘ └──────────────┘  │
+                         │                  │                                        │
+                         │         ┌────────▼───────────────┐                         │
+                         │         │     OrderService       │  execute()              │
+                         │         │  (idempotent entry,     │                         │
+                         │         │   validate_order gate,  │                         │
+                         │         │   _repair_order, SL/TP)  │                         │
+                         │         └────────┬───────────────┘                         │
+                         │                  │                                        │
+                         │         ┌────────▼───────────────┐   ┌─────────────────┐   │
+                         │         │    BinanceExchange      │◀─▶│ SymbolRegistry   │   │
+                         │         │ (futures REST+WS, proxy) │   │ (live exchangeInfo│  │
+                         │         └────────┬───────────────┘   │  cache, 15m refresh│ │
+                         │                  │                   └─────────────────┘   │
+                         │         ┌────────▼───────────────┐                         │
+                         │         │   PositionManager       │  triggers, close, SL/TP│ │
+                         │         └────────┬───────────────┘                         │
+                         │                  │                                        │
+                         │  ┌───────────────▼───────────────┐   ┌─────────────────┐   │
+                         │  │   Repositories (SQLite:         │   │ TelegramNotifier│   │
+                         │  │    signals/decisions/orders/    │   │ (bot → notify   │   │
+                         │  │    positions/pending/events/    │   │  chat + /health)│   │
+                         │  │    llm_interactions/logs/       │   └────────┬────────┘   │
+                         │  │    config_snapshots)            │            │            │
+                         │  └────────────────────────────────┘            │            │
+                         │                                                │            │
+                         │  ┌──────────────────────────────────────┐      │            │
+                         │  │ HealthReporter (every 6h → /health)   │      │            │
+                         │  └──────────────────────────────────────┘      │            │
+                         │                                                │            │
+                         │  ┌──────────────────────────────────────┐      │            │
+                         │  │ API bridge (FastAPI, :9090, optional) │      │            │
+                         │  └──────────────────────────────────────┘      │            │
+                         └────────────────────────────────────────────────┘
+                                  ▲                                          │
+                                  │            Telegram bot notifications    │
+                                  └──────────────────────────────────────────┘
 ```
 
-### Dynamic Leverage Calculation
+### 1.2 Module map (`src/`)
 
-```
-                  ┌─────────────────────┐
-                  │ balance = $10.58    │
-                  │ risk_pct = 10%      │
-                  │ max_loss = $1.058   │
-                  └────────┬────────────┘
-                           │
-                  ┌────────▼────────────┐
-                  │ LLM calculates qty  │
-                  │ qty = max_loss /    │
-                  │   abs(entry - sl)   │
-                  └────────┬────────────┘
-                           │
-                  ┌────────▼────────────┐
-                  │ Gate 2 clamps       │
-                  │ pos_val <= max_size │
-                  └────────┬────────────┘
-                           │
-                  ┌────────▼────────────┐
-                  │ Scale up for        │
-                  │ min_notional if     │
-                  │ pos_val < $1        │
-                  └────────┬────────────┘
-                           │
-                  ┌────────▼────────────┐
-                  │ Leverage = ceil(    │
-                  │   pos_val /         │
-                  │   (balance × 50%)   │
-                  │ ) capped to 20x     │
-                  └────────┬────────────┘
-                           │
-                  ┌────────▼────────────┐
-                  │ Margin = pos_val /  │
-                  │ leverage            │
-                  │ ≈ 50% of balance    │
-                  └─────────────────────┘
-```
+| Module | Responsibility |
+|--------|---------------|
+| `main.py` | Entry point. Loads config + `.env`, wires every component, starts the listener/health/API tasks. |
+| `listener.py` | Telethon client. Monitors `@YOUR_SIGNAL_CHANNEL`; forwards new/edited messages to the orchestrator; implements the private-chat slash commands (`/help`, `/balance`, `/positions`, `/pending`, `/cancel`, `/health`, `/setport`, `/getport`, `/version`). |
+| `orchestrator.py` | `TradeOrchestrator`. The core pipeline (steps below). Also handles reply-based management ("sl to entry", modify) and `execute_trigger()` for conditional signals. |
+| `agent/agent.py` | `AgentBrain`. Builds the prompt and calls the LLM (OpenCode Go endpoint) once per signal to produce a `TradeDecision` (ENTER / SKIP / CLOSE / MODIFY / CONDITIONAL). |
+| `agent/parser.py` | Regex pre-parse of raw signal text into a `TradeSignal` (pair, direction, entry, SL, TP). Symbol resolution via `SymbolRegistry`. |
+| `agent/gate.py` | `SafetyGate1` (pre-LLM structural checks) and `SafetyGate2` (post-LLM sizing + leverage cap from exchange `minNotional`). |
+| `exchange/binance.py` | `BinanceExchange`. Futures REST + WS, optional proxy, real exchangeInfo filters (`_load_futures_filters`), `_round_price`/`_round_quantity`, order placement. |
+| `exchange/symbol_registry.py` | Live `exchangeInfo` cache (seeded from `data/symbols_seed.json`, refreshed every 15 min). Source of truth for price/quantity precision and `minNotional`. |
+| `exchange/validation.py` | `validate_order(symbol, side, price, qty, filters)` — pre-submission gate (Tasks 1–5). Returns `(ok, error)`. |
+| `exchange/paper.py` | Simulated exchange for `paper` mode. |
+| `execution/order_service.py` | `OrderService`. Idempotent entry (dedup via `get_active_for_decision` + `client_order_id` UNIQUE), validation gate, deterministic `_repair_order`, SL/TP placement. |
+| `execution/position_manager.py` | Monitors open positions, fires conditional triggers, manages SL/TP and closes. |
+| `notifier/telegram.py` | `TelegramNotifier`. Bot → notify chat: startup, decisions, execution, health, alerts. Registers slash commands via `setMyCommands`. |
+| `health/reporter.py` | `build_health_report()` (shared by `/health` and the 6h scheduler) + `HealthReporter` loop. |
+| `state/database.py` | SQLite (`trades.db`, on a Fly volume at `/data` in prod). Schema: `signals, decisions, orders, executions, positions, processed_signals, events, daily_stats, pending_signals, llm_interactions, trade_logs, position_events, config_snapshots`. |
+| `state/repositories.py` | One repository class per table. |
+| `api/server.py` | Optional FastAPI bridge (port 9090) for external status hooks. |
+| `config/loader.py`, `config/validator.py` | Load + validate `config.yaml`. |
 
-## Event System
+### 1.3 Data stores & state
 
-The event bus (`src/events/bus.py`) provides in-process pub/sub:
-- Events are emitted at each pipeline stage
-- EventRepository logs all events to DB
-- Future: could drive metrics, alerts, external triggers
+- **SQLite `trades.db`** — persistent state: every signal, decision, order, position, pending trigger, LLM prompt/response, and a config snapshot at each entry.
+- **`processed_signals`** — idempotent claim so a message delivered twice (post + immediate edit, or reconnect replay) is processed once.
+- **`pending_signals`** — conditional (setup/alert) signals awaiting their price trigger.
+- **`.env`** (gitignored) — `TELEGRAM_BOT_TOKEN`, `NOTIFY_CHAT_ID`, `TG_API_ID`, `TG_API_HASH`, `CHANNEL_USERNAME`, `OPENCODE_GO_API_KEY`, `SESSION_STRING`.
 
-## Database Schema
+---
 
-14 tables in `data/trades.db`:
+## 2. End-to-End Trade Flow
 
-### Core Pipeline
+Triggered by a new/edited message in `@YOUR_SIGNAL_CHANNEL`, forwarded by `SignalListener.on_new_message` → `TradeOrchestrator.handle_signal(message_id, channel, raw_text, …)`.
 
-| Table | Records | Key Columns |
-|-------|---------|-------------|
-| `signals` | Raw Telegram signals | message_id (unique), pair, direction, entry_price, sl_price, tp_prices, correlation_id |
-| `decisions` | LLM outputs | signal_id (FK), action, pair, quantity, confidence, reason, correlation_id, llm_interaction_id |
-| `orders` | Exchange orders | decision_id (FK), symbol, side, type, quantity, status, exchange_order_id, correlation_id |
-| `positions` | Open/closed positions | pair, direction, entry_price, quantity, sl_price, tp_prices, pnl, correlation_id, config_snapshot_id |
-| `executions` | Order fills | order_id (FK), filled_quantity, price, fee |
+### 2.1 Signal → Decision pipeline
 
-### Traceability (New)
+| # | Step | Component | Notes |
+|---|------|-----------|-------|
+| 0 | **Idempotent claim** | `signal_repo.claim(message_id)` | Duplicate delivery (edit/reconnect) is dropped *before* any LLM call or notification. |
+| 0b | **Management command?** | `parse_management_command` | Replies like "sl to entry" bypass the LLM and mutate the open position directly (see §2.4). |
+| 1 | **Regex pre-parse** | `parse_signal` + `SymbolRegistry` | Raw text → `TradeSignal` (pair resolved, precision/`minNotional` attached as `sym_meta`). |
+| 2 | **Safety Gate 1** | `SafetyGate1.check` | Pre-LLM structural/risk check. Rejections are expected noise → **no Telegram spam**, signal marked processed. |
+| 3 | **Context gather** | orchestrator | Fetches open positions, pending signals, and futures balance (for sizing). |
+| 3b | **Save signal** | `signal_repo.save` | Persisted for audit/traceability. |
+| 4 | **Agent Brain (1 LLM call)** | `AgentBrain.decide` | Technical context (`ta_context`) is fetched **only** when the signal lacks SL/TP, so the LLM anchors on real support/resistance/ATR. Returns a `TradeDecision`. |
+| 4b | **Save decision + LLM** | `decision_repo.save`, `_save_llm_interaction` | Persisted. |
+| 5 / 5b | **Branch on action** | orchestrator | `MODIFY` → execute modification. `CONDITIONAL` → save a `pending_signal` (await trigger). `SKIP`/`CLOSE` → notify (SKIP) and exit (no Gate 2). |
+| 6 | **Safety Gate 2** | `SafetyGate2.check(decision, balance, filters)` | **ENTER only.** Clamps size, computes leverage from exchange `minNotional` (Task 6), never above `max_leverage` (`50`) and capped at `max_leverage_increase_pct` (`10`) over the needed baseline. |
+| 7 | **Notify decision** | `notifier.notify_decision` | "thinking / decision" card to the notify chat. |
+| 8 | **Execute** | `order_service.execute` | See §2.2. |
+| 9 | **Notify execution** | `notifier.notify_execution` | `LIMIT order placed` / `Trade entered (repaired)` / reject / skip. |
 
-| Table | Records | Key Columns |
-|-------|---------|-------------|
-| `llm_interactions` | Full LLM request/response | decision_id (FK), model, system_prompt, user_prompt, raw_response, prompt_tokens, completion_tokens, latency_ms |
-| `trade_logs` | Structured pipeline logs | correlation_id (indexed), level, module, message, metadata_json |
-| `position_events` | Position lifecycle events | position_id (FK), event_type (SL_HIT, POSITION_OPENED, etc.), details, metadata_json |
-| `config_snapshots` | Point-in-time config | config_hash, config_yaml (full dump), app_version |
+### 2.2 Order execution (`OrderService.execute`)
 
-### Support
+1. **Idempotency dedup** — `get_active_for_decision(decision_id, side)`; if an active order exists → return `DUPLICATE_SKIPPED` (UNIQUE `client_order_id` is the DB backstop).
+2. **Pre-submission validation gate** — `validate_order(symbol, side, price=entry, qty, filters)` (Tasks 1–5). If invalid → `VALIDATION_SKIP`, **no API call**.
+3. **Place entry** — `LIMIT` buy/sell at the rounded entry price, quantity rounded to the symbol's real precision and `minNotional` (Tasks 2–3).
+4. **On rejection** (e.g. still `-1111`/`-4164`) — deterministic `_repair_order` reloads filters, re-rounds, re-validates, recomputes leverage, and **resubmits exactly once**. No LLM involved. Success → `✅ Repaired entry …`; failure → `VALIDATION_SKIP`.
+5. **SL / TP legs** — placed after entry; each is validated; an invalid leg is skipped with a warning (does not abort the position).
+6. **Notify** — `LIMIT order placed` (PENDING) or `Trade entered (repaired)` (FILLED).
 
-| Table | Purpose |
-|-------|---------|
-| `processed_signals` | Idempotency tracking (message_id + hash) |
-| `events` | Generic audit trail |
-| `daily_stats` | Daily aggregated metrics |
-| `pending_signals` | Conditional signals awaiting price triggers |
+### 2.3 Conditional signals & triggers
 
-### Migrations
+- A `CONDITIONAL` decision saves a `pending_signal` (`close_above` for LONG, `close_below` for SHORT, at the trigger price, with a timeframe).
+- `PositionManager` watches price; when the condition fires it calls `orchestrator.execute_trigger()`, which re-runs the LLM with trigger context, applies **Gate 2** sizing, and enters via `OrderService`.
+- Manage pending entries with `/pending` and `/cancel <id>` / `/cancel all`.
 
-All new columns are added via `_run_migrations()` using `try/except` for `ALTER TABLE ADD COLUMN`, so existing databases are upgraded automatically without data loss.
+### 2.4 Reply-based position management (no LLM)
 
-## API Bridge (`src/api/`)
+Replying to a previous signal/message with a management command (e.g. "sl to entry", "modify") is routed by `_resolve_reply_context` (which re-parses the replied-to message to recover the `reply_pair`) into `_handle_management`. These mutate the open position directly and still pass through Gate 2 for SL validity.
 
-A FastAPI server running on port 9090 provides secure remote access to the database:
+---
 
-### Auth Flow
+## 3. Telegram surface
 
-```
-Client                          Fly.io Edge                     API Server
-  │                                │                               │
-  ├─ HTTPS GET /api/v1/stats ─────►├─ Forward to :9090 ──────────►│
-  │   X-API-Key: <key>            │  (TLS terminated)             │  ├─ Constant-time key compare
-  │                                │                               │  ├─ Rate limit check (30/min)
-  │                                │                               │  └─ Return JSON
-  │◄──── JSON response ◄──────────┤◄──────────────────────────────┤
-```
+### 3.1 Slash commands (private chat with the bot)
 
-For POST/PUT/DELETE: additional `X-Signature: <HMAC-SHA256>` header required.
+| Command | Purpose |
+|---------|---------|
+| `/help` | List commands + current `port` setting |
+| `/balance` | Binance Futures account balance |
+| `/positions` | All open futures positions |
+| `/pending` | Pending conditional signals |
+| `/cancel <id>` | Cancel one pending signal |
+| `/cancel all` | Cancel all pending signals |
+| `/health` | Full system health check (also includes **💼 Portfolio: N open · margin/trade $X**) |
+| `/setport N` | Set margin per trade to $N (leverage auto-derived) |
+| `/getport` | Show current margin per trade (`port_usdt`) |
+| `/version` | Bot version + mode (YOLO auto-trade vs dry run) |
 
-### 15 Query Endpoints
+> The pre-written Telegram menu (`setMyCommands`) lists the 7 arg-free commands: `balance, positions, health, setport, getport, version, help`.
 
-| Endpoint | Returns |
-|----------|---------|
-| `GET /health` | Health check (no auth) |
-| `GET /api/v1/auth/verify` | API key validation |
-| `GET /api/v1/stats` | Dashboard (PnL, positions, signals, LLM tokens) |
-| `GET /api/v1/trades` | Paginated trade list |
-| `GET /api/v1/trades/{id}` | Full trace (trade + decision + LLM + events + logs) |
-| `GET /api/v1/positions` | Open positions with lifecycle events |
-| `GET /api/v1/llm/recent` | Recent LLM interactions |
-| `GET /api/v1/llm/search?q=` | Semantic search across LLM prompts/responses |
-| `GET /api/v1/logs/{correlation_id}` | Full pipeline trace |
-| `GET /api/v1/config/snapshots` | Config version history |
-| `GET /api/v1/events/recent` | Position lifecycle events |
-| `GET /api/v1/signals/recent` | Recent signals with decisions |
-| `GET /api/v1/search/trades?q=` | Trade search by pair/reason |
-| `GET /api/v1/exchange/balance` | Live Binance balance (proxy) |
+### 3.2 Notifications sent by the bot
 
-### Webhook (Push Notifications)
+`notify_startup` · `notify_decision` · `notify_execution` (`LIMIT order placed` / `Trade entered (repaired)`) · `Skipped` / `Trade Rejected` / `Close signal received` · conditional-saved · position modified · periodic `/health` report (every 6h, includes portfolio/port).
 
-When a trade executes, the orchestrator calls `emit_event()` which POSTs to a configurable URL:
+---
 
-```json
-{
-  "event_type": "TRADE_ENTERED",
-  "correlation_id": "a1b2c3d4e5f6",
-  "data": { "pair": "BTCUSDT", "direction": "LONG", "entry_price": 65000, ... }
-}
-```
+## 4. Deployment
 
-Headers: `X-Signature: <hmac-sha256>` (if secret configured)
+- **Platform:** Fly.io (Singapore). `main.py` runs as the single process; the listener blocks on `run_until_disconnected()`, so the HealthReporter and API tasks are started *before* it.
+- **Volumes:** SQLite lives on a persistent volume (`/data` in `FLY_MODE`); local dev uses the repo root.
+- **Config:** `config.yaml` (`exchange.active`, `risk.port_usdt`, `risk.max_leverage`, `risk.max_leverage_increase_pct`, `agent.auto_trade`, `monitoring.health_report_hours`, `api.*`).
+- **Secrets:** set via Fly secrets / `.env` (never committed — `.env` is gitignored and was scrubbed from git history).
+- **No schema migrations** are required for the reliability pass (tables already had `status DEFAULT 'PENDING'` and `client_order_id UNIQUE`); a rolling `fly deploy` is safe.
+- **Post-deploy check:** Telegram should show `LIMIT order placed`, `Trade entered (repaired)`, or `VALIDATION_SKIP` — never an unvalidated fill.
