@@ -312,7 +312,27 @@ class OrderService:
             )
 
             response, _, _, _ = self.agent._call_llm(prompt)
-            data = json.loads(response.strip().strip("`").strip())
+            resp_text = (response or "").strip().strip("`").strip()
+            if not resp_text:
+                # Reasoning model returned empty content — cannot parse.
+                # Treat as non-fixable; leave the trade (no retry per policy).
+                log.warning("LLM fallback: empty LLM response — cannot repair order")
+                return None
+
+            try:
+                data = json.loads(resp_text)
+            except json.JSONDecodeError:
+                # Retry once with a stricter "JSON only" prompt before giving up.
+                log.warning("LLM fallback: first response not valid JSON — retrying")
+                try:
+                    response2, _, _, _ = self.agent._call_llm(
+                        prompt + "\n\nReturn ONLY the JSON object, no prose, no markdown."
+                    )
+                    resp_text2 = (response2 or "").strip().strip("`").strip()
+                    data = json.loads(resp_text2)
+                except (json.JSONDecodeError, Exception) as e:
+                    log.warning("LLM fallback: retry also failed to parse (%s) — giving up", e)
+                    return None
 
             if data.get("action") != "RETRY":
                 log.info("LLM fallback: ABORT — %s", data.get("reason", "no reason"))

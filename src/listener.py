@@ -13,6 +13,7 @@ from telethon.sessions import StringSession
 
 from src.exchange.base import Exchange
 from src.config.loader import get_session_dir
+from src.health.reporter import build_health_report
 from src.orchestrator import TradeOrchestrator
 
 log = logging.getLogger("listener")
@@ -90,11 +91,14 @@ class SignalListener:
             msg = event.message
             text = msg.text or msg.message or ""
             log.info("New message #%s | %d chars", msg.id, len(text))
+            reply_ctx = await self._resolve_reply_context(msg)
             await self.orchestrator.handle_signal(
                 message_id=msg.id,
                 channel=self.channel,
                 raw_text=text,
                 has_media=msg.media is not None,
+                reply_to_message_id=reply_ctx.get("reply_to_message_id"),
+                reply_pair=reply_ctx.get("reply_pair"),
             )
 
         @self.client.on(events.MessageEdited(chats=self.channel))
@@ -102,11 +106,14 @@ class SignalListener:
             msg = event.message
             text = msg.text or msg.message or ""
             log.info("Edited message #%s", msg.id)
+            reply_ctx = await self._resolve_reply_context(msg)
             await self.orchestrator.handle_signal(
                 message_id=msg.id,
                 channel=self.channel,
                 raw_text=text,
                 has_media=msg.media is not None,
+                reply_to_message_id=reply_ctx.get("reply_to_message_id"),
+                reply_pair=reply_ctx.get("reply_pair"),
             )
 
         log.info("Listening for new messages... (Ctrl+C to stop)")
@@ -134,8 +141,37 @@ class SignalListener:
                 await self._handle_pending(event)
             elif cmd.startswith("/cancel"):
                 await self._handle_cancel(event)
+            elif cmd == "/health":
+                await self._handle_health(event)
 
         await self.client.run_until_disconnected()
+
+    async def _resolve_reply_context(self, msg) -> dict:
+        """Extract reply context so management commands (e.g. 'sl to entry')
+
+        can be attributed to the trade they reply to.
+
+        Returns ``{"reply_to_message_id": int|None, "reply_pair": str|None}``.
+        The reply_pair is resolved by re-parsing the replied-to message text
+        through the same SymbolRegistry pair resolver used for signals.
+        """
+        reply_to = getattr(msg, "reply_to", None)
+        if not reply_to:
+            return {"reply_to_message_id": None, "reply_pair": None}
+
+        reply_id = getattr(reply_to, "reply_to_msg_id", None)
+        reply_pair = None
+        try:
+            original = await msg.get_reply_message()
+            if original:
+                orig_text = original.text or original.message or ""
+                if orig_text:
+                    from src.agent.parser import _resolve_pair
+                    reply_pair = _resolve_pair(orig_text)
+        except Exception as e:  # noqa: BLE001
+            log.debug("Failed to resolve reply context: %s", e)
+
+        return {"reply_to_message_id": reply_id, "reply_pair": reply_pair}
 
     async def stop(self):
         """Stop listening."""
@@ -275,6 +311,7 @@ class SignalListener:
             "  /pending    — List pending conditional signals\n"
             "  /cancel <id> — Cancel a pending signal\n"
             "  /cancel all — Cancel all pending signals\n"
+            "  /health     — Run full system health check\n"
             "  /setport N  — Set margin per trade to $N\n"
             "  /getport    — Show current margin per trade\n"
             "  /version    — Show bot version\n"
@@ -283,6 +320,15 @@ class SignalListener:
             "The bot automatically processes signals from @YOUR_SIGNAL_CHANNEL and\n"
             "executes trades on Binance Futures when conditions are met."
         )
+
+    async def _handle_health(self, event):
+        """Handle /health — run a full system health check across all subsystems."""
+        log.info("Command: /health")
+        lines, n_ok, n_fail = await build_health_report(self)
+        overall = "✅ ALL SYSTEMS OK" if n_fail == 0 else f"⚠️ {n_fail} ISSUE(S)"
+        header = f"🩺 **Health Check** — {overall}"
+        # build_health_report already prepends the header line; just reply
+        await event.reply("\n".join(lines))
 
     async def _handle_version(self, event):
         """Handle /version — show bot version."""

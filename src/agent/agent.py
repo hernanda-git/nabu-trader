@@ -279,6 +279,52 @@ class AgentBrain:
 
         return decision
 
+    async def ping(self) -> dict:
+        """Lightweight health check — one minimal chat completion call.
+
+        Returns a dict with ``status`` (ok|error), the model/url used, any
+        error text, and round-trip latency in ms. Does not count against
+        trade logic (no retries, minimal tokens).
+        """
+        import time
+
+        result: dict = {
+            "status": "unknown",
+            "model": self.model,
+            "url": self.api_url,
+            "error": None,
+            "latency_ms": 0,
+        }
+        if not self.api_key:
+            result["status"] = "error"
+            result["error"] = "API key not configured"
+            return result
+
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {self.api_key}",
+        }
+        payload = {
+            "model": self.model,
+            "messages": [{"role": "user", "content": "ping"}],
+            "max_tokens": 5,
+        }
+        t0 = time.monotonic()
+        try:
+            async with httpx.AsyncClient(timeout=self.timeout) as client:
+                resp = await client.post(self.api_url, json=payload, headers=headers)
+            result["latency_ms"] = int((time.monotonic() - t0) * 1000)
+            if resp.status_code == 200:
+                result["status"] = "ok"
+            else:
+                result["status"] = "error"
+                result["error"] = f"HTTP {resp.status_code}: {resp.text[:200]}"
+        except Exception as e:  # noqa: BLE001 — health must never raise
+            result["status"] = "error"
+            result["error"] = f"{type(e).__name__}: {e}"
+            result["latency_ms"] = int((time.monotonic() - t0) * 1000)
+        return result
+
     def _call_llm(self, prompt: str) -> tuple[str, int, int, int]:
         """Call the LLM via OpenAI-compatible chat completions endpoint.
 
@@ -297,7 +343,9 @@ class AgentBrain:
                 {"role": "user", "content": prompt},
             ],
             "temperature": 0.1,
-            "max_tokens": 2048,
+            # deepseek-v4-flash is a reasoning model: low max_tokens yields an
+            # empty `content` and -1111-style silent failures. Keep it high.
+            "max_tokens": 4096,
         }
 
         log.info("Calling LLM: %s with model %s", self.api_url, self.model)

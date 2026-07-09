@@ -2,7 +2,24 @@
 
 All notable changes to this project are documented here.
 
-## [v54] — 2026-07-07
+- **Failure alert now delivers**: the "Failed to place order" alert was wrapped in nested backticks, which Telegram rejected with *"can't parse entities"* — so failed-trade alerts were silently **undelivered** in prod. Now uses a fenced code block for the raw error. Added markdown-safety tests.
+
+- **Telegram alerts now render reliably**: added `_md_escape()` and applied it to all dynamic content (signal preview, decision reason, etc.) so raw signal/agent text with `*`, `_`, `` ` `` no longer breaks Markdown parsing. This eliminates the pre-existing "can't parse entities" delivery failures across *all* notifications, not just the failure alert.
+
+- **Guaranteed alert delivery**: `send_message` now retries as **plain text** if Telegram rejects the Markdown ("can't parse entities"). No notification is ever silently dropped again — this was the root cause of failed-trade alerts not reaching you.
+
+## [v59] — 2026-07-09
+
+### Fixed
+- **Root-cause `-1111` precision rejection (the lost UAIUSDT trade)**: outgoing LIMIT/STOP/TP **prices** are now rounded to the pair's `PRICE_FILTER.tickSize` (and clamped to `minPrice`/`maxPrice`), not just quantity. `_place_order` now calls a new `_round_price()`. Previously only `quantity` was rounded, so a price with too many decimals (e.g. `0.413` on a 4-decimal pair) was rejected by Binance with `-1111` and the trade was silently dropped. Deterministic tests prove the wire values now align to exchange precision.
+- **LLM fallback crash on empty reasoning-model response**: `_llm_fallback` no longer calls `json.loads("")` when the model returns empty `content` (deepseek-v4-flash occasionally does). It now warns and returns `None` (trade left, per policy — no retry), instead of throwing `Expecting value` and crashing the safety net. Added a one-shot JSON-only retry on a malformed-but-non-empty response.
+- **Reasoning-model `max_tokens` raised** `2048 → 4096` in `agent._call_llm` to avoid truncated/empty completions from deepseek-v4-flash.
+- **Failure notification copy**: "❌ Order failed" → "❌ Failed to place order" (still no retry; signal is left after normal pipeline + LLM fallback both fail, since the price may no longer be relevant).
+
+### Added
+- **Gateway proxy-awareness** (default OFF): `exchange.binance.proxy` config lets the listener route ALL Binance REST calls through a signed relay (the `binance-gateway` Fly app) so the Binance key lives only on the gateway. Prod stays direct (key in its own Fly secrets). `config.yaml` documents the block.
+
+
 
 ### Added
 - **Conditional SL/TP orders**: `stop_loss()` now places a `STOP` (stop-limit) order → Binance **Conditional tab**, fills as LIMIT (no slippage). New `take_profit()` method places `TAKE_PROFIT` (tp-limit) → Conditional tab, LIMIT fill. Both appear in the Conditional tab, exactly as the user requested.

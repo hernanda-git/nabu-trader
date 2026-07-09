@@ -193,3 +193,60 @@ def extract_leverage(text: str) -> int | None:
             except ValueError:
                 continue
     return None
+
+
+# ─── Management command detection ──────────────────────────────────────────
+# Channel management messages like "sl to entry" / "sl at entry" are replies to
+# a previous signal. They are NOT fresh entries — they are instructions to
+# modify the open position (move its Stop Loss to the entry/breakeven price).
+_MANAGEMENT_PATTERNS = [
+    re.compile(r"\bsl\s+(?:to|at|@)\s+entry\b", re.I),
+    re.compile(r"\bsl\s*=\s*entry\b", re.I),
+    re.compile(r"\bstop\s*(?:loss)?\s+(?:to|at)\s+entry\b", re.I),
+    re.compile(r"\bbreakeven\b", re.I),
+    re.compile(r"\bbe\b", re.I),  # "be" shorthand often used as "move to breakeven"
+]
+
+
+def is_management_command(raw_text: str) -> bool:
+    """Return True if the message looks like a position-management command."""
+    if not raw_text:
+        return False
+    return any(p.search(raw_text) for p in _MANAGEMENT_PATTERNS)
+
+
+def parse_management_command(message_id: int, channel: str, raw_text: str,
+                             reply_pair: str | None = None) -> TradeSignal | None:
+    """Detect a 'sl to entry' style management command.
+
+    Returns a TradeSignal with direction=None and a special ``sl_price`` marker
+    meaning "move SL to the position's entry price" — or None if this is not a
+    management command. The pair is resolved from the reply context first, then
+    from the message's own text.
+
+    The resulting decision is always a MODIFY (handled by the orchestrator's
+    management path, NOT the LLM), with ``sl_price`` set to the sentinel
+    ``_SL_TO_ENTRY`` so the orchestrator substitutes the live entry price.
+    """
+    if not is_management_command(raw_text):
+        return None
+
+    # Pair: prefer the replied-to message's pair, then try own text.
+    pair = reply_pair or _resolve_pair(raw_text)
+    if not pair:
+        # No pair resolvable — let the orchestrator report it clearly.
+        return TradeSignal(
+            message_id=message_id, channel=channel, raw_text=raw_text,
+            pair=None, direction=None,
+        )
+
+    return TradeSignal(
+        message_id=message_id, channel=channel, raw_text=raw_text,
+        pair=pair, direction=None,
+        # Sentinel: SL should be moved to the open position's entry price.
+        sl_price=_SL_TO_ENTRY,
+    )
+
+
+# Sentinel sl_price meaning "set SL to the position's entry price (breakeven)".
+_SL_TO_ENTRY = -1.0

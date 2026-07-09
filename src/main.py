@@ -43,6 +43,7 @@ from src.execution.order_service import OrderService
 from src.execution.position_manager import PositionManager
 from src.listener import SignalListener
 from src.notifier.telegram import TelegramNotifier
+from src.health.reporter import HealthReporter
 from src.orchestrator import TradeOrchestrator
 from src.state.database import get_connection
 from src.state.repositories import (
@@ -132,6 +133,7 @@ async def main():
                 testnet=(exchange_mode == "binance_testnet"),
                 futures=binance_cfg.get("futures", False),
                 recv_window=binance_cfg.get("recv_window", 5000),
+                proxy=binance_cfg.get("proxy"),
             )
         mode_label = "BINANCE"
         if exchange_mode == "binance_testnet":
@@ -156,8 +158,15 @@ async def main():
     # ── Notifier ─────────────────────────────────────────────────────────
     notifier = TelegramNotifier(bot_token=bot_token, chat_id=notify_chat_id)
 
-    # Determine version: Fly.io release version, git commit hash, or package version
-    app_version = os.environ.get("FLY_RELEASE_VERSION") or os.environ.get("SOURCE_VERSION", "")
+    # Determine version: explicit RELEASE_VERSION (set by deploy bump), Fly.io
+    # release version, git commit hash, or the package version.py fallback.
+    # NOTE: src/version.py is auto-incremented on every deploy by
+    # scripts/bump_version.py, so it always reflects the real build.
+    app_version = (
+        os.environ.get("RELEASE_VERSION")
+        or os.environ.get("FLY_RELEASE_VERSION")
+        or os.environ.get("SOURCE_VERSION", "")
+    )
     if not app_version:
         try:
             import subprocess
@@ -240,19 +249,34 @@ async def main():
     listener = SignalListener(orchestrator, cfg, exchange=exchange,
                               version=version_str or None, notifier=notifier)
 
+    # ── Health Reporter (periodic /health post every 6h) ───────────────────
+    health_interval = cfg.get("monitoring", {}).get("health_report_hours", 6)
+    health_reporter = HealthReporter(listener, interval_hours=float(health_interval))
+
     # ── Start ────────────────────────────────────────────────────────────
+    # NOTE: listener.start() blocks in run_until_disconnected() for the life
+    # of the process, so the health reporter must be launched as a concurrent
+    # background task *before* it — otherwise it would never start.
+    health_task: asyncio.Task | None = None
     try:
         await position_manager.start()
+        health_task = asyncio.create_task(health_reporter.start())
         await listener.start()
     except KeyboardInterrupt:
         log.info("Shutting down...")
     finally:
+        await health_reporter.stop()
         await listener.stop()
         await position_manager.stop()
         if api_task:
             api_task.cancel()
             try:
                 await api_task
+            except (asyncio.CancelledError, Exception):
+                pass
+        if health_task and not health_task.done():
+            try:
+                await health_task
             except (asyncio.CancelledError, Exception):
                 pass
         await symbol_registry.stop()

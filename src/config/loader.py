@@ -75,6 +75,24 @@ def load_config(path: str | Path | None = None) -> dict[str, Any]:
     api_secret_env = binance_cfg.get("api_secret_env", "BINANCE_API_SECRET")
     binance_cfg["api_key"] = env.get(api_key_env, os.environ.get(api_key_env, ""))
     binance_cfg["api_secret"] = env.get(api_secret_env, os.environ.get(api_secret_env, ""))
+
+    # ── Gateway proxy (optional) ──────────────────────────────────────────
+    # When `exchange.binance.proxy.enabled` is true, the listener routes ALL
+    # Binance REST calls through a signed relay (e.g. the binance-gateway Fly
+    # app) and does NOT need the Binance API key locally. The key lives only
+    # on the gateway. Default: OFF (direct calls, key on the listener).
+    proxy_cfg = binance_cfg.get("proxy", {}) or {}
+    proxy_enabled = bool(proxy_cfg.get("enabled", False))
+    proxy_cfg["enabled"] = proxy_enabled
+    if proxy_enabled:
+        proxy_cfg.setdefault(
+            "url", os.environ.get("GATEWAY_URL", proxy_cfg.get("url", ""))
+        )
+        proxy_cfg.setdefault(
+            "hmac_secret",
+            os.environ.get("GATEWAY_HMAC_SECRET", proxy_cfg.get("hmac_secret", "")),
+        )
+    binance_cfg["proxy"] = proxy_cfg
     cfg.setdefault("exchange", {})["binance"] = binance_cfg
 
     # Overlay LLM API key from .env

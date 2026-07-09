@@ -24,6 +24,15 @@ risk:
   margin_usage_pct: 80         # use up to 80% of balance as margin per trade
   margin_type: ISOLATED        # ISOLATED or CROSS
   max_portfolio_leverage: 10   # total portfolio notional / balance cap (prevents over-concentration)
+  # ── Gateway proxy (OPTIONAL, default OFF) ──────────────────────────────
+  # When enabled, ALL Binance REST calls route through a signed gateway relay
+  # (e.g. the binance-gateway Fly app). The listener then does NOT need the
+  # Binance API key — only GATEWAY_URL + GATEWAY_HMAC_SECRET. Leave off to keep
+  # calling Binance directly from this app (key stays in Fly secrets here).
+  # proxy:
+  #   enabled: false
+  #   url: "https://binance-gateway.fly.dev"   # overridden by GATEWAY_URL env
+  #   hmac_secret: ""                            # overridden by GATEWAY_HMAC_SECRET env
 
 agent:
   confidence_threshold: 0.0
@@ -39,6 +48,7 @@ agent:
 monitoring:
   check_interval_seconds: 10
   health_check_port: 9090
+  health_report_hours: 6      # periodic /health summary posted to Telegram every N hours
 
 # ─── API Bridge ──────────────────────────────────────────────────
 # Secure HTTP API for Hermes ↔ Fly.io interaction.

@@ -20,7 +20,7 @@ from typing import Any
 
 from src.agent.agent import AgentBrain
 from src.agent.gate import SafetyGate1, SafetyGate2
-from src.agent.parser import parse_signal
+from src.agent.parser import parse_signal, parse_management_command, _SL_TO_ENTRY
 from src.agent.ta_context import fetch_ta_context
 from src.domain.models import (
     ConfigSnapshot,
@@ -169,7 +169,9 @@ class TradeOrchestrator:
         return snap_id
 
     async def handle_signal(self, message_id: int, channel: str,
-                            raw_text: str, has_media: bool = False) -> dict[str, Any]:
+                            raw_text: str, has_media: bool = False,
+                            reply_to_message_id: int | None = None,
+                            reply_pair: str | None = None) -> dict[str, Any]:
         """Process a single signal through the entire pipeline.
 
         Returns a summary dict of what happened.
@@ -198,6 +200,15 @@ class TradeOrchestrator:
                 result["action"] = "duplicate"
                 result["skipped"] = True
                 return result
+
+            # ── Step 0b: Management command (e.g. "sl to entry") ──────────────
+            # These are replies to a previous signal. They do NOT go through the
+            # LLM — they modify the open position directly (move SL to entry).
+            mgmt = parse_management_command(message_id, channel, raw_text, reply_pair)
+            if mgmt is not None:
+                return await self._handle_management(
+                    correlation_id, message_id, raw_text, mgmt, result
+                )
 
             # ── Step 1: Regex Pre-Parse ────────────────────────────────────
             signal = parse_signal(message_id, channel, raw_text, has_media)
@@ -577,6 +588,124 @@ class TradeOrchestrator:
             result["action"] = "error"
             result["error"] = str(e)
 
+        return result
+
+    # ── Management command handling ────────────────────────────────────────
+
+    async def _handle_management(self, correlation_id: str, message_id: int,
+                                 raw_text: str, mgmt: "TradeSignal",
+                                 result: dict) -> dict:
+        """Handle a position-management command (e.g. 'sl to entry').
+
+        Resolves the target open position, moves its Stop Loss to the entry
+        price (breakeven), and reports back. No LLM call is made.
+        """
+        log.info("Management command: pair=%s", mgmt.pair)
+        self._log(correlation_id, "INFO", "orchestrator",
+                  f"Management command: {raw_text[:120]}", {"pair": mgmt.pair})
+
+        # Resolve target position.
+        if mgmt.pair:
+            # Normalize to the symbol used by the position repo (always *USDT).
+            sym = mgmt.pair.replace("#", "").replace("$", "").upper()
+            if not sym.endswith("USDT"):
+                sym += "USDT"
+            position = self.position_repo.get_open_by_pair(sym)
+        else:
+            position = None
+
+        if position is None:
+            # Try the single open position as a fallback when pair is unknown.
+            opens = self.position_repo.get_open_positions()
+            if len(opens) == 1:
+                position = opens[0]
+            elif not mgmt.pair:
+                result["action"] = "skipped"
+                result["skipped"] = True
+                result["reason"] = "Could not determine which position 'sl to entry' refers to (no pair in reply/text and 0 or >1 open positions)"
+                self.signal_repo.mark_processed(message_id, raw_text)
+                await self.notifier.send_message(
+                    f"⚠️ **sl to entry** — could not determine the position.\n"
+                    f"Reply to the specific signal, or include the pair (e.g. `#BTC sl to entry`)."
+                )
+                return result
+            else:
+                result["action"] = "skipped"
+                result["skipped"] = True
+                result["reason"] = f"No open position for {mgmt.pair}"
+                self.signal_repo.mark_processed(message_id, raw_text)
+                await self.notifier.send_message(
+                    f"⚠️ **sl to entry** — no open position found for `{mgmt.pair}`."
+                )
+                return result
+
+        # Build a MODIFY decision: SL → position entry price (breakeven).
+        # mgmt.sl_price is the sentinel _SL_TO_ENTRY (-1.0); substitute entry.
+        if mgmt.sl_price == _SL_TO_ENTRY:
+            new_sl = position.entry_price
+        else:
+            new_sl = mgmt.sl_price
+
+        from src.domain.models import TradeDecision
+        decision = TradeDecision(
+            action="MODIFY",
+            pair=position.pair,
+            direction=position.direction,
+            sl_price=new_sl,
+            tp_prices=position.tp_prices or [],
+            reason="sl to entry — move stop loss to breakeven (entry price)",
+        )
+
+        # MODIFY still runs through Gate2 so size/portfolio limits stay valid
+        # (Gate2 is a no-op on size for MODIFY but validates the SL side).
+        bal_for_gate = None
+        try:
+            balance_info = await self.exchange.get_balance()
+            bal_for_gate = balance_info.free_usdt
+        except Exception:
+            log.warning("Balance fetch failed in management path; proceeding")
+        allowed, reason, decision = self.gate2.check(decision, bal_for_gate)
+        if not allowed:
+            result["action"] = "rejected"
+            result["reason"] = reason
+            self.signal_repo.mark_processed(message_id, raw_text)
+            await self.notifier.send_message(
+                f"🚫 **sl to entry rejected** — {position.pair}\nReason: {reason}"
+            )
+            return result
+
+        # Execute the modification via the existing MODIFY path.
+        signal_db_id = self.signal_repo.save(mgmt)
+        exec_result = await self.order_service.execute(
+            signal_db_id, decision
+        )
+
+        self.signal_repo.mark_processed(message_id, raw_text)
+        result["action"] = "modified"
+        result["reason"] = decision.reason
+
+        if exec_result.success:
+            old_sl = position.sl_price if position.sl_price is not None else "—"
+            await self.notifier.send_message(
+                f"🔒 **SL → entry (breakeven)** — `{position.pair}`\n"
+                f"   ├ Direction: `{position.direction}`\n"
+                f"   ├ New SL: `{new_sl}` (was `{old_sl}`)\n"
+                f"   └ Entry: `{position.entry_price}`"
+            )
+            self._log(correlation_id, "INFO", "orchestrator",
+                      f"SL moved to entry for {position.pair}: {position.sl_price} → {new_sl}")
+        else:
+            await self.notifier.send_message(
+                f"❌ **sl to entry failed** — {position.pair}\n"
+                f"`{exec_result.error or 'unknown error'}`"
+            )
+            result["action"] = "failed"
+            result["error"] = exec_result.error
+
+        if self.event_bus:
+            self.event_bus.emit(Event("PositionModified", {
+                "pair": position.pair, "sl": new_sl, "reason": decision.reason,
+            }))
         return result
 
     # ── Trigger execution ──────────────────────────────────────────────────

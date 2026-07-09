@@ -26,6 +26,19 @@ from src.exchange.base import BalanceInfo, Exchange, OrderInfo, PositionInfo
 log = logging.getLogger("exchange.binance")
 
 
+# ─── Gateway relay client (used only when proxy mode is enabled) ──────────────
+# Mirrors src.signing on the gateway: signs (method, path, query, body) with the
+# shared HMAC secret so the gateway can verify + replay-protect. Sends the
+# Binance request on behalf of the listener — the listener never sees the key.
+def _gw_sign(secret: str, method: str, path: str,
+             query: dict | None, body: bytes | None):
+    ts = int(time.time())
+    q = urlencode(query or {}, doseq=True)
+    canon = f"{method.upper()}\n{path}\n{q}\n{(body or b'').decode('utf-8', 'replace')}"
+    sig = hmac.new(secret.encode("utf-8"), canon.encode("utf-8"), hashlib.sha256).hexdigest()
+    return {"X-Gateway-Sig": sig, "X-Gateway-Ts": str(ts)}
+
+
 class BinanceErrorCategory(Enum):
     AUTH = "auth"        # 401/403 — bad key, no permission
     RATE_LIMIT = "rate"  # 429 — backoff needed
@@ -83,7 +96,7 @@ def _format_order_error(symbol: str, side: str, order_type: str,
     notional = quantity * ref_price if ref_price > 0 else 0
 
     parts = [
-        f"❌ **Order failed — {symbol}**",
+        f"❌ **Failed to place order — {symbol}**",
         f"   ├ Side: `{side}` | Type: `{order_type}`",
         f"   ├ Qty: `{quantity}`",
     ]
@@ -221,7 +234,7 @@ class BinanceExchange(Exchange):
 
     def __init__(self, api_key: str, api_secret: str, testnet: bool = True,
                  futures: bool = False, leverage: int = 1,
-                 recv_window: int = 5000):
+                 recv_window: int = 5000, proxy: dict | None = None):
         self.api_key = api_key
         self.api_secret = api_secret
         self.testnet = testnet
@@ -229,10 +242,24 @@ class BinanceExchange(Exchange):
         self.leverage = max(1, leverage)  # fallback default
         self.recv_window = min(int(recv_window), 60000)
 
+        # Proxy mode: route Binance calls through a signed gateway relay.
+        # When enabled, the Binance api_key/secret are NOT required locally.
+        self.proxy = proxy or {}
+        self.proxy_enabled = bool(self.proxy.get("enabled"))
+        self.proxy_url = (self.proxy.get("url") or "").rstrip("/")
+        self.proxy_secret = self.proxy.get("hmac_secret", "")
+        if self.proxy_enabled:
+            if not self.proxy_url or not self.proxy_secret:
+                log.warning("Proxy enabled but GATEWAY_URL/HMAC_SECRET missing — "
+                            "falling back to direct Binance calls")
+                self.proxy_enabled = False
+            else:
+                log.info("Binance calls routed through gateway relay: %s", self.proxy_url)
+
         urls = FUTURES_URLS if futures else SPOT_URLS
         base_url = urls["testnet"] if testnet else urls["mainnet"]
         self._base = base_url
-        self._client = httpx.AsyncClient(base_url=base_url, timeout=10)
+        self._client = httpx.AsyncClient(base_url=base_url, timeout=10) if not self.proxy_enabled else None
         # Cache symbol rules: stepSize/minQty/maxQty/valid
         self._filters: dict[str, dict] = {}
         self._invalid_symbols: dict[str, datetime] = {}
@@ -265,14 +292,31 @@ class BinanceExchange(Exchange):
 
     async def _signed_request(self, method: str, path: str,
                         params: dict | None = None) -> dict:
-        """Send a signed request to Binance API."""
+        """Send a signed request to Binance API.
+
+        In proxy mode, the request is forwarded (already signed with the local
+        Binance key) to the gateway relay, which swaps in its own key. The local
+        key is still used to sign `params` so behaviour is identical.
+        """
         params = params or {}
         params["timestamp"] = int(time.time() * 1000)
         params["recvWindow"] = self.recv_window
         params["signature"] = self._sign(params)
 
-        resp = await self._client.request(method, path, params=params,
-                                    headers=self._headers())
+        # ── Proxy mode: forward through the gateway relay ────────────────
+        if self.proxy_enabled:
+            body = json.dumps(params).encode("utf-8")
+            headers = _gw_sign(self.proxy_secret, method, path, params, body)
+            headers["Content-Type"] = "application/json"
+            async with httpx.AsyncClient(timeout=15) as client:
+                resp = await client.request(
+                    method, f"{self.proxy_url}{path}",
+                    params=params, headers=headers,
+                )
+        else:
+            resp = await self._client.request(method, path, params=params,
+                                        headers=self._headers())
+
         if resp.status_code != 200:
             category = _categorize_error(resp.status_code, resp.text, None)
             log.error("Binance API error %s [%s]: %s", resp.status_code, category.value, resp.text)
@@ -291,7 +335,20 @@ class BinanceExchange(Exchange):
 
     async def _public_request(self, method: str, path: str,
                         params: dict | None = None) -> dict:
-        """Send a public request (no auth required)."""
+        """Send a public request (no auth required).
+
+        In proxy mode, public market-data calls are also relayed so the listener
+        never talks to Binance directly.
+        """
+        if self.proxy_enabled:
+            headers = _gw_sign(self.proxy_secret, method, path, params, None)
+            async with httpx.AsyncClient(timeout=15) as client:
+                resp = await client.request(
+                    method, f"{self.proxy_url}{path}",
+                    params=params, headers=headers,
+                )
+            resp.raise_for_status()
+            return resp.json()
         resp = await self._client.request(method, path, params=params)
         resp.raise_for_status()
         return resp.json()
@@ -448,7 +505,11 @@ class BinanceExchange(Exchange):
             out = {"_updated": now, "valid": True}
             for f in s.get("filters", []):
                 ft = f.get("filterType")
-                if ft == "LOT_SIZE":
+                if ft == "PRICE_FILTER":
+                    out["tickSize"] = float(f.get("tickSize", 0))
+                    out["minPrice"] = float(f.get("minPrice", 0))
+                    out["maxPrice"] = float(f.get("maxPrice", 0))
+                elif ft == "LOT_SIZE":
                     out["minQty"] = float(f.get("minQty", 0))
                     out["maxQty"] = float(f.get("maxQty", 0))
                     out["stepSize"] = float(f.get("stepSize", 1))
@@ -506,6 +567,43 @@ class BinanceExchange(Exchange):
         prec = max(0, -int(round(log10(step))) if step < 1 else 0)
         rounded = float(f"{rounded:.{prec}f}")
         return rounded, rules
+
+    async def _round_price(self, symbol: str, price: float) -> tuple[float, dict | None]:
+        """Round price to exchange tick-size precision for symbol.
+
+        Uses PRICE_FILTER.tickSize from the cached exchangeInfo filters.
+        Falls back to 6-decimal rounding if filters are unavailable.
+        Returns (rounded_price, rules_or_None).
+
+        This is the root-cause guard against Binance error -1111
+        ("Precision is over the maximum defined for this asset") — outgoing
+        LIMIT/STOP/TP prices must align to the pair's tick size.
+        """
+        if price is None or price <= 0:
+            return price, None
+
+        rules = self._filters.get(symbol)
+        if not rules:
+            filters = await self._load_futures_filters(symbol)
+            if filters:
+                rules = filters
+
+        if rules and rules.get("tickSize"):
+            step = float(rules["tickSize"])
+            rounded = round(price / step) * step
+            if rounded <= 0 and step > 0:
+                rounded = step
+            # Clamp to exchange price bounds when known
+            if rules.get("minPrice") is not None and rounded < rules["minPrice"]:
+                rounded = rules["minPrice"]
+            if rules.get("maxPrice") is not None and rounded > rules["maxPrice"]:
+                rounded = rules["maxPrice"]
+            prec = max(0, -int(round(log10(step))) if step < 1 else 0)
+            rounded = float(f"{rounded:.{prec}f}")
+            return rounded, rules
+
+        # Fallback: 6 decimals (safe for most futures pairs)
+        return float(f"{price:.6f}"), None
 
     async def _preflight_symbol(self, symbol: str) -> bool:
         """Ensure a futures symbol can be traded; loads filters if needed."""
@@ -691,6 +789,9 @@ class BinanceExchange(Exchange):
         qty = quantity
         if self.futures:
             qty, rules = await self._round_quantity(symbol_key, qty)
+            # Round price to tick-size precision (prevents -1111 precision rejections)
+            if price is not None:
+                price, _ = await self._round_price(symbol_key, price)
             # For 1000x contracts where LOT_SIZE.stepSize = 1,
             # _round_quantity already handles integer rounding.
             # For very low-price coins with cache miss, the fallback
