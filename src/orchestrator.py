@@ -490,10 +490,10 @@ class TradeOrchestrator:
             if exec_result.success:
                 result["action"] = "entered"
 
-                # Notify user — include fallback info if LLM-corrected
-                if exec_result.status == "FILLED_FALLBACK" and exec_result.error:
+                # Notify user — include repair info if deterministically repaired
+                if exec_result.error and exec_result.error.startswith("✅ Repaired") and exec_result.status == "FILLED":
                     await self.notifier.send_message(
-                        f"✅ **Trade entered (LLM fallback)** — {exec_result.symbol}\n"
+                        f"✅ **Trade entered (repaired)** — {exec_result.symbol}\n"
                         f"   ├ Qty: `{exec_result.filled_quantity:,.0f}`\n"
                         f"   ├ Entry: `{exec_result.avg_price:.8f}`\n"
                         f"   ├ SL: `{decision.sl_price or '—'}`\n"
@@ -805,9 +805,9 @@ class TradeOrchestrator:
             if exec_result.success:
                 result["action"] = "entered"
 
-                if exec_result.status == "FILLED_FALLBACK" and exec_result.error:
+                if exec_result.error and exec_result.error.startswith("✅ Repaired") and exec_result.status == "FILLED":
                     await self.notifier.send_message(
-                        f"🚀 **Trigger ENTERED (LLM fallback)** — {exec_result.symbol}\n"
+                        f"🚀 **Trigger ENTERED (repaired)** — {exec_result.symbol}\n"
                         f"   ├ Direction: `{decision.direction}`\n"
                         f"   ├ Entry: `{exec_result.avg_price:.8f}`\n"
                         f"   ├ Qty: `{exec_result.filled_quantity:,.0f}`\n"

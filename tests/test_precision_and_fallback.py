@@ -120,11 +120,10 @@ async def test_place_order_rounds_price_and_qty_on_wire():
     assert info.status != "FAILED", f"order wrongly failed: {info.error}"
 
 
-# ─── 3. LLM fallback never throws on empty reasoning-model response ──────────
+# ─── 3. No LLM involved in order repair (deterministic path only) ──────────
 
 class _StubAgent:
-    """Mimics AgentBrain._call_llm. Returns empty content like deepseek-v4-flash
-    sometimes does (reasoning model with too-low max_tokens)."""
+    """Mimics AgentBrain._call_llm. Records whether it is ever invoked."""
     def __init__(self, returns):
         self._returns = list(returns)
         self.calls = 0
@@ -134,26 +133,55 @@ class _StubAgent:
         return text, 10, 5, 100
 
 
-def test_llm_fallback_empty_response_returns_none(monkeypatch):
-    """A blank LLM reply must yield None (trade left), not raise."""
+def test_no_llm_on_rejection(monkeypatch):
+    """A rejected entry must be repaired deterministically — the LLM is
+    NEVER called (the old bypass was removed)."""
     from src.execution.order_service import OrderService
     from src.domain.models import TradeDecision
 
-    # Minimal stubs
+    agent = _StubAgent(returns=[""])  # would be used by the old bypass
+
     class _Ex:
         name = "binance_futures"
-    agent = _StubAgent(returns=[""])  # empty content
-    os_ = OrderService(exchange=_Ex(), config={}, signal_repo=_R(), decision_repo=_R(),
-                       order_repo=_R(), position_repo=_R(), agent=agent)
+        async def _load_futures_filters(self, sym):
+            return {"tickSize": 0.0001, "minPrice": 0.001, "maxPrice": 1000,
+                    "stepSize": 1, "minQty": 1, "minNotional": 5.0}
+        async def _round_price(self, sym, p):
+            return round(p / 0.0001) * 0.0001, {}
+        async def _round_quantity(self, sym, q, price_ref=None):
+            return max(1.0, round(q)), {}
+        async def set_symbol_leverage(self, sym, lev):
+            return None
+        async def take_profit(self, sym, q, p, side):
+            return None
+        async def limit_buy(self, sym, q, p):
+            # The original entry is rejected; the deterministic repair resubmits
+            # with re-derived params and THIS attempt fills successfully.
+            from src.exchange.base import OrderInfo
+            return OrderInfo(order_id="REPAIRED123", symbol=sym, side="BUY", type="LIMIT",
+                             quantity=q, status="FILLED", filled_quantity=q,
+                             avg_price=p, error="")
 
-    dec = TradeDecision(action="ENTER", pair="UAIUSDT", direction="LONG",
-                        order_type="LIMIT", quantity=12.0, entry_price=0.413)
-    # Should not raise — returns None gracefully.
-    result = asyncio.run(
-        os_._llm_fallback("UAIUSDT", "BUY", dec, "precision error", 0.413, 12.0)
-    )
-    assert result is None
-    assert agent.calls >= 1
+    class _Repo:
+        def save(self, *a, **k): return 1
+        def update_status(self, *a, **k): return None
+        def get_open_by_pair(self, *a, **k): return None
+        def get_open_count(self, *a, **k): return 0
+        def create(self, *a, **k): return 1
+
+    cfg = {"risk": {"port_usdt": 1.0, "max_leverage": 50,
+                    "max_leverage_increase_pct": 10, "min_notional_usdt": 5.0}}
+    os_ = OrderService(exchange=_Ex(), config=cfg, signal_repo=_Repo(), decision_repo=_Repo(),
+                       order_repo=_Repo(), position_repo=_Repo(), agent=agent)
+
+    dec = TradeDecision(action="ENTER", pair="APEUSDT", direction="LONG",
+                        order_type="LIMIT", quantity=31, entry_price=0.162,
+                        sl_price=0.158, tp_prices=[0.173], leverage=5)
+    # The rejection path calls _repair_order; the LLM must never be touched.
+    from src.execution.order_service import ExecutionResult
+    result = asyncio.run(os_._repair_order(1, dec, "APEUSDT", "BUY", "-1111 rejected"))
+    assert agent.calls == 0, "LLM was called during repair — bypass not removed"
+    assert isinstance(result, ExecutionResult)
 
 
 # ─── minimal no-op repos ─────────────────────────────────────────────────────

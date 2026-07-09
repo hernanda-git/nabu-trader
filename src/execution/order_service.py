@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import logging
 import uuid
 from typing import Any, TYPE_CHECKING
@@ -10,6 +9,7 @@ from typing import Any, TYPE_CHECKING
 from src.domain.models import ExecutionResult, OrderRequest, TradeSignal, TradeDecision
 from src.exchange.base import Exchange
 from src.exchange.validation import validate_order
+from src.agent.gate import _snap_leverage
 from src.state.repositories import DecisionRepository, OrderRepository, PositionRepository, SignalRepository
 
 if TYPE_CHECKING:
@@ -211,14 +211,13 @@ class OrderService:
         if order.status in ("FAILED", "REJECTED", "EXPIRED"):
             self.order_repo.update_status(order_db_id, order.status, order.order_id)
 
-            # ── LLM Fallback: let the agent analyze the error and retry ──
-            if self.agent:
-                fallback = await self._llm_fallback(
-                    symbol, side, decision, order.error or "Order rejected",
-                    entry_price, quantity,
-                )
-                if fallback and fallback.success:
-                    return fallback
+            # ── Deterministic repair (NO LLM) ──
+            # Re-derive qty/price/leverage from the symbol's filters + Gate2,
+            # validate, and resubmit exactly once. If the repaired order still
+            # cannot pass validation, we SKIP rather than invent parameters.
+            repair = await self._repair_order(decision_id, decision, symbol, side, order.error)
+            if repair is not None:
+                return repair
 
             return ExecutionResult(
                 success=False, status=order.status, error=order.error or "Order rejected",
@@ -309,150 +308,107 @@ class OrderService:
             status="FILLED",
         )
 
-    async def _llm_fallback(self, symbol: str, side: str,
-                            original_decision: TradeDecision,
-                            error_message: str,
-                            attempted_price: float | None,
-                            attempted_qty: float) -> ExecutionResult | None:
-        """Let the LLM analyze a failed order and retry with corrected parameters.
+    async def _repair_order(self, decision_id: int, decision: TradeDecision,
+                            symbol: str, side: str,
+                            error_message: str | None) -> ExecutionResult | None:
+        """Deterministic repair of a rejected entry order — NO LLM.
 
-        Returns ExecutionResult if the retry succeeded, None if the LLM
-        couldn't fix it or the retry also failed.
+        On a FAILED/REJECTED/EXPIRED entry we re-derive the order parameters
+        from the symbol's real exchange filters and the config-driven leverage
+        rules, validate them through the same gate every order passes, and
+        resubmit exactly once. If the repaired parameters still can't pass
+        validation, we return a VALIDATION_SKIP result — we never invent or
+        guess parameters the way the old LLM fallback did.
+
+        Returns an ExecutionResult on a successful repair, or None if repair
+        was not possible (caller then returns the original failure).
         """
-        if not self.agent:
-            return None
-
         try:
-            # Build a focused prompt for the LLM
-            bal_info = ""
-            try:
-                bal = await self.exchange.get_balance()
-                bal_info = f"Free balance: ${bal.free_usdt:.4f} USDT"
-            except Exception:
-                bal_info = "Balance: unavailable"
-
-            prompt = (
-                "You are a Binance Futures order repair agent. An order just FAILED.\n"
-                "Analyze the error and return a CORRECTED set of parameters as JSON.\n\n"
-                f"## Failed Order\n"
-                f"  Symbol: {symbol}\n"
-                f"  Side: {side}\n"
-                f"  Direction: {original_decision.direction}\n"
-                f"  Attempted quantity: {attempted_qty}\n"
-                f"  Attempted price: {attempted_price}\n"
-                f"  Leverage: {original_decision.leverage}\n\n"
-                f"## Error\n{error_message}\n\n"
-                f"## Account\n{bal_info}\n\n"
-                "## Your Task\n"
-                "1. Identify the ROOT CAUSE from the error code/message\n"
-                "2. Compute corrected parameters that WILL pass Binance validation\n"
-                "3. Return ONLY a JSON object:\n"
-                '{"action":"RETRY","quantity":<float>,"price":<float>,"leverage":<int>,'
-                '"reason":"<root cause>","fix":"<what you changed and why>"}\n\n'
-                "Common fixes:\n"
-                "- -4164 (notional too small): increase quantity or leverage\n"
-                "- -1111 (precision): round quantity/price to correct step size\n"
-                "- -2019 (insufficient margin): reduce quantity or leverage\n"
-                "- -4120 (order type blocked): cannot fix, return action=ABORT\n\n"
-                "If you CANNOT fix it, return: {\"action\":\"ABORT\",\"reason\":\"...\"}\n\n"
-                "Output ONLY the JSON object:"
-            )
-
-            response, _, _, _ = self.agent._call_llm(prompt)
-            resp_text = (response or "").strip().strip("`").strip()
-            if not resp_text:
-                # Reasoning model returned empty content — cannot parse.
-                # Treat as non-fixable; leave the trade (no retry per policy).
-                log.warning("LLM fallback: empty LLM response — cannot repair order")
+            filters = await self._get_filters(symbol)
+            if not filters:
+                log.warning("Repair skipped for %s: no filters available", symbol)
                 return None
 
-            try:
-                data = json.loads(resp_text)
-            except json.JSONDecodeError:
-                # Retry once with a stricter "JSON only" prompt before giving up.
-                log.warning("LLM fallback: first response not valid JSON — retrying")
-                try:
-                    response2, _, _, _ = self.agent._call_llm(
-                        prompt + "\n\nReturn ONLY the JSON object, no prose, no markdown."
-                    )
-                    resp_text2 = (response2 or "").strip().strip("`").strip()
-                    data = json.loads(resp_text2)
-                except (json.JSONDecodeError, Exception) as e:
-                    log.warning("LLM fallback: retry also failed to parse (%s) — giving up", e)
-                    return None
+            # Re-round price + quantity to the symbol's real precision.
+            price = decision.entry_price
+            if price:
+                price, _ = await self.exchange._round_price(symbol, price)
+            qty = decision.quantity
+            qty, _ = await self.exchange._round_quantity(symbol, qty, price_ref=price)
 
-            if data.get("action") != "RETRY":
-                log.info("LLM fallback: ABORT — %s", data.get("reason", "no reason"))
-                return None
-
-            new_qty = float(data.get("quantity", 0))
-            new_price = float(data.get("price", 0))
-            new_lev = int(data.get("leverage", original_decision.leverage))
-            reason = data.get("reason", "")
-            fix = data.get("fix", "")
-
-            if new_qty <= 0 or new_price <= 0:
-                log.warning("LLM fallback returned invalid params: qty=%.4f price=%.4f", new_qty, new_price)
-                return None
-
-            log.info("LLM fallback: retry with qty=%.4f price=%.6f lev=%d (fix: %s)",
-                     new_qty, new_price, new_lev, fix)
-
-            # Set new leverage if changed
-            if new_lev != original_decision.leverage:
+            # Recompute leverage deterministically (config-driven, no literals):
+            # enough to meet the exchange minNotional from the configured margin.
+            risk = self.config.get("risk", {})
+            port_usdt = risk.get("port_usdt", 1.0)
+            max_lev = risk.get("max_leverage", 50)
+            increase_pct = risk.get("max_leverage_increase_pct", 10)
+            min_notional = filters.get("minNotional") or risk.get("min_notional_usdt", 1.0)
+            pos_value = qty * (price or 0)
+            raw_lev = (pos_value / port_usdt) if port_usdt > 0 else 1
+            lev_cap = _snap_leverage(raw_lev * (1 + increase_pct / 100.0), max_lev)
+            new_lev = min(_snap_leverage(raw_lev, max_lev), lev_cap, max_lev)
+            if new_lev != decision.leverage:
                 try:
                     await self.exchange.set_symbol_leverage(symbol, new_lev)
-                except Exception:
-                    pass
+                except Exception as e:
+                    log.debug("Repair: set_symbol_leverage failed: %s", e)
 
-            # Retry the order
-            retry_order = await self.exchange.limit_buy(symbol, new_qty, new_price) if side == "BUY" \
-                else await self.exchange.limit_sell(symbol, new_qty, new_price)
+            # Validate before resubmitting — never send an invalid order.
+            val_err = validate_order(symbol, side, price, qty, filters)
+            if val_err:
+                log.warning("Repair for %s still invalid after re-round: %s", symbol, val_err)
+                return ExecutionResult(
+                    success=False, status="VALIDATION_SKIP",
+                    error=f"Repair failed validation: {val_err}",
+                    symbol=symbol, side=side,
+                )
 
-            if retry_order.status == "FILLED":
-                log.info("LLM fallback SUCCESS: %s %s qty=%.4f @ %.6f",
-                         symbol, side, new_qty, new_price)
+            log.info("Repair %s %s: qty=%.6f price=%.8f lev=%d (orig error: %s)",
+                     symbol, side, qty, price or 0, new_lev, error_message)
 
-                # Save position
+            retry = await self.exchange.limit_buy(symbol, qty, price) if side == "BUY" \
+                else await self.exchange.limit_sell(symbol, qty, price)
+
+            if retry.order_id and retry.status != "FILLED":
+                # Resting on the book — record and return PENDING.
+                repair_db_id = self.order_repo.save(
+                    decision_id=decision_id, exchange=self.exchange.name,
+                    symbol=symbol, side=side, order_type="LIMIT",
+                    quantity=qty, price=retry.price, client_order_id=self._generate_client_id(decision_id),
+                )
+                self.order_repo.update_status(repair_db_id, "PENDING", retry.order_id)
+                return ExecutionResult(
+                    success=True, order_id=retry.order_id, symbol=symbol, side=side,
+                    filled_quantity=0, avg_price=price or 0, status="PENDING",
+                    error=f"⏳ Repaired LIMIT resting @ {price} — waiting for price",
+                )
+
+            if retry.status == "FILLED":
                 from src.domain.models import Position
                 pos = Position(
-                    pair=symbol, direction=original_decision.direction,
-                    entry_price=retry_order.avg_price or new_price,
-                    quantity=retry_order.filled_quantity or new_qty,
-                    sl_price=original_decision.sl_price,
-                    tp_prices=original_decision.tp_prices,
-                    entry_order_id=retry_order.order_id,
+                    pair=symbol, direction=decision.direction,
+                    entry_price=retry.avg_price or price or 0,
+                    quantity=retry.filled_quantity or qty,
+                    sl_price=decision.sl_price, tp_prices=decision.tp_prices,
+                    entry_order_id=retry.order_id,
                 )
                 self.position_repo.create(pos)
-
-                # Place TP orders
-                for tp_price in original_decision.tp_prices[:3]:
-                    tp_side = "SELL" if original_decision.direction == "LONG" else "BUY"
-                    await self.exchange.take_profit(symbol, new_qty, tp_price, tp_side)
-
+                for tp_price in decision.tp_prices[:3]:
+                    tp_side = "SELL" if decision.direction == "LONG" else "BUY"
+                    await self.exchange.take_profit(symbol, qty, tp_price, tp_side)
                 return ExecutionResult(
-                    success=True,
-                    order_id=retry_order.order_id,
-                    symbol=symbol,
-                    side=side,
-                    filled_quantity=retry_order.filled_quantity or new_qty,
-                    avg_price=retry_order.avg_price or new_price,
-                    status="FILLED_FALLBACK",
-                    error=(
-                        f"⚠️ **Fallback trade — LLM-corrected**\n"
-                        f"   ├ Original error: {error_message}\n"
-                        f"   ├ Root cause: {reason}\n"
-                        f"   ├ Fix applied: {fix}\n"
-                        f"   └ Retried with qty={new_qty}, price={new_price}, lev={new_lev}x"
-                    ),
+                    success=True, order_id=retry.order_id, symbol=symbol, side=side,
+                    filled_quantity=retry.filled_quantity or qty,
+                    avg_price=retry.avg_price or price or 0, status="FILLED",
+                    error=f"✅ Repaired order filled @ {price}",
                 )
 
-            # Retry also failed
-            log.warning("LLM fallback retry also failed: %s", retry_order.error)
+            # Repair resubmission also failed.
+            log.warning("Repair resubmission failed for %s: %s", symbol, retry.error)
             return None
 
         except Exception as e:
-            log.warning("LLM fallback failed: %s", e)
+            log.warning("Repair raised: %s", e)
             return None
 
     async def _close_position(self, decision_id: int,
