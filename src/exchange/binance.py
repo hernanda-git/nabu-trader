@@ -608,9 +608,16 @@ class BinanceExchange(Exchange):
             rounded = round(price / step) * step
             if rounded <= 0 and step > 0:
                 rounded = step
-            # Clamp to exchange price bounds when known
-            if rules.get("minPrice") is not None and rounded < rules["minPrice"]:
-                rounded = rules["minPrice"]
+            # Clamp to exchange price bounds when known.
+            # Only clamp DOWN to the floor when the rounded price is genuinely
+            # below it. A minPrice that is >10x the requested price signals a
+            # bad filter (e.g. a leaked rules[0] from another symbol) — do NOT
+            # inflate the price, which would flip its order of magnitude and
+            # trigger Binance -1111.
+            if rules.get("minPrice") is not None:
+                band_lo = rules["minPrice"]
+                if rounded < band_lo and band_lo <= price * 10:
+                    rounded = band_lo
             if rules.get("maxPrice") is not None and rounded > rules["maxPrice"]:
                 rounded = rules["maxPrice"]
             prec = max(0, -int(round(log10(step))) if step < 1 else 0)
