@@ -119,8 +119,19 @@ class SafetyGate2:
         self.config = config
         self.position_repo = position_repo
 
-    def check(self, decision: TradeDecision, balance_usdt: float | None = None) -> tuple[bool, str, TradeDecision]:
-        """Returns (allowed: bool, reason: str, clamped_decision)."""
+    def check(self, decision: TradeDecision, balance_usdt: float | None = None,
+              filters: dict | None = None) -> tuple[bool, str, TradeDecision]:
+        """Returns (allowed: bool, reason: str, clamped_decision).
+
+        Args:
+            decision: The trade decision to validate/clamp.
+            balance_usdt: Current free balance in USDT (for sizing).
+            filters: Optional exchange filter dict for the symbol (from
+                     BinanceExchange._load_futures_filters). When provided, its
+                     MIN_NOTIONAL is used as the floor instead of (or in addition
+                     to) the config min_notional_usdt, so leverage is driven by the
+                     REAL exchange minimum, not a hardcoded value.
+        """
         risk = self.config.get("risk", {})
         price = decision.entry_price or 0.0
 
@@ -133,6 +144,12 @@ class SafetyGate2:
         margin_usage = risk.get("margin_usage_pct", 50)       # absolute cap % of balance
         min_notional = risk.get("min_notional_usdt", 1.0)
         max_portfolio_lev = risk.get("max_portfolio_leverage", 10)
+        max_lev_increase_pct = risk.get("max_leverage_increase_pct", 10)
+        # Use the REAL exchange MIN_NOTIONAL when available (Task 6).
+        if filters:
+            exchange_min = filters.get("minNotional")
+            if exchange_min:
+                min_notional = max(min_notional, float(exchange_min))
         # -------------------------------------------------------------------
 
         # ── 1. Max concurrent positions ───────────────────────────────────
@@ -223,7 +240,10 @@ class SafetyGate2:
                 margin_budget = min(port_usdt, balance_usdt * margin_usage / 100.0)
                 if margin_budget > 0 and pos_value > 0:
                     raw_lev = pos_value / margin_budget
-                    leverage = _snap_leverage(raw_lev, max_lev)
+                    # Cap any increase above the needed baseline at
+                    # max_leverage_increase_pct (Task 6) — but never above max_lev.
+                    lev_cap = _snap_leverage(raw_lev * (1 + max_lev_increase_pct / 100.0), max_lev)
+                    leverage = min(_snap_leverage(raw_lev, max_lev), lev_cap, max_lev)
                 else:
                     leverage = 1
 
@@ -275,7 +295,8 @@ class SafetyGate2:
                 pos_value = decision.quantity * price
                 if margin_budget > 0 and pos_value > 0:
                     raw_lev = pos_value / margin_budget
-                    leverage = _snap_leverage(raw_lev, max_lev)
+                    lev_cap = _snap_leverage(raw_lev * (1 + max_lev_increase_pct / 100.0), max_lev)
+                    leverage = min(_snap_leverage(raw_lev, max_lev), lev_cap, max_lev)
                     decision = dc_replace(decision, leverage=leverage)
                     sizing_reason.append(f"lev={leverage}x")
 
