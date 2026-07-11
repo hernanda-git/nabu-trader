@@ -907,6 +907,65 @@ class BinanceExchange(Exchange):
     async def market_sell(self, symbol: str, quantity: float) -> OrderInfo:
         return await self._place_order(symbol, "SELL", "MARKET", quantity)
 
+    async def market_close(self, symbol: str, quantity: float,
+                           side: str = "SELL") -> OrderInfo:
+        """Close (reduce) a position at market with reduceOnly=true.
+
+        Unlike a maker LIMIT close at mark price (which often won't fill on a
+        thin book), a MARKET close fills immediately. reduceOnly guarantees it
+        can only reduce — never flip — the open position.
+        """
+        resolve_sym, _, _ = _resolve_futures_symbol(symbol)
+        side_upper = side.upper()
+        if side_upper not in ("SELL", "BUY"):
+            return OrderInfo(order_id="", symbol=symbol, side=side_upper,
+                             type="MARKET", quantity=quantity, status="FAILED",
+                             error=f"Invalid close side: {side_upper}")
+        if self.futures and not await self._preflight_symbol(resolve_sym):
+            return OrderInfo(order_id="", symbol=symbol, side=side_upper,
+                             type="MARKET", quantity=quantity, status="FAILED",
+                             error="Symbol not available for futures trading")
+        qty = quantity
+        if self.futures:
+            qty, _ = await self._round_quantity(resolve_sym, qty, price_ref=None)
+        params = {
+            "symbol": resolve_sym,
+            "side": side_upper,
+            "type": "MARKET",
+            "quantity": qty,
+            "reduceOnly": "true",
+        }
+        try:
+            data = await self._signed_request("POST", self._order_path(), params)
+            return OrderInfo(
+                order_id=str(data.get("orderId", "")),
+                symbol=data.get("symbol", resolve_sym),
+                side=data.get("side", side_upper),
+                type=data.get("type", "MARKET"),
+                quantity=float(data.get("origQty", qty)),
+                status=data.get("status", "FILLED"),
+                filled_quantity=float(data.get("executedQty", 0)),
+                avg_price=float(data.get("avgPrice", 0)) or (
+                    float(data.get("cummulativeQuoteQty", 0)) / max(float(data.get("executedQty", 1)), 0.001)
+                    if float(data.get("executedQty", 0)) > 0 else 0.0
+                ),
+            )
+        except httpx.HTTPStatusError as e:
+            error_msg = _format_order_error(
+                symbol, side_upper, "MARKET", qty, None,
+                getattr(self, "_last_leverage", 1),
+                e.response.status_code, e.response.text,
+            )
+            log.error("Market close failed: %s", error_msg)
+            return OrderInfo(order_id="", symbol=symbol, side=side_upper,
+                             type="MARKET", quantity=qty, status="FAILED",
+                             error=error_msg)
+        except Exception as e:
+            log.error("Market close failed: %s", e)
+            return OrderInfo(order_id="", symbol=symbol, side=side_upper,
+                             type="MARKET", quantity=qty, status="FAILED",
+                             error=str(e))
+
     async def limit_buy(self, symbol: str, quantity: float, price: float) -> OrderInfo:
         return await self._place_order(symbol, "BUY", "LIMIT", quantity, price=price)
 

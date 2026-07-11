@@ -326,6 +326,13 @@ class _CloseExchange:
     async def cancel_all_orders(self, sym):
         self.cancelled.append(sym)
         return 2  # a STOP and a TP were resting
+    async def market_close(self, sym, qty, side="SELL"):
+        from src.exchange.base import OrderInfo
+        self.closed = (sym, qty, side)
+        self.closed_side = side
+        return OrderInfo(order_id="C1", symbol=sym, side=side, type="MARKET",
+                         quantity=qty, status="FILLED",
+                         filled_quantity=qty, avg_price=1.25)
     async def limit_sell(self, sym, qty, price):
         from src.exchange.base import OrderInfo
         self.closed = (sym, qty, price)
@@ -374,7 +381,8 @@ def test_close_resolves_symbol_and_closes():
     assert res["size"] == 100
     assert res["pnl"] == 25.0
     assert "ENAUSDT" in ex.cancelled, "resting SL/TP not cancelled before close"
-    assert ex.closed == ("ENAUSDT", 100, 1.25), "close used wrong qty/price"
+    assert ex.closed == ("ENAUSDT", 100, "SELL"), "market close used wrong qty/side"
+    assert ex.closed_side == "SELL", "LONG should close with SELL"
 
 
 def test_close_no_open_position_reports_cleanly():

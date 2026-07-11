@@ -67,6 +67,15 @@ class Exchange(ABC):
     async def market_sell(self, symbol: str, quantity: float) -> OrderInfo:
         """Market sell order."""
 
+    async def market_close(self, symbol: str, quantity: float,
+                           side: str = "SELL") -> OrderInfo:
+        """Close (reduce) a position at market. Default: route to market side.
+        Exchange subclasses SHOULD override to add reduceOnly so the order can
+        only reduce, never flip, the position."""
+        if side.upper() == "BUY":
+            return await self.market_buy(symbol, quantity)
+        return await self.market_sell(symbol, quantity)
+
     @abstractmethod
     async def limit_buy(self, symbol: str, quantity: float, price: float) -> OrderInfo:
         """Limit buy order."""

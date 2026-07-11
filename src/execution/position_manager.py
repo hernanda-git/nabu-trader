@@ -250,7 +250,7 @@ class PositionManager:
             quantity=pos_info.size,
             status="OPEN",
         )
-        ok = await self._close_position(pos, reason, closed_by)
+        ok = await self._close_position(pos, reason, closed_by, market=True)
 
         # 4. Also mark the local DB record (if any) CLOSED.
         db_pos = None
@@ -303,10 +303,37 @@ class PositionManager:
         return f"{s}USDT"
 
     async def _close_position(self, pos: Position, reason: str,
-                              closed_by: str = "MANUAL") -> bool:
-        """Internal: close a position via LIMIT order."""
+                              closed_by: str = "MANUAL", market: bool = False) -> bool:
+        """Internal: close a position via LIMIT order.
+
+        If ``market`` is True (used by the manual /close command), the position
+        is closed with a MARKET order + reduceOnly for an immediate fill instead
+        of a resting maker LIMIT at mark price (which can fail to fill on a thin
+        book and surface as a "rejected" close).
+        """
         side = "SELL" if pos.direction == "LONG" else "BUY"
         try:
+            if market:
+                # Immediate market close (reduceOnly). No fill-wait needed.
+                order = await self.exchange.market_close(pos.pair, pos.quantity, side)
+                if order.status in ("FILLED", "NEW", "PARTIALLY_FILLED"):
+                    # Market orders fill instantly; record fill price from order.
+                    if order.status != "FILLED" and order.filled_quantity <= 0:
+                        # Rarely NEW/partial — give a brief moment then read fill.
+                        import asyncio as _aio
+                        for _ in range(5):
+                            await _aio.sleep(1)
+                            try:
+                                check = await self.exchange.get_order(pos.pair, order.order_id)
+                                if check.filled_quantity > 0 or check.status == "FILLED":
+                                    order = check
+                                    break
+                            except Exception:
+                                pass
+                    return self._finalize_close(pos, order, reason, closed_by)
+                log.error("Market close rejected for %s: %s", pos.pair, order.error)
+                return False
+
             # Fetch current price for LIMIT close
             close_price = await self.exchange.get_mark_price(pos.pair)
             if not close_price or close_price <= 0:
@@ -342,46 +369,50 @@ class PositionManager:
                     return False
 
             if order.status in ("FILLED", "NEW"):
-                entry_cost = pos.entry_price * pos.quantity
-                exit_value = (order.avg_price or 0) * pos.quantity
-                pnl = (exit_value - entry_cost) if pos.direction == "LONG" else (entry_cost - exit_value)
-
-                self.position_repo.close_position(
-                    pos.id, exit_price=order.avg_price or 0,
-                    pnl=pnl, reason=reason, closed_by=closed_by,
-                )
-
-                # Log position event
-                if self.position_event_repo:
-                    event_type = {
-                        "MANUAL": "POSITION_CLOSED",
-                        "SL": "SL_HIT",
-                        "TP": "TP_HIT",
-                        "TRIGGER": "POSITION_CLOSED",
-                        "SYSTEM": "AUTO_DETECTED_CLOSE",
-                    }.get(closed_by, "POSITION_CLOSED")
-                    self.position_event_repo.save_event(
-                        position_id=pos.id,
-                        event_type=event_type,
-                        details=f"Closed {pos.direction} @ {order.avg_price:.8f} PnL={pnl:.2f} ({reason})",
-                        metadata={
-                            "pair": pos.pair,
-                            "direction": pos.direction,
-                            "exit_price": order.avg_price,
-                            "pnl": pnl,
-                            "reason": reason,
-                            "closed_by": closed_by,
-                        },
-                    )
-
-                log.info("Position closed: %s %s PnL=%.2f (%s)", pos.direction, pos.pair, pnl, closed_by)
-                return True
+                return self._finalize_close(pos, order, reason, closed_by)
             else:
                 log.error("Failed to close %s: status=%s error=%s", pos.pair, order.status, order.error)
                 return False
         except Exception as e:
             log.error("Failed to close %s: %s", pos.pair, e)
             return False
+
+    def _finalize_close(self, pos: Position, order: "object",
+                        reason: str, closed_by: str) -> bool:
+        """Compute PnL and persist the close (DB + event)."""
+        entry_cost = pos.entry_price * pos.quantity
+        exit_value = (order.avg_price or 0) * pos.quantity
+        pnl = (exit_value - entry_cost) if pos.direction == "LONG" else (entry_cost - exit_value)
+
+        self.position_repo.close_position(
+            pos.id, exit_price=order.avg_price or 0,
+            pnl=pnl, reason=reason, closed_by=closed_by,
+        )
+
+        # Log position event
+        if self.position_event_repo:
+            event_type = {
+                "MANUAL": "POSITION_CLOSED",
+                "SL": "SL_HIT",
+                "TP": "TP_HIT",
+                "TRIGGER": "POSITION_CLOSED",
+                "SYSTEM": "AUTO_DETECTED_CLOSE",
+            }.get(closed_by, "POSITION_CLOSED")
+            self.position_event_repo.save_event(
+                position_id=pos.id,
+                event_type=event_type,
+                details=f"Closed {pos.direction} @ {order.avg_price:.8f} PnL={pnl:.2f} ({reason})",
+                metadata={
+                    "pair": pos.pair,
+                    "direction": pos.direction,
+                    "exit_price": order.avg_price,
+                    "pnl": pnl,
+                    "reason": reason,
+                    "closed_by": closed_by,
+                },
+            )
+        log.info("Position closed: %s %s PnL=%.2f (%s)", pos.direction, pos.pair, pnl, closed_by)
+        return True
 
     # ── Pending conditions ──────────────────────────────────────────────────
 
