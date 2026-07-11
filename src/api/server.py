@@ -19,7 +19,6 @@ import os
 import sqlite3
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
-from pathlib import Path
 from typing import Any
 
 import uvicorn
@@ -29,13 +28,11 @@ from fastapi.responses import JSONResponse
 from starlette.status import HTTP_404_NOT_FOUND, HTTP_500_INTERNAL_SERVER_ERROR
 
 from src.api.auth import auth_middleware
+from src.state.database import DB_PATH
 
 log = logging.getLogger("api.server")
 
 # ─── DB Connection ────────────────────────────────────────────────────────────
-
-DATA_DIR = Path(os.environ.get("DATA_ROOT", "/data")) / "data"
-DB_PATH = DATA_DIR / "trades.db"
 
 
 def _get_conn() -> sqlite3.Connection:
