@@ -198,6 +198,7 @@ class TelegramNotifier:
                     {"command": "version", "description": "Show bot version"},
                     {"command": "help", "description": "Show available commands"},
                     {"command": "close", "description": "Close an active trade, e.g. /close ENAUSDT"},
+                    {"command": "db", "description": "Browse/edit DB: /db tables|list|get|delete|update|insert"},
                 ],
                 "scope": {"type": "default"},
             },

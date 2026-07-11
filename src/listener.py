@@ -15,6 +15,8 @@ from src.exchange.base import Exchange
 from src.config.loader import get_session_dir
 from src.health.reporter import build_health_report
 from src.orchestrator import TradeOrchestrator
+from src.state.database import get_connection
+from src.state.db_admin import run_db_command
 
 log = logging.getLogger("listener")
 
@@ -145,6 +147,8 @@ class SignalListener:
                 await self._handle_health(event)
             elif cmd.startswith("/close"):
                 await self._handle_close(event)
+            elif cmd.startswith("/db"):
+                await self._handle_db(event)
 
         await self.client.run_until_disconnected()
 
@@ -319,6 +323,13 @@ class SignalListener:
             "  /version    — Show bot version\n"
             "  /help       — Show this message\n\n"
             "  /close <PAIR> — Immediately market-close an active trade (cancels its SL/TP)\n\n"
+            "  /db <cmd> — Browse/edit the trade DB. Subcommands:\n"
+            "    /db tables — list tables + row counts\n"
+            "    /db list <table> [page] — page through rows (10/page)\n"
+            "    /db get <table> <id> — one row by primary key\n"
+            "    /db delete <table> <id> — remove a row (needs `!` confirm)\n"
+            "    /db update <table> <id> <col>=<val> [...] — edit (needs `!`)\n"
+            "    /db insert <table> (<col>=<val>, ...) — add (needs `!`)\n\n"
             f"Current port setting: `$ {port:.2f}` per trade\n\n"
             "The bot automatically processes signals from @YOUR_SIGNAL_CHANNEL and\n"
             "executes trades on Binance Futures when conditions are met."
@@ -500,3 +511,21 @@ class SignalListener:
             f"   {pnl_emoji} Realised PnL: `{pnl_str}`\n\n"
             f"_Closed manually via /close command._"
         )
+
+    async def _handle_db(self, event):
+        """Handle /db ... — browse and edit the trade SQLite DB.
+
+        Subcommands mirror a tiny SQL REPL but are safe by design: reads are
+        free, writes (delete/update/insert) require a confirmation pass. The
+        actual command logic lives in `src/state/db_admin.run_db_command` so it
+        is unit-testable without Telegram.
+        """
+        raw = (event.message.text or "")[len("/db"):]
+        log.info("Command: /db %s", raw.strip())
+        try:
+            conn = get_connection()
+            reply = run_db_command(conn, raw)
+        except Exception as e:  # noqa: BLE001
+            log.exception("Failed to run /db command")
+            reply = f"❌ **Error:** `{e}`"
+        await event.reply(reply)
