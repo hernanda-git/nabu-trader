@@ -2,6 +2,46 @@
 
 All notable changes to this project are documented here.
 
+## Fly volume DB-path fix + docs/runbook enrichment — 2026-07-12
+
+### Fixed
+- **DB nested at `/data/data/trades.db` (data-loss trap)**: `src/config/loader.py`
+  `get_data_dir()` appended `"data"` to a root that is already the mounted
+  volume (`DATA_ROOT=/data`), so the live SQLite DB landed one level too deep
+  while a stale, schema-less `/data/trades.db` sat at the intended path. On
+  Fly (`DATA_ROOT`/`FLY_MODE` set) the volume root now IS the data dir → the DB
+  is `/data/trades.db`. Local dev unchanged (`ROOT_DIR/data`). Migrated the live
+  DB (71 signals, 2 pending rows) with a `premigrate-<ts>` backup before
+  deleting the nested dir. Commit `66cf92b` (branch `fix/code-review-fixes`).
+
+### Added / Enriched
+- **Docs corrected**: `AGENTS.md` + `docs/DEPLOYMENT.md` now document the real
+  `/data/trades.db` path (was `/data/data/...`), the git-bash `flyctl` deploy
+  flow (was stale `deploy.sh`/WSL/PowerShell guidance), and a working
+  `flyctl ssh console` heredoc for balance checks (the old `-C 'python -c'`
+  nested-quote form breaks).
+- **`scripts/deploy_and_verify.sh`**: the standing "verify → commit → push →
+  deploy" helper referenced by `AGENTS.md` and the `crypto-auto-trader-reliability`
+  / `fly-bot-deploy-verify` Hermes skills.
+- **Two Hermes skills capture this session's operational knowledge**:
+  - `crypto-auto-trader-reliability` — order-fix *content* (conditional
+    SL/TP, `/close` maker-LIMIT root cause, `market_close`/`reduceOnly`/`-2022`,
+    and why conditional setups like the AAVE "look for long if above 95.45 on 4H"
+    message are parked pending, not failed).
+  - `fly-bot-deploy-verify` (devops) — the *deploy + live-verify loop*: run
+    verification Python *inside* the deployed container (live keys + new code)
+    to prove a fix against the real Binance account, incl. the
+    `/fapi/v1/order/test` param check and the ENAUSDT open→close round-trip.
+
+### Earlier this branch (fix/code-review-fixes)
+- `cada131` — `feat: /close <PAIR>` manual market-close command.
+- market_close fix commits — `/close` now closes immediately via a MARKET
+  order with `reduceOnly=true` (was a resting maker LIMIT at mark that never
+  filled); retries without `reduceOnly` on Binance `-2022`. Live-verified on
+  ENAUSDT (position gone after `/close`).
+- `503abda` — conditional SL/TP orders (`STOP`/`TAKE_PROFIT` conditional LIMIT,
+  not market).
+
 - **Failure alert now delivers**: the "Failed to place order" alert was wrapped in nested backticks, which Telegram rejected with *"can't parse entities"* — so failed-trade alerts were silently **undelivered** in prod. Now uses a fenced code block for the raw error. Added markdown-safety tests.
 
 ## Trade Execution Reliability Pass — 2026-07-09 (APE-1111)

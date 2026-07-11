@@ -2,16 +2,11 @@
 
 ## Quick Health Check
 
-```powershell
-# From Windows (PowerShell) — the app is on Windows Fly CLI auth:
+```bash
+# From git-bash/MSYS (the Hermes terminal runs bash). Add flyctl to PATH:
+export PATH="$PATH:/c/Users/it26/.fly/bin"
 flyctl status --app nabu-trader
 flyctl logs --app nabu-trader --no-tail
-```
-
-```bash
-# From WSL — use PowerShell bridge:
-powershell.exe -NoProfile -Command "& flyctl status --app nabu-trader"
-powershell.exe -NoProfile -Command "& flyctl logs --app nabu-trader --no-tail"
 ```
 
 ## App Details
@@ -24,37 +19,45 @@ powershell.exe -NoProfile -Command "& flyctl logs --app nabu-trader --no-tail"
 | **Exchange** | Binance Futures (auto-trade = 🚀 YOLO) |
 | **Channel** | @YOUR_SIGNAL_CHANNEL |
 | **Telegram notifier** | Chat ID: YOUR_CHAT_ID |
-| **Persistent volume** | `/data` (source: `data_volume`) |
+| **Persistent volume** | `/data` (source: `data_volume`) — **DB at `/data/trades.db`** (corrected 2026-07-12 from the old nested `/data/data/trades.db`) |
 | **Health port** | 9090 |
 
 ## Important: Cross-Platform Auth
 
-> ⚠️ The WSL Fly.io token (`b12017ec-...`) does **NOT** have access to this app.
-> The Windows Fly CLI (`YOUR_HOME\.fly\bin\flyctl.exe`) has the correct auth.
->
-> Always use `powershell.exe -NoProfile -Command "& flyctl ..."` from WSL,
-> or run flyctl directly in Windows PowerShell.
+> ⚠️ This app uses the **Windows Fly CLI** binary (`YOUR_HOME\.fly\bin\flyctl.exe`).
+> The WSL `fly` token does **NOT** have access. Run `flyctl` directly from git-bash/MSYS
+> via `export PATH="$PATH:/c/Users/it26/.fly/bin"` — do **not** shell out
+> through `powershell.exe` (nested quoting breaks `ssh console` heredocs).
 
 ## Check Machine Logs
 
-```powershell
+```bash
 flyctl logs --app nabu-trader
 ```
 
 ## SSH into machine (debugging)
 
-```powershell
-flyctl ssh console --app nabu-trader
+```bash
+# Pipe a heredoc (NOT -C 'python -c ...' — nested quotes break):
+flyctl ssh console --app nabu-trader <<'PY'
+python - <<'PY'
+import os
+os.chdir("/app")
+from src.state.database import DB_PATH
+print("DB_PATH:", DB_PATH)
+PY
+exit
+PY
 ```
 
 ## Check secrets are set
 
-```powershell
+```bash
 flyctl secrets list --app nabu-trader
 ```
 
 ## Health endpoint (if app has HTTP)
 
-```powershell
+```bash
 curl https://nabu-trader.fly.dev/health
 ```

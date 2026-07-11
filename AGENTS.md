@@ -58,6 +58,11 @@ python src/main.py
                                                    Hermes ←→ API Bridge
 ```
 
+> **DB location (corrected 2026-07-12):** the live SQLite DB is
+> **`/data/trades.db`** on the Fly volume (`DATA_ROOT=/data`). It used to be
+> nested at `/data/data/trades.db` (a `get_data_dir()` bug, now fixed). If you
+> ever see a second `/data/data/trades.db`, that is the OLD path — ignore it.
+
 ### Directory Layout
 
 ```
@@ -203,9 +208,10 @@ Binance lists some low-price tokens (BONK, PEPE, SHIB, FLOKI) as "1000x" contrac
 
 ### 1. Health Check
 ```bash
-# From WSL (Windows Fly CLI bridge):
-powershell.exe -NoProfile -Command "& flyctl status --app nabu-trader"
-powershell.exe -NoProfile -Command "& flyctl logs --app nabu-trader --no-tail"
+# From git-bash/MSYS (NOT PowerShell/cmd — the Hermes terminal runs bash):
+export PATH="$PATH:/c/Users/it26/.fly/bin"
+flyctl status --app nabu-trader
+flyctl logs --app nabu-trader --no-tail
 
 # Key things to check:
 # - Machine state == "started"
@@ -216,20 +222,31 @@ powershell.exe -NoProfile -Command "& flyctl logs --app nabu-trader --no-tail"
 
 ### 2. Deploy New Code
 
-**The `deploy.sh` script handles WSL→Windows sync automatically.** From WSL:
+Deploy directly from git-bash/MSYS (the Hermes terminal runs bash). The Fly CLI
+binary is at `/c/Users/it26/.fly/bin/flyctl.exe` — add it to PATH first.
 
 ```bash
-cd /home/it26/nabu-trader
-bash deploy.sh "feat: description of changes"
+export PATH="$PATH:/c/Users/it26/.fly/bin"
+cd "/c/Working Folder/Research/nabu-trader"
+source .venv/Scripts/activate
+python -m pytest -q            # 1. verify: must be green before committing
+git add src/... tests/...      # 2. stage specific paths (NOT -A — avoids .hermes/ + junk)
+git commit -m "..."            # 3. commit
+git push origin fix/code-review-fixes   # 4. push
+flyctl deploy                  # 5. deploy (rolling update, ~1-2 min)
+flyctl status                  # machine STATE=started + new deployment hash
+curl -s -o /dev/null -w "HTTP %{http_code}\n" https://nabu-trader.fly.dev/health   # expect HTTP 200
+flyctl logs --no-tail          # confirm boot: "Listening for new messages..." + sendMessage 200 OK
 ```
 
-This script: (1) rsyncs WSL → Windows path, (2) detects next Fly.io release
-version, (3) writes `src/version.py`, (4) commits from Windows path, (5) runs
-`flyctl deploy --detach` via the Windows PowerShell bridge.
+**Standing "verify → commit → push → deploy" loop** (full version in the
+`crypto-auto-trader-reliability` skill reference `nabu-bot.md`; the
+live end-to-end verification recipe is in the `fly-bot-deploy-verify` Hermes
+skill). Reusable helper script: `scripts/deploy_and_verify.sh`.
 
-**⚠️ Do NOT deploy manually bypassing `deploy.sh`** — the Fly CLI is on Windows
-and WSL changes are invisible to it. The script exists precisely to solve that.
-```
+**Staging gotcha:** prefer `git add <specific paths>` over `git add -A` — `-A`
+staged agent-internal dirs (`.hermes/`) and stray untracked files. `.gitignore`
+now excludes `.hermes/`.
 
 ### 3. Add a New Signal Format
 1. Edit `src/agent/parser.py` — add regex pattern + test
@@ -257,7 +274,20 @@ flyctl secrets list --app nabu-trader
 
 ### 7. Check Binance Futures Balance
 ```bash
-powershell.exe -NoProfile -Command "& flyctl ssh console --app nabu-trader -C 'python -c \"import os; os.chdir(\\\"/app\\\"); from src.exchange.binance import BinanceExchange; import asyncio; e=BinanceExchange(os.environ[\\\"BINANCE_API_KEY\\\"], os.environ[\\\"BINANCE_API_SECRET\\\"], futures=True, testnet=False); b=asyncio.run(e.get_balance()); print(f\\\"Free: \\${b.free_usdt}, Total: \\${b.total_usdt}\\\")\\\"'\""
+# From git-bash/MSYS. Pipe a heredoc (NOT -C 'python -c ...' — nested quotes break):
+export PATH="$PATH:/c/Users/it26/.fly/bin"
+flyctl ssh console --app nabu-trader <<'PY'
+python - <<'PY'
+import os, asyncio
+os.chdir("/app")
+from src.exchange.binance import BinanceExchange
+e=BinanceExchange(os.environ["BINANCE_API_KEY"], os.environ["BINANCE_API_SECRET"],
+                  futures=True, testnet=False)
+b=asyncio.run(e.get_balance())
+print(f"Free: ${b.free_usdt}, Total: ${b.total_usdt}")
+PY
+exit
+PY
 ```
 
 ### 8. Query Trades via API Bridge
@@ -334,17 +364,17 @@ CHANNEL_USERNAME
 ### Persistent Data
 | Path | Contents |
 |------|----------|
-| `/data/data/trades.db` | SQLite (14 tables: signals, decisions, orders, positions, llm_interactions, trade_logs, position_events, config_snapshots, etc.) |
+| `/data/trades.db` | SQLite (14 tables: signals, decisions, orders, positions, llm_interactions, trade_logs, position_events, config_snapshots, etc.) — **DB path corrected 2026-07-12** from the old nested `/data/data/trades.db`. |
 | `/data/sessions/nabu.session` | Telethon session (auth persistence) |
 | `/data/logs/trading.log` | Debug logs |
 
 ### ⚠️ Cross-Platform Auth
-The app is deployed via **Windows Fly CLI** (`YOUR_HOME\.fly\bin\flyctl.exe`).  
-The WSL Fly token (`b12017ec-...`) does **NOT** have access to this app.  
-Always use PowerShell bridge from WSL:
-```bash
-powershell.exe -NoProfile -Command "& flyctl <command> --app nabu-trader"
-```
+The app is deployed via the **Windows Fly CLI** binary at
+`YOUR_HOME\.fly\bin\flyctl.exe`. Add it to PATH in git-bash/MSYS:
+`export PATH="$PATH:/c/Users/it26/.fly/bin"`. Run `flyctl` directly from
+git-bash — do NOT shell out through `powershell.exe` (the nested quoting breaks
+SSH-console heredocs). The `flyctl` binary (not the WSL `fly` token) owns this
+app.
 
 ---
 

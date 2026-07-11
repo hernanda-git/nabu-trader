@@ -252,26 +252,26 @@ Full docs: [`src/api/server.py`](src/api/server.py), [`fly-trade-bridge` skill](
 
 ## 🚀 Deploy & Health (Fly.io)
 
-> ⚠️ **Cross-platform auth**: This app is deployed via **Windows Fly CLI** (`YOUR_HOME\.fly\bin\flyctl.exe`).  
-> The WSL Fly token does **NOT** have access. From WSL, always use:
-> ```bash
-> powershell.exe -NoProfile -Command "& flyctl <command> --app nabu-trader"
-> ```
+> ⚠️ **Cross-platform auth**: This app is deployed via the **Windows Fly CLI**
+> binary at `YOUR_HOME\.fly\bin\flyctl.exe`. Add it to PATH in git-bash/MSYS:
+> `export PATH="$PATH:/c/Users/it26/.fly/bin"` — then run `flyctl` directly. Do
+> **not** shell out through `powershell.exe` (nested quoting breaks `ssh console`
+> heredocs). The `flyctl` binary (not the WSL `fly` token) owns this app.
 
 ### Health Check
 
-```powershell
-# Windows PowerShell (or via WSL → powershell.exe bridge)
+```bash
+export PATH="$PATH:/c/Users/it26/.fly/bin"
 flyctl status --app nabu-trader
 flyctl logs --app nabu-trader --no-tail
 ```
 
-| Check | WSL Command |
+| Check | Command (git-bash) |
 |-------|-------------|
-| Status & machine | `powershell.exe -NoProfile -Command "& flyctl status --app nabu-trader"` |
-| Live logs | `powershell.exe -NoProfile -Command "& flyctl logs --app nabu-trader"` |
-| SSH console | `powershell.exe -NoProfile -Command "& flyctl ssh console --app nabu-trader"` |
-| Secrets | `powershell.exe -NoProfile -Command "& flyctl secrets list --app nabu-trader"` |
+| Status & machine | `flyctl status --app nabu-trader` |
+| Live logs | `flyctl logs --app nabu-trader --no-tail` |
+| SSH console | `flyctl ssh console --app nabu-trader` |
+| Secrets | `flyctl secrets list --app nabu-trader` |
 
 ### Quick Deploy
 

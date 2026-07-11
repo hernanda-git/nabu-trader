@@ -84,7 +84,7 @@ CMD ["python", "src/main.py"]
 
 ### Persistent Storage
 
-- Database: `/data/data/trades.db` (SQLite WAL mode)
+- Database: `/data/trades.db` (SQLite WAL mode) — **corrected 2026-07-12** from the old nested `/data/data/trades.db` (`get_data_dir()` bug fixed).
 - Sessions: `/data/sessions/nabu.session`
 - Logs: `/data/logs/trading.log`
 
@@ -93,27 +93,32 @@ Fly.io mounts a persistent volume at `/data` so data survives restarts.
 ### Check the App
 
 ```bash
-# View logs from WSL (use Windows flyctl)
-powershell.exe -NoProfile -Command "& flyctl logs --app nabu-trader --no-tail"
-
-# Check machine status
-powershell.exe -NoProfile -Command "& flyctl status --app nabu-trader"
-
-# SSH into machine
-powershell.exe -NoProfile -Command "& flyctl ssh console --app nabu-trader"
+# From git-bash/MSYS — NOT PowerShell/cmd. Add flyctl to PATH first:
+export PATH="$PATH:/c/Users/it26/.fly/bin"
+flyctl logs --app nabu-trader --no-tail
+flyctl status --app nabu-trader
+flyctl ssh console --app nabu-trader        # interactive shell in /app
 ```
 
 ### Updating
 
 ```bash
-git pull
-fly deploy
+export PATH="$PATH:/c/Users/it26/.fly/bin"
+cd "/c/Working Folder/Research/nabu-trader"
+source .venv/Scripts/activate
+python -m pytest -q            # 1. verify green
+git add src/... tests/...      # 2. stage specific paths (NOT -A)
+git commit -m "..." && git push origin fix/code-review-fixes
+flyctl deploy                  # 3. rolling deploy (~1-2 min)
+curl -s -o /dev/null -w "HTTP %{http_code}\n" https://nabu-trader.fly.dev/health  # expect 200
+flyctl logs --no-tail          # confirm "Listening for new messages..."
 ```
 
 ### Stopping
 
 ```bash
-fly machine stop <machine-id>
+export PATH="$PATH:/c/Users/it26/.fly/bin"
+flyctl machine stop <machine-id>
 ```
 
 ## Local (WSL / Linux)
@@ -191,4 +196,4 @@ services:
 2. **Never commit `.env`** — secrets are set via `fly secrets set` or Docker env vars.
 3. **One machine per region** — Fly.io free tier includes 3 shared-cpu-1x machines. One is enough.
 4. **SQLite concurrency** — WAL mode handles single-writer fine. No need for PostgreSQL.
-5. **Cross-platform auth** — This app uses Windows Fly CLI. From WSL, prefix commands with `powershell.exe -NoProfile -Command "& flyctl ..."`
+5. **Cross-platform auth** — this app uses the Windows Fly CLI binary (`/c/Users/it26/.fly/bin/flyctl.exe`). Run it directly from git-bash/MSYS via `export PATH="$PATH:/c/Users/it26/.fly/bin"` — do not shell out through `powershell.exe` (nested quoting breaks `ssh console` heredocs).
