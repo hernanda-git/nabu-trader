@@ -28,8 +28,16 @@ def _resolve_data_root() -> Path:
 
 
 def get_data_dir() -> Path:
-    """Return the directory for persistent data files."""
-    return _resolve_data_root() / "data"
+    """Return the directory for persistent data files.
+
+    On Fly.io (DATA_ROOT/FLY_MODE set) the volume mounted at /data IS the data
+    dir, so the DB lives at /data/trades.db — NOT /data/data/trades.db. Locally
+    (no volume) it stays ROOT_DIR/data to preserve existing dev behaviour.
+    """
+    root = _resolve_data_root()
+    if os.environ.get("DATA_ROOT") or os.environ.get("FLY_MODE"):
+        return root
+    return root / "data"
 
 
 def get_session_dir() -> Path:
