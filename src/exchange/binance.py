@@ -951,10 +951,35 @@ class BinanceExchange(Exchange):
                 ),
             )
         except httpx.HTTPStatusError as e:
+            # -2022 "ReduceOnly Order is rejected" can fire if the rounded qty
+            # exceeds the live reducible size (e.g. rounding up past the open
+            # position). Retry WITHOUT reduceOnly using the exact size — resting
+            # SL/TP were already cancelled by the caller, so no flip risk.
+            text = e.response.text
+            if e.response.status_code == 400 and '"-2022"' in text:
+                log.warning("reduceOnly close rejected (-2022) for %s; retrying without reduceOnly", resolve_sym)
+                params.pop("reduceOnly", None)
+                try:
+                    data = await self._signed_request("POST", self._order_path(), params)
+                    return OrderInfo(
+                        order_id=str(data.get("orderId", "")),
+                        symbol=data.get("symbol", resolve_sym),
+                        side=data.get("side", side_upper),
+                        type=data.get("type", "MARKET"),
+                        quantity=float(data.get("origQty", qty)),
+                        status=data.get("status", "FILLED"),
+                        filled_quantity=float(data.get("executedQty", 0)),
+                        avg_price=float(data.get("avgPrice", 0)) or (
+                            float(data.get("cummulativeQuoteQty", 0)) / max(float(data.get("executedQty", 1)), 0.001)
+                            if float(data.get("executedQty", 0)) > 0 else 0.0
+                        ),
+                    )
+                except Exception as e2:
+                    log.error("Market close retry failed: %s", e2)
             error_msg = _format_order_error(
                 symbol, side_upper, "MARKET", qty, None,
                 getattr(self, "_last_leverage", 1),
-                e.response.status_code, e.response.text,
+                e.response.status_code, text,
             )
             log.error("Market close failed: %s", error_msg)
             return OrderInfo(order_id="", symbol=symbol, side=side_upper,
