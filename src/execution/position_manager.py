@@ -185,6 +185,123 @@ class PositionManager:
         """Close a position by market order and update state."""
         return await self._close_position(pos, reason, closed_by)
 
+    async def close_position_by_symbol(self, symbol: str,
+                                        reason: str = "Manual close (Telegram command)",
+                                        closed_by: str = "MANUAL") -> dict:
+        """Manually close an open position for ``symbol`` (e.g. via /close).
+
+        Returns a result dict::
+
+            {"ok": bool, "symbol": str, "side": str, "size": float,
+             "fill_price": float|None, "pnl": float|None, "error": str|None}
+
+        Flow:
+          1. Find the live exchange position (source of truth for size/direction).
+          2. Cancel any resting SL/TP orders for the symbol (avoid orphans).
+          3. Close via market order using the live position size.
+          4. If a local DB position record exists, mark it CLOSED + emit event.
+
+        If no open position exists for ``symbol``, returns ``ok=False`` with a
+        clear error so the command can report "no open position".
+        """
+        from src.domain.models import Position as _Position
+        symbol = (symbol or "").strip().upper()
+        if not symbol:
+            return {"ok": False, "symbol": symbol, "side": "", "size": 0.0,
+                    "fill_price": None, "pnl": None, "error": "No symbol provided"}
+
+        # Normalize: accept bare base ("ENA") → "ENAUSDT" via symbol registry.
+        resolved = self._resolve_close_symbol(symbol)
+
+        # 1. Find the live exchange position (authoritative open size).
+        positions = []
+        try:
+            positions = await self.exchange.get_positions()
+        except Exception as e:
+            return {"ok": False, "symbol": symbol, "side": "", "size": 0.0,
+                    "fill_price": None, "pnl": None,
+                    "error": f"Could not fetch positions: {e}"}
+
+        pos_info = next(
+            (p for p in positions
+             if p.symbol.upper() == resolved.upper() or p.symbol.upper() == symbol.upper()),
+            None,
+        )
+        if pos_info is None:
+            return {"ok": False, "symbol": resolved, "side": "", "size": 0.0,
+                    "fill_price": None, "pnl": None,
+                    "error": f"No open position for {resolved}"}
+
+        # 2. Cancel resting SL/TP orders so they don't dangle after close.
+        try:
+            cancelled = await self.exchange.cancel_all_orders(resolved)
+            if cancelled:
+                log.info("Cancelled %d resting order(s) for %s before manual close",
+                         cancelled, resolved)
+        except Exception as e:
+            log.warning("Failed to cancel resting orders for %s: %s", resolved, e)
+
+        # 3. Build a Position from the live info and close.
+        pos = _Position(
+            id=0,
+            pair=pos_info.symbol,
+            direction=pos_info.direction,
+            entry_price=pos_info.entry_price,
+            quantity=pos_info.size,
+            status="OPEN",
+        )
+        ok = await self._close_position(pos, reason, closed_by)
+
+        # 4. Also mark the local DB record (if any) CLOSED.
+        db_pos = None
+        try:
+            db_pos = self.position_repo.get_open_by_pair(resolved)
+        except Exception:
+            db_pos = None
+        if db_pos is not None:
+            try:
+                self.position_repo.close_position(
+                    db_pos.id, exit_price=pos_info.mark_price or 0,
+                    pnl=pos_info.unrealized_pnl, reason=reason, closed_by=closed_by,
+                )
+            except Exception as e:
+                log.warning("DB close record update failed for %s: %s", resolved, e)
+
+        if ok:
+            return {
+                "ok": True, "symbol": pos_info.symbol,
+                "side": pos_info.direction, "size": pos_info.size,
+                "fill_price": pos_info.mark_price or None,
+                "pnl": pos_info.unrealized_pnl or None, "error": None,
+            }
+        return {"ok": False, "symbol": pos_info.symbol, "side": pos_info.direction,
+                "size": pos_info.size, "fill_price": None, "pnl": None,
+                "error": "Close order not filled / rejected (see logs)"}
+
+    def _resolve_close_symbol(self, symbol: str) -> str:
+        """Normalize a close command symbol to a full futures pair.
+
+        Accepts ``ENAUSDT``, ``#ENA``, or ``ENA`` and resolves via the
+        SymbolRegistry when available; falls back to appending USDT.
+        """
+        s = symbol.upper().lstrip("#").strip()
+        if s.endswith("USDT"):
+            return s
+        if s.endswith(("USD", "BUSD", "USDC")):
+            return s
+        # Try the symbol registry for a base→pair mapping.
+        try:
+            from src.exchange.symbol_registry import get_registry
+        except ImportError:
+            get_registry = None  # type: ignore[assignment]
+        registry = get_registry() if get_registry else None
+        if registry and registry.is_ready:
+            resolved, _ = registry.resolve(s)
+            if resolved:
+                return resolved
+        # Bare base asset — assume USDT-margined.
+        return f"{s}USDT"
+
     async def _close_position(self, pos: Position, reason: str,
                               closed_by: str = "MANUAL") -> bool:
         """Internal: close a position via LIMIT order."""

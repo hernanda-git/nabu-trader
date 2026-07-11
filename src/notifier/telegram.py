@@ -197,6 +197,7 @@ class TelegramNotifier:
                     {"command": "getport", "description": "Show current margin per trade"},
                     {"command": "version", "description": "Show bot version"},
                     {"command": "help", "description": "Show available commands"},
+                    {"command": "close", "description": "Close an active trade, e.g. /close ENAUSDT"},
                 ],
                 "scope": {"type": "default"},
             },

@@ -306,3 +306,91 @@ def test_monitor_recognizes_stop_and_take_profit_types():
     tp_count = sum(1 for o in open_orders if o.type in tp_types)
     assert sl_ok is True, "monitor failed to recognize STOP SL"
     assert tp_count == 1, "monitor failed to recognize TAKE_PROFIT TP"
+
+
+# ─── 6. Manual /close command closes the right position ─────────────────────
+# Validates the close_position_by_symbol helper used by the /close Telegram
+# command: it must find the live position, cancel resting orders, close, and
+# report the result — and gracefully report "no open position" otherwise.
+
+class _CloseExchange:
+    """Fakes Binance: one open ENAUSDT LONG, resting STOP+TP, market close."""
+    name = "binance_futures"
+    def __init__(self, positions):
+        self._positions = positions
+        self.cancelled = []
+        self.closed = None
+    async def get_positions(self):
+        return self._positions
+    async def get_mark_price(self, sym): return 1.25
+    async def cancel_all_orders(self, sym):
+        self.cancelled.append(sym)
+        return 2  # a STOP and a TP were resting
+    async def limit_sell(self, sym, qty, price):
+        from src.exchange.base import OrderInfo
+        self.closed = (sym, qty, price)
+        return OrderInfo(order_id="C1", symbol=sym, side="SELL", type="LIMIT",
+                         quantity=qty, price=price, status="FILLED",
+                         filled_quantity=qty, avg_price=1.25)
+    async def limit_buy(self, sym, qty, price):
+        from src.exchange.base import OrderInfo
+        self.closed = (sym, qty, price)
+        return OrderInfo(order_id="C1", symbol=sym, side="BUY", type="LIMIT",
+                         quantity=qty, price=price, status="FILLED",
+                         filled_quantity=qty, avg_price=1.25)
+    async def get_order(self, sym, oid):
+        from src.exchange.base import OrderInfo
+        return OrderInfo(order_id=oid, status="FILLED", avg_price=1.25,
+                         filled_quantity=self.closed[1] if self.closed else 0)
+
+
+class _ClosePosRepo:
+    def __init__(self): self.closed_id = None
+    def get_open_by_pair(self, pair):
+        from src.domain.models import Position
+        if pair == "ENAUSDT":
+            return Position(id=7, pair="ENAUSDT", direction="LONG",
+                            entry_price=1.0, quantity=100, status="OPEN")
+        return None
+    def close_position(self, pid, exit_price, pnl, reason, closed_by):
+        self.closed_id = pid
+
+
+def _make_pm(positions):
+    from src.execution.position_manager import PositionManager
+    ex = _CloseExchange(positions)
+    pm = PositionManager(ex, {}, _ClosePosRepo())
+    return pm, ex
+
+
+def test_close_resolves_symbol_and_closes():
+    from src.exchange.base import PositionInfo
+    pos = PositionInfo(symbol="ENAUSDT", direction="LONG", size=100,
+                       entry_price=1.0, mark_price=1.25, unrealized_pnl=25.0)
+    pm, ex = _make_pm([pos])
+    res = asyncio.run(pm.close_position_by_symbol("ENA"))
+    assert res["ok"] is True, res
+    assert res["symbol"] == "ENAUSDT"
+    assert res["size"] == 100
+    assert res["pnl"] == 25.0
+    assert "ENAUSDT" in ex.cancelled, "resting SL/TP not cancelled before close"
+    assert ex.closed == ("ENAUSDT", 100, 1.25), "close used wrong qty/price"
+
+
+def test_close_no_open_position_reports_cleanly():
+    pm, ex = _make_pm([])
+    res = asyncio.run(pm.close_position_by_symbol("BONKUSDT"))
+    assert res["ok"] is False
+    assert "No open position" in res["error"]
+
+
+def test_close_hash_symbol_and_usdt_variants():
+    from src.exchange.base import PositionInfo
+    pos = PositionInfo(symbol="ENAUSDT", direction="SHORT", size=50,
+                       entry_price=2.0, mark_price=1.25, unrealized_pnl=37.5)
+    pm, ex = _make_pm([pos])
+    # #ENA and ENAUSDT both resolve to the live ENAUSDT position
+    r1 = asyncio.run(pm.close_position_by_symbol("#ENA"))
+    r2 = asyncio.run(pm.close_position_by_symbol("ENAUSDT"))
+    assert r1["ok"] and r1["symbol"] == "ENAUSDT"
+    assert r2["ok"] and r2["size"] == 50

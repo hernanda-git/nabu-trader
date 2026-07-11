@@ -143,6 +143,8 @@ class SignalListener:
                 await self._handle_cancel(event)
             elif cmd == "/health":
                 await self._handle_health(event)
+            elif cmd.startswith("/close"):
+                await self._handle_close(event)
 
         await self.client.run_until_disconnected()
 
@@ -316,6 +318,7 @@ class SignalListener:
             "  /getport    — Show current margin per trade\n"
             "  /version    — Show bot version\n"
             "  /help       — Show this message\n\n"
+            "  /close <PAIR> — Immediately market-close an active trade (cancels its SL/TP)\n\n"
             f"Current port setting: `$ {port:.2f}` per trade\n\n"
             "The bot automatically processes signals from @YOUR_SIGNAL_CHANNEL and\n"
             "executes trades on Binance Futures when conditions are met."
@@ -442,3 +445,58 @@ class SignalListener:
         except Exception as e:
             log.exception("Failed to cancel signal")
             await event.reply(f"❌ **Error:** `{e}`")
+
+    async def _handle_close(self, event):
+        """Handle /close <PAIR> — manually close an active trade.
+
+        Accepts a full pair (ENAUSDT), a bare base (#ENA / ENA), or a quoted
+        pair. Cancels resting SL/TP orders, closes the position at market, and
+        replies with the result (fill price, size, realised PnL).
+        """
+        if not self.exchange:
+            await event.reply("❌ No exchange configured.")
+            return
+        parts = (event.message.text or "").strip().split()
+        if len(parts) < 2:
+            await event.reply(
+                "⚠️ **Usage:** `/close <pair>`\n\n"
+                "Examples:\n"
+                "  `/close ENAUSDT` — close the ENAUSDT position\n"
+                "  `/close ENA`     — same (auto-appends USDT)\n"
+                "  `/close #ENA`    — same\n\n"
+                "This immediately market-closes the position and cancels its\n"
+                "resting SL/TP orders."
+            )
+            return
+        symbol = parts[1].strip()
+        log.info("Command: /close %s", symbol)
+
+        pm = getattr(self.orchestrator, "position_manager", None)
+        if pm is None:
+            await event.reply("❌ Position manager not available.")
+            return
+        try:
+            res = await pm.close_position_by_symbol(symbol, reason="Manual close (/close command)")
+        except Exception as e:
+            log.exception("Failed to close %s", symbol)
+            await event.reply(f"❌ **Error closing {symbol}:** `{e}`")
+            return
+
+        if not res["ok"]:
+            await event.reply(
+                f"⚠️ **Could not close `{res['symbol']}`**\n\n"
+                f"_{res['error']}_"
+            )
+            return
+
+        side_emoji = "🟢" if res["side"] == "LONG" else "🔴"
+        pnl = res["pnl"]
+        pnl_str = f"`{pnl:+.2f}`" if pnl is not None else "—"
+        pnl_emoji = "🟢" if (pnl or 0) >= 0 else "🔴"
+        await event.reply(
+            f"✅ **Position closed**\n\n"
+            f"{side_emoji} `{res['symbol']}` `{res['side']}`\n"
+            f"   Size: `{res['size']:,.4f}`\n"
+            f"   {pnl_emoji} Realised PnL: `{pnl_str}`\n\n"
+            f"_Closed manually via /close command._"
+        )
