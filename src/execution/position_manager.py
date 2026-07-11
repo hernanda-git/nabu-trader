@@ -88,10 +88,13 @@ class PositionManager:
         # Check if SL/TP orders were filled by looking at open orders
         open_orders = await self.exchange.get_open_orders(pos.pair)
 
-        # Check if the position still has open SL/TP orders
-        # If all SL/TP are filled/removed, the position may need closing
-        sl_ok = any(o.type in ("STOP_LOSS", "STOP_LOSS_LIMIT") for o in open_orders)
-        tp_count = sum(1 for o in open_orders if o.type == "LIMIT")
+        # Check if the position still has open SL/TP orders.
+        # Binance returns conditional orders with type "STOP" (SL) and
+        # "TAKE_PROFIT" (TP) — recognize those, plus the spot/legacy variants
+        # and the resting Basic-tab LIMIT used as the TP fallback.
+        sl_ok = any(o.type in ("STOP_LOSS", "STOP_LOSS_LIMIT", "STOP") for o in open_orders)
+        tp_types = ("TAKE_PROFIT", "TAKE_PROFIT_LIMIT", "TAKE_PROFIT_MARKET", "LIMIT")
+        tp_count = sum(1 for o in open_orders if o.type in tp_types)
 
         log.debug("Position %s: open_orders=%d, sl_ok=%s, tp_orders=%d",
                   pos.pair, len(open_orders), sl_ok, tp_count)

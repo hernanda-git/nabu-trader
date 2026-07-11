@@ -140,9 +140,9 @@ FUTURES_ORDER_TYPES = {
     "MARKET": "MARKET",
     "LIMIT": "LIMIT",
     "STOP_LOSS": "STOP_MARKET",       # spot STOP_LOSS → futures STOP_MARKET
-    "STOP_LOSS_LIMIT": "STOP",        # less common
-    "TAKE_PROFIT": "TAKE_PROFIT_MARKET",
-    "TAKE_PROFIT_LIMIT": "TAKE_PROFIT",
+    "STOP_LOSS_LIMIT": "STOP",        # conditional STOP-LIMIT (futures "STOP")
+    "TAKE_PROFIT_LIMIT": "TAKE_PROFIT",  # conditional TP-LIMIT (futures "TAKE_PROFIT")
+    "TAKE_PROFIT": "TAKE_PROFIT_MARKET",  # spot TP → market (no price protection)
 }
 
 # ─── Symbol mapping: user-facing pair → actual Binance Futures symbol + price multiplier ──
@@ -798,7 +798,17 @@ class BinanceExchange(Exchange):
         mapped_type = self._map_type(order_type)
         symbol_key = resolve_sym
 
-        if self.futures and mapped_type not in {"MARKET", "LIMIT", "STOP_MARKET", "TAKE_PROFIT_MARKET", "TRAILING_STOP_MARKET"}:
+        # Allowed futures order types. STOP (conditional STOP-LIMIT) and
+        # TAKE_PROFIT (conditional TAKE_PROFIT-LIMIT) are valid Binance Futures
+        # types that appear in the "Conditional" tab and fill as LIMITs — this is
+        # exactly what stop_loss()/take_profit() intend. The market variants
+        # (STOP_MARKET / TAKE_PROFIT_MARKET) are allowed too but are NOT what
+        # SL/TP use here (they'd fill at market, no price protection).
+        _ALLOWED_FUTURES_TYPES = {
+            "MARKET", "LIMIT", "STOP", "TAKE_PROFIT",
+            "STOP_MARKET", "TAKE_PROFIT_MARKET", "TRAILING_STOP_MARKET",
+        }
+        if self.futures and mapped_type not in _ALLOWED_FUTURES_TYPES:
             return OrderInfo(
                 order_id="", symbol=symbol_key, side=side.upper(), type=mapped_type,
                 quantity=quantity, status="FAILED",
@@ -848,6 +858,10 @@ class BinanceExchange(Exchange):
 
         if mapped_type in ("LIMIT", "STOP", "TAKE_PROFIT"):
             params["timeInForce"] = "GTC"
+            # SL/TP on futures must be reduce-only so they can only close (never
+            # open/flip) the position. This is what makes them safe conditional
+            # exit orders rather than new entries.
+            params["reduceOnly"] = "true"
 
         try:
             data = await self._signed_request("POST", self._order_path(), params)
@@ -932,8 +946,10 @@ class BinanceExchange(Exchange):
         Uses TAKE_PROFIT (not TAKE_PROFIT_MARKET) so it appears in the
         Conditional tab and fills as a LIMIT order — no slippage.
         """
-        # TAKE_PROFIT-LIMIT: triggers at tp_price, fills as LIMIT at tp_price
-        return await self._place_order(symbol, side, "TAKE_PROFIT", quantity,
+        # TAKE_PROFIT-LIMIT: triggers at tp_price, fills as LIMIT at tp_price.
+        # Routed through the "TAKE_PROFIT_LIMIT" key so _map_type produces the
+        # conditional-limit Futures type (TAKE_PROFIT), NOT the market variant.
+        return await self._place_order(symbol, side, "TAKE_PROFIT_LIMIT", quantity,
                                        price=tp_price, stop_price=tp_price)
 
     async def cancel_order(self, symbol: str, order_id: str) -> bool:
