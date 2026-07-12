@@ -1,291 +1,950 @@
-#!/usr/bin/env python3
-"""
-Nabu Trader Channel Listener
-Real-time Telethon listener that monitors @Nabu Trader
-and forwards trade signals to Hermes Telegram chat.
-"""
+"""Telegram listener — monitors channel and feeds signals to the orchestrator."""
+
+from __future__ import annotations
 
 import asyncio
-import os
-import sys
-import re
-import json
 import logging
-from datetime import datetime, timezone
+import os
 from pathlib import Path
-from typing import Optional
 
 from dotenv import load_dotenv
 from telethon import TelegramClient, events
-from telethon.tl.types import Channel, MessageMediaPhoto, MessageMediaDocument
+from telethon.sessions import StringSession
 
-# ─── Config ────────────────────────────────────────────────────────────────────
-load_dotenv(Path(__file__).parent.parent / ".env")
+from src.exchange.base import Exchange
+from src.config.loader import get_session_dir
+from src.health.reporter import build_health_report
+from src.orchestrator import TradeOrchestrator
+from src.state.database import get_connection
+from src.state.db_admin import run_db_command
 
-API_ID = int(os.getenv("TG_API_ID", "0"))
-API_HASH = os.getenv("TG_API_HASH", "")
-CHANNEL = os.getenv("CHANNEL_USERNAME", "Nabu Trader")
-NOTIFY_CHAT_ID = int(os.getenv("NOTIFY_CHAT_ID", "0"))
-BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-
-SESSION_DIR = Path(__file__).parent.parent / "sessions"
-LOG_DIR = Path(__file__).parent.parent / "logs"
-SESSION_DIR.mkdir(exist_ok=True)
-LOG_DIR.mkdir(exist_ok=True)
-
-# ─── Logging ───────────────────────────────────────────────────────────────────
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[
-        logging.StreamHandler(sys.stdout),
-        logging.FileHandler(LOG_DIR / "listener.log"),
-    ],
-)
 log = logging.getLogger("listener")
 
-# ─── Signal Parser ─────────────────────────────────────────────────────────────
-# Pattern-based extraction + full text pass-through for agent processing
 
-PAIR_PATTERNS = [
-    re.compile(r"\b(BTC|ETH|BNB|SOL|XRP|ADA|DOGE|AVAX|DOT|LINK|ATOM|UNI|SHIB|PEPE|FIL|LTC|BCH|ETC|NEAR|APT|ARB|OP|SUI|SEI|TIA|INJ|FET|RENDER|WIF|BONK|JUP|PYTH|ONDO|OMNI|ENS|AAVE|MKR|CRV|SNX)\s*/?\s*(USDT|USD|BUSD|USDC|BTC|ETH)\b", re.I),
-    re.compile(r"\b([A-Z]{3,6})\s*(?:USDT|USD|BUSD)\b", re.I),
-    re.compile(r"[#$](\w{2,20})\b", re.I),
-    re.compile(r"\b([A-Z]{2,10})\b"),  # fallback: any all-caps word as ticker
-]
+def normalize_pair(raw: str) -> str:
+    """Normalize a user-supplied pair to a full futures symbol.
 
-DIRECTION_PATTERNS = [
-    re.compile(r"\b(buy|long|bullish|upside|Call)\b", re.I),
-    re.compile(r"\b(sell|short|bearish|downside|Put)\b", re.I),
-]
-
-ENTRY_PATTERNS = [
-    re.compile(r"(?:entry|enter|open|buy\s*at|sell\s*at|limit|@\s*)\s*[:\\-]?\s*([\d,]+\.?\d*)", re.I),
-    re.compile(r"(?:zone|range|area)\s*[:\\-]?\s*([\d,]+\.?\d*)", re.I),
-]
-
-SL_PATTERNS = [
-    re.compile(r"(?:sl|stop\s*(?:loss)?|stoploss)\s*[:\-]?\s*([\d,]+\.?\d*)", re.I),
-    re.compile(r"(?:invalidat|invalid)\s*[:\-]?\s*([\d,]+\.?\d*)", re.I),
-]
-
-TP_PATTERNS = [
-    re.compile(r"(?:tp\s*1?|take\s*profit\s*1?|target\s*1?|tgt\s*1?)\s*[:\-]?\s*([\d,]+\.?\d*)", re.I),
-    re.compile(r"(?:tp\s*2|take\s*profit\s*2|target\s*2|tgt\s*2)\s*[:\-]?\s*([\d,]+\.?\d*)", re.I),
-    re.compile(r"(?:tp\s*3|take\s*profit\s*3|target\s*3|tgt\s*3)\s*[:\-]?\s*([\d,]+\.?\d*)", re.I),
-]
+    Accepts a bare base (``BTC``), a base with ``#``/``$`` prefix
+    (``#BTC``), or an already-quoted pair (``BTCUSDT``). Appends ``USDT``
+    for bare bases, using the live SymbolRegistry when available (so e.g.
+    ``PEPE`` → ``1000PEPEUSDT`` resolves correctly). Returns ``""`` for
+    empty input.
+    """
+    s = (raw or "").strip().upper().lstrip("#").lstrip("$").strip()
+    if not s:
+        return ""
+    if s.endswith(("USDT", "USD", "BUSD", "USDC")):
+        return s
+    try:
+        from src.exchange.symbol_registry import get_registry
+    except ImportError:
+        get_registry = None
+    registry = get_registry() if get_registry else None
+    if registry and registry.is_ready:
+        resolved, _ = registry.resolve(s)
+        if resolved:
+            return resolved
+    return f"{s}USDT"
 
 
-def parse_signal(text: str) -> dict:
-    """Extract trade signal components from message text."""
-    if not text:
-        return {}
+def parse_positions_add(args: list[str]) -> dict:
+    """Parse ``/positions add`` arguments into a structured, validated plan.
 
-    signal = {"raw_text": text.strip()}
+    Pure and side-effect-free so it can be unit-tested without Telegram or
+    an exchange connection.
 
-    # Pair
-    for pat in PAIR_PATTERNS:
-        m = pat.search(text)
-        if m:
-            signal["pair"] = m.group(0).strip().upper()
-            break
+    Accepted grammar (the optional side may be omitted — it is then
+    inferred from the limit price vs. market):
 
-    # Direction
-    for pat in DIRECTION_PATTERNS:
-        m = pat.search(text)
-        if m:
-            direction = m.group(1).lower()
-            signal["direction"] = "LONG" if direction in ("buy", "long", "bullish", "upside", "call") else "SHORT"
-            break
+        /positions add [LONG|SHORT] <pair> <margin_usdt> <leverage> \\
+                       <price|market> [tp] [sl]
 
-    # Entry
-    for pat in ENTRY_PATTERNS:
-        m = pat.search(text)
-        if m:
-            signal["entry"] = m.group(1).replace(",", "")
-            break
+    Returns ``{"ok": True, "side", "pair", "margin_usdt", "leverage",
+    "price", "market", "tp", "sl"}`` on success, or
+    ``{"ok": False, "error": <str>}`` on any parse/validation failure.
+    ``side`` is ``None`` when it must be inferred at runtime; ``price`` is
+    ``None`` for a ``market`` entry; ``tp``/``sl`` are ``None`` when omitted.
+    """
+    if not args:
+        return {"ok": False, "error": "missing arguments"}
+    toks = [a for a in args if a != ""]
+    # Optional leading side token.
+    side: str | None = None
+    if toks and toks[0].upper() in ("LONG", "SHORT"):
+        side = toks[0].upper()
+        toks = toks[1:]
+    if len(toks) < 4:
+        return {
+            "ok": False,
+            "error": (
+                "expected: add [LONG|SHORT] <pair> <margin> <leverage> "
+                "<price|market> [tp] [sl]"
+            ),
+        }
+    pair_raw, margin_tok, lev_tok, price_tok = toks[0], toks[1], toks[2], toks[3]
+    opt = toks[4:]
 
-    # Stop Loss
-    for pat in SL_PATTERNS:
-        m = pat.search(text)
-        if m:
-            signal["sl"] = m.group(1).replace(",", "")
-            break
+    pair = normalize_pair(pair_raw)
+    if not pair:
+        return {"ok": False, "error": f"invalid pair: {pair_raw!r}"}
 
-    # Take Profits
-    tps = []
-    for pat in TP_PATTERNS:
-        m = pat.search(text)
-        if m:
-            tps.append(m.group(1).replace(",", ""))
-    if tps:
-        signal["tps"] = tps
+    # Margin (USDT) — positive, with a sane upper guard against fat-fingers.
+    try:
+        margin = float(margin_tok)
+    except ValueError:
+        return {"ok": False, "error": f"invalid margin: {margin_tok!r} (expected a number)"}
+    if margin <= 0:
+        return {"ok": False, "error": "margin must be > 0"}
+    if margin > 100_000:
+        return {"ok": False, "error": "margin > $100k rejected (use a smaller value)"}
 
-    return signal
+    # Leverage.
+    try:
+        leverage = int(float(lev_tok))
+    except ValueError:
+        return {"ok": False, "error": f"invalid leverage: {lev_tok!r} (expected an integer)"}
+    if leverage < 1:
+        return {"ok": False, "error": "leverage must be >= 1"}
+    if leverage > 125:
+        return {"ok": False, "error": "leverage must be <= 125 (Binance max)"}
 
+    # Entry price or market.
+    is_market = price_tok.lower() == "market"
+    price: float | None = None
+    if not is_market:
+        try:
+            price = float(price_tok)
+        except ValueError:
+            return {
+                "ok": False,
+                "error": f"invalid price: {price_tok!r} (expected a number or 'market')",
+            }
+        if price <= 0:
+            return {"ok": False, "error": "price must be > 0"}
 
-def format_signal(signal: dict, original_text: str, has_media: bool = False) -> str:
-    """Format parsed signal for Telegram notification."""
-    pair = signal.get("pair", "❓")
-    direction = signal.get("direction", "❓")
-    entry = signal.get("entry", "—")
-    sl = signal.get("sl", "—")
-    tps = signal.get("tps", [])
+    # Optional TP / SL.
+    tp: float | None = None
+    sl: float | None = None
+    if len(opt) >= 1:
+        try:
+            tp = float(opt[0])
+        except ValueError:
+            return {"ok": False, "error": f"invalid tp: {opt[0]!r} (expected a number)"}
+        if tp <= 0:
+            return {"ok": False, "error": "tp must be > 0"}
+    if len(opt) >= 2:
+        try:
+            sl = float(opt[1])
+        except ValueError:
+            return {"ok": False, "error": f"invalid sl: {opt[1]!r} (expected a number)"}
+        if sl <= 0:
+            return {"ok": False, "error": "sl must be > 0"}
 
-    # Emoji
-    if direction == "LONG":
-        emoji = "🟢"
-        dir_text = "LONG (Buy)"
-    elif direction == "SHORT":
-        emoji = "🔴"
-        dir_text = "SHORT (Sell)"
-    else:
-        emoji = "⚡"
-        dir_text = "Unknown"
-
-    # Build message
-    lines = [
-        f"{emoji} **SIGNAL — {pair}**",
-        f"📊 **Direction:** {dir_text}",
-        f"💰 **Entry:** `{entry}`",
-        f"🛑 **Stop Loss:** `{sl}`",
-    ]
-
-    if tps:
-        for i, tp in enumerate(tps, 1):
-            lines.append(f"🎯 **TP{i}:** `{tp}`")
-
-    if has_media:
-        lines.append("📷 _Contains image/media_")
-
-    lines.append("")
-    lines.append(f"📝 _{original_text[:300]}_")
-    lines.append(f"🕐 _{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}_")
-
-    return "\n".join(lines)
-
-
-# ─── Notifier ──────────────────────────────────────────────────────────────────
-
-async def notify_hermes(message: str):
-    """Send notification to Hermes Telegram chat via Bot API."""
-    if not BOT_TOKEN:
-        log.warning("No BOT_TOKEN set — printing to stdout only")
-        print(f"\n{'='*60}\n{message}\n{'='*60}\n")
-        return
-
-    import httpx
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": NOTIFY_CHAT_ID,
-        "text": message,
-        "parse_mode": "Markdown",
-        "disable_web_page_preview": True,
+    return {
+        "ok": True,
+        "side": side,
+        "pair": pair,
+        "margin_usdt": margin,
+        "leverage": leverage,
+        "price": price,
+        "market": is_market,
+        "tp": tp,
+        "sl": sl,
     }
-    async with httpx.AsyncClient() as client:
-        resp = await client.post(url, json=payload, timeout=10)
-        if resp.status_code == 200:
-            log.info("Notification sent to Hermes chat")
+
+
+def fmt_price(val: float) -> str:
+    """Format a price with sensible precision for display."""
+    if val <= 0:
+        return "—"
+    if val < 0.001:
+        return f"{val:.8f}"
+    if val < 1:
+        return f"{val:.6f}"
+    return f"{val:.4f}"
+
+
+class SignalListener:
+    """Telethon-based listener that forwards messages to the orchestrator."""
+
+    def __init__(self, orchestrator: TradeOrchestrator, config: dict, exchange: Exchange | None = None, version: str | None = None, notifier: "TelegramNotifier | None" = None):
+        self.orchestrator = orchestrator
+        self.config = config
+        self.exchange = exchange or getattr(orchestrator, 'exchange', None)
+        self.version = version
+
+        # Load Telegram API credentials
+        load_dotenv(Path(__file__).parent.parent / ".env")
+        api_id = int(os.getenv("TG_API_ID", "0"))
+        api_hash = os.getenv("TG_API_HASH", "")
+        channel = os.getenv("CHANNEL_USERNAME", "YOUR_SIGNAL_CHANNEL")
+        session_dir = get_session_dir()
+        session_dir.mkdir(parents=True, exist_ok=True)
+
+        self.channel = channel
+        self.notifier = notifier
+        self.version = version
+
+        # Session: prefer a StringSession secret (for headless/container
+        # deployments) so we never fall back to an interactive login prompt,
+        # which crashes the process when there is no TTY.
+        session_str = os.getenv("SESSION_STRING", "")
+        if session_str:
+            session = StringSession(session_str)
+            log.info("Using StringSession from SESSION_STRING secret")
         else:
-            log.error(f"Notification failed: {resp.status_code} — {resp.text}")
+            session = str(session_dir / "nabu")
+            log.info("Using file session at %s", session)
+        self.client = TelegramClient(session, api_id, api_hash)
 
+    async def start(self):
+        """Start listening."""
+        log.info("=" * 60)
+        log.info("Signal Listener starting...")
+        log.info("Channel: @%s", self.channel)
+        log.info("Auto-trade: %s", self.config.get("agent", {}).get("auto_trade", False))
+        log.info("=" * 60)
 
-# ─── Main Listener ─────────────────────────────────────────────────────────────
+        # Connect WITHOUT an interactive prompt (headless-safe). Then verify
+        # the session is actually authorized; if not, fail fast with a clear
+        # message instead of crashing on a hidden login prompt.
+        await self.client.connect()
+        if not await self.client.is_user_authorized():
+            raise RuntimeError(
+                "Telethon session is NOT authorized. Set the SESSION_STRING Fly "
+                "secret (generate once via `python scripts/gen_session.py`)."
+            )
+        me = await self.client.get_me()
+        log.info("Connected as: %s (ID: %s)", me.first_name, me.id)
 
-# Store processed message IDs to avoid duplicates
-seen_messages = set()
+        # Announce "Online" ONLY after a successful connection, so a crash
+        # during startup can never spam the deployment notification.
+        if self.notifier is not None:
+            await self.notifier.notify_startup(version=self.version)
 
-client = TelegramClient(
-    str(SESSION_DIR / "nabu"),
-    API_ID,
-    API_HASH,
-)
+        # Verify channel access
+        try:
+            channel = await self.client.get_entity(self.channel)
+            log.info("Channel found: %s (ID: %s)", channel.title, channel.id)
+        except Exception as e:
+            log.error("Cannot access @%s: %s", self.channel, e)
+            return
 
+        # Register handlers
+        @self.client.on(events.NewMessage(chats=self.channel))
+        async def on_new_message(event):
+            msg = event.message
+            text = msg.text or msg.message or ""
+            log.info("New message #%s | %d chars", msg.id, len(text))
+            reply_ctx = await self._resolve_reply_context(msg)
+            await self.orchestrator.handle_signal(
+                message_id=msg.id,
+                channel=self.channel,
+                raw_text=text,
+                has_media=msg.media is not None,
+                reply_to_message_id=reply_ctx.get("reply_to_message_id"),
+                reply_pair=reply_ctx.get("reply_pair"),
+            )
 
-@client.on(events.NewMessage(chats=CHANNEL))
-async def on_new_message(event):
-    """Handle new messages from @Nabu Trader channel."""
-    msg = event.message
-    msg_id = msg.id
+        @self.client.on(events.MessageEdited(chats=self.channel))
+        async def on_edited(event):
+            msg = event.message
+            text = msg.text or msg.message or ""
+            log.info("Edited message #%s", msg.id)
+            reply_ctx = await self._resolve_reply_context(msg)
+            await self.orchestrator.handle_signal(
+                message_id=msg.id,
+                channel=self.channel,
+                raw_text=text,
+                has_media=msg.media is not None,
+                reply_to_message_id=reply_ctx.get("reply_to_message_id"),
+                reply_pair=reply_ctx.get("reply_pair"),
+            )
 
-    # Dedup
-    if msg_id in seen_messages:
-        return
-    seen_messages.add(msg_id)
+        log.info("Listening for new messages... (Ctrl+C to stop)")
 
-    text = msg.text or msg.message or ""
-    has_media = msg.media is not None
-    is_forward = msg.forward is not None
+        # ── Register command handlers (private chat only) ─────────────
+        @self.client.on(events.NewMessage(outgoing=True, pattern=r"^/"))
+        async def on_command(event):
+            cmd = (event.message.text or "").strip().lower()
+            # Only respond in private chats (Saved Messages / bot DMs)
+            if not event.is_private:
+                return
+            if cmd == "/positions":
+                await self._handle_positions(event)
+            elif cmd == "/balance":
+                await self._handle_balance(event)
+            elif cmd == "/help":
+                await self._handle_help(event)
+            elif cmd == "/version":
+                await self._handle_version(event)
+            elif cmd.startswith("/setport"):
+                await self._handle_setport(event)
+            elif cmd == "/getport":
+                await self._handle_getport(event)
+            elif cmd == "/pending":
+                await self._handle_pending(event)
+            elif cmd.startswith("/cancel"):
+                await self._handle_cancel(event)
+            elif cmd == "/health":
+                await self._handle_health(event)
+            elif cmd.startswith("/close"):
+                await self._handle_close(event)
+            elif cmd.startswith("/db"):
+                await self._handle_db(event)
+            elif cmd.startswith("/check"):
+                await self._handle_check(event)
 
-    log.info(f"New message #{msg_id} | text={len(text)} chars | media={has_media} | forward={is_forward}")
+        await self.client.run_until_disconnected()
 
-    # Parse signal
-    signal = parse_signal(text)
+    async def _resolve_reply_context(self, msg) -> dict:
+        """Extract reply context so management commands (e.g. 'sl to entry')
 
-    # Check if it looks like a trade signal
-    is_signal = any(k in signal for k in ("pair", "direction", "entry"))
+        can be attributed to the trade they reply to.
 
-    if is_signal:
-        notification = format_signal(signal, text, has_media)
-        log.info(f"Signal detected: {signal.get('pair', '?')} {signal.get('direction', '?')}")
-    else:
-        # Non-signal post — still forward as info
-        preview = text[:200] if text else "(media/forwarded message)"
-        notification = (
-            f"📢 **New post from @Nabu Trader**\n\n"
-            f"{preview}\n\n"
-            f"🕐 _{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}_"
+        Returns ``{"reply_to_message_id": int|None, "reply_pair": str|None}``.
+        The reply_pair is resolved by re-parsing the replied-to message text
+        through the same SymbolRegistry pair resolver used for signals.
+        """
+        reply_to = getattr(msg, "reply_to", None)
+        if not reply_to:
+            return {"reply_to_message_id": None, "reply_pair": None}
+
+        reply_id = getattr(reply_to, "reply_to_msg_id", None)
+        reply_pair = None
+        try:
+            original = await msg.get_reply_message()
+            if original:
+                orig_text = original.text or original.message or ""
+                if orig_text:
+                    from src.agent.parser import _resolve_pair
+                    reply_pair = _resolve_pair(orig_text)
+        except Exception as e:  # noqa: BLE001
+            log.debug("Failed to resolve reply context: %s", e)
+
+        return {"reply_to_message_id": reply_id, "reply_pair": reply_pair}
+
+    async def stop(self):
+        """Stop listening."""
+        await self.client.disconnect()
+        log.info("Listener stopped")
+
+    # ── Command handlers ──────────────────────────────────────────────────
+
+    async def _handle_positions(self, event):
+        """Handle /positions — show open futures positions from exchange."""
+        if not self.exchange:
+            await event.reply("❌ No exchange configured.")
+            return
+        log.info("Command: /positions")
+        try:
+            positions = await self.exchange.get_positions()
+            if not positions:
+                await event.reply(
+                    "📭 **No open positions**\n\n"
+                    "No active futures positions found on Binance."
+                )
+                return
+
+            # Fetch balance for context
+            try:
+                bal = await self.exchange.get_balance()
+                total_balance = bal.total_usdt
+                free_balance = bal.free_usdt
+            except Exception:
+                total_balance = 0
+                free_balance = 0
+
+            # Fetch current prices for all position symbols in one call
+            price_map: dict[str, float] = {}
+            for p in positions:
+                try:
+                    price = await self.exchange.get_mark_price(p.symbol)
+                    if price and price > 0:
+                        price_map[p.symbol] = price
+                except Exception:
+                    pass
+
+            # Build the message
+            total_margin = 0.0
+            total_pnl = 0.0
+            lines = ["💼 **Open Positions**\n"]
+
+            for i, p in enumerate(positions, 1):
+                current_price = price_map.get(p.symbol, p.mark_price)
+                direction_emoji = "🟢" if p.direction == "LONG" else "🔴"
+                direction_label = "LONG ▲" if p.direction == "LONG" else "SHORT ▼"
+
+                # Calculate margin in use
+                margin_used = p.margin if p.margin > 0 else (p.notional / p.leverage if p.leverage > 0 else 0)
+                total_margin += margin_used
+                total_pnl += p.unrealized_pnl
+
+                # PnL styling
+                pnl_sign = "+" if p.unrealized_pnl >= 0 else ""
+                pnl_emoji = "🟢" if p.unrealized_pnl >= 0 else "🔴"
+
+                # Price change %
+                if p.entry_price > 0 and current_price > 0:
+                    if p.direction == "LONG":
+                        pct_change = ((current_price - p.entry_price) / p.entry_price) * 100
+                    else:
+                        pct_change = ((p.entry_price - current_price) / p.entry_price) * 100
+                    pct_str = f"{pnl_sign}{pct_change:.2f}%"
+                else:
+                    pct_str = "—"
+
+                # Format price with appropriate precision
+                def fmt_price(val):
+                    if val <= 0:
+                        return "—"
+                    if val < 0.001:
+                        return f"{val:.8f}"
+                    if val < 1:
+                        return f"{val:.6f}"
+                    return f"{val:.4f}"
+
+                lines.append(
+                    f"{direction_emoji} **{p.symbol}** · `{direction_label}`\n"
+                    f"   Entry `{fmt_price(p.entry_price)}` → Now `{fmt_price(current_price)}` ({pct_str})\n"
+                    f"   Size `{p.size:,.0f}` · Lev `{p.leverage}x` · Margin `${margin_used:.2f}`\n"
+                    f"   {pnl_emoji} PnL `${pnl_sign}{p.unrealized_pnl:.2f}`"
+                )
+
+            # Footer with account summary
+            used_pct = (total_margin / total_balance * 100) if total_balance > 0 else 0
+            lines.append("")
+            lines.append(
+                f"💰 Balance `${total_balance:.2f}` · "
+                f"Free `${free_balance:.2f}` · "
+                f"In use `${total_margin:.2f}` ({used_pct:.0f}%)"
+            )
+            if total_pnl != 0:
+                tp = "+" if total_pnl >= 0 else ""
+                te = "🟢" if total_pnl >= 0 else "🔴"
+                lines.append(f"{te} Total PnL `${tp}{total_pnl:.2f}`")
+
+            await event.reply("\n".join(lines))
+        except Exception as e:
+            log.exception("Failed to fetch positions")
+            await event.reply(f"❌ **Error fetching positions:** `{e}`")
+
+    async def _handle_check(self, event):
+        """Handle /check <pair> — show current price + 24h stats for a pair.
+
+        Usage:
+            /check btcusdt
+            /check #ETH
+            /check pepe           (auto-resolves to 1000PEPEUSDT)
+        """
+        if not self.exchange:
+            await event.reply("❌ No exchange configured.")
+            return
+        parts = (event.message.text or "").strip().split()
+        if len(parts) < 2:
+            await event.reply(
+                "⚠️ **Usage:** `/check <pair>`\n\n"
+                "Examples:\n"
+                "  `/check btcusdt`\n"
+                "  `/check #eth`\n"
+                "  `/check pepe`\n\n"
+                "Shows the current mark price, 24h change, high/low and volume."
+            )
+            return
+        raw = parts[1]
+        symbol = normalize_pair(raw)
+        log.info("Command: /check %s → %s", raw, symbol)
+        try:
+            ticker = await self.exchange.get_ticker(symbol)
+        except Exception as e:
+            log.exception("Failed to fetch ticker for %s", symbol)
+            await event.reply(f"❌ **Error fetching {symbol}:** `{e}`")
+            return
+        if ticker is None:
+            await event.reply(f"❌ Price feed not available for `{symbol}`.")
+            return
+        if ticker.error:
+            await event.reply(
+                f"❌ **Could not fetch `{symbol}`**\n`{ticker.error}`"
+            )
+            return
+
+        change = ticker.change_pct_24h
+        up = change >= 0
+        emoji = "🟢" if up else "🔴"
+        sign = "+" if up else ""
+        await event.reply(
+            f"💹 **{symbol}**\n\n"
+            f"   ├ Last: `{fmt_price(ticker.last_price)}`\n"
+            f"   ├ Mark: `{fmt_price(ticker.mark_price)}`\n"
+            f"   ├ 24h: {emoji} `{sign}{change:.2f}%`\n"
+            f"   ├ High: `{fmt_price(ticker.high_24h)}`\n"
+            f"   ├ Low:  `{fmt_price(ticker.low_24h)}`\n"
+            f"   └ Vol:  `${ticker.volume_24h:,.0f}` (24h)"
         )
-        log.info("Non-signal post forwarded")
 
-    await notify_hermes(notification)
+    async def _handle_positions_add(self, event):
+        """Handle ``/positions add ...`` — open a new futures position.
 
+        Grammar:
 
-@client.on(events.MessageEdited(chats=CHANNEL))
-async def on_message_edited(event):
-    """Handle edited messages (sometimes signals get updated)."""
-    msg = event.message
-    text = msg.text or msg.message or ""
+            /positions add [LONG|SHORT] <pair> <margin_usdt> <leverage> \\
+                           <price|market> [tp] [sl]
 
-    log.info(f"Message #{msg.id} edited")
+        - Side is required when using ``market`` (a market order needs to know
+          whether to buy or sell). For a limit ``price`` the side is *inferred*
+          from the book: a buy-limit below market = LONG, a sell-limit above
+          market = SHORT (rejected if the price is on the wrong side of market).
+        - Margin is the USDT margin budget; position notional = margin × leverage.
+        - On a market fill, SL/TP conditional orders are attached automatically.
+        - A resting limit order is placed and left on the book (no DB position
+          until it fills) so the position manager never spuriously closes it.
+        """
+        if not self.exchange:
+            await event.reply("❌ No exchange configured.")
+            return
+        # text after "/positions"
+        rest = (event.message.text or "")[len("/positions"):].strip()
+        toks = rest.split()
+        # First token MUST be "add".
+        if not toks or toks[0].lower() != "add":
+            await event.reply(
+                "⚠️ **Usage:** `/positions add [LONG|SHORT] <pair> <margin> "
+                "<leverage> <price|market> [tp] [sl]`\n\n"
+                "Examples:\n"
+                "  `/positions add btcusdt 10 20 60000 65000 58000`\n"
+                "  `/positions add LONG ethusdt 5 10 market 3500 3200`\n"
+                "  `/positions add pepe 5 20 0.000012 market`"
+            )
+            return
 
-    signal = parse_signal(text)
-    if any(k in signal for k in ("pair", "direction", "entry")):
-        notification = (
-            f"✏️ **SIGNAL UPDATED**\n\n"
-            f"{format_signal(signal, text, msg.media is not None)}"
+        plan = parse_positions_add(toks[1:])
+        if not plan["ok"]:
+            await event.reply(f"⚠️ **Invalid command:** {plan['error']}")
+            return
+
+        symbol = plan["pair"]
+        margin = plan["margin_usdt"]
+        leverage = plan["leverage"]
+        is_market = plan["market"]
+        price = plan["price"]
+        log.info(
+            "Command: /positions add %s margin=$%.2f lev=%dx market=%s price=%s",
+            symbol, margin, leverage, is_market, price,
         )
-        await notify_hermes(notification)
 
+        # ── Resolve side (explicit, or inferred from limit price vs market) ──
+        side = plan["side"]
+        mark_price = None
+        if side is None:
+            if is_market:
+                await event.reply(
+                    "⚠️ **Side required for a market entry.**\n"
+                    "Use LONG or SHORT, e.g. `/positions add LONG btcusdt 10 20 market`."
+                )
+                return
+            # Limit order — infer side from price vs. current market.
+            try:
+                mark_price = await self.exchange.get_mark_price(symbol)
+            except Exception as e:
+                log.warning("Could not fetch mark price for %s: %s", symbol, e)
+            if not mark_price or mark_price <= 0:
+                await event.reply(
+                    f"⚠️ **Cannot infer side for {symbol}** — no market price "
+                    f"available. Use an explicit LONG/SHORT side."
+                )
+                return
+            if price < mark_price:
+                side = "LONG"        # buy the dip
+            elif price > mark_price:
+                side = "SHORT"       # sell the rip
+            else:
+                await event.reply(
+                    f"⚠️ Limit price `{fmt_price(price)}` equals mark "
+                    f"`{fmt_price(mark_price)}` — use `market` or a clearly "
+                    f"different limit price."
+                )
+                return
 
-async def main():
-    """Start the listener."""
-    log.info("=" * 60)
-    log.info("Nabu Trader Listener starting...")
-    log.info(f"Channel: @{CHANNEL}")
-    log.info(f"Notify chat: {NOTIFY_CHAT_ID}")
-    log.info(f"Bot token: {'SET' if BOT_TOKEN else 'NOT SET (stdout only)'}")
-    log.info("=" * 60)
+        exchange_side = "BUY" if side == "LONG" else "SELL"
+        notional = margin * leverage
+        # Position size in base asset = notional / entry price.
+        entry_ref = price if not is_market else (mark_price or 0)
+        if entry_ref <= 0:
+            try:
+                entry_ref = await self.exchange.get_mark_price(symbol) or 0
+            except Exception:
+                entry_ref = 0
+        if entry_ref <= 0:
+            await event.reply(
+                f"❌ **Cannot size {symbol}** — no reference price available."
+            )
+            return
+        quantity = notional / entry_ref
 
-    await client.start()
-    me = await client.get_me()
-    log.info(f"Connected as: {me.first_name} (ID: {me.id})")
+        # ── Pre-flight: symbol readiness + balance ────────────────────────
+        if not is_market:
+            if not await self.exchange._preflight_symbol(symbol):  # noqa: SLF001
+                await event.reply(
+                    f"❌ **{symbol}** is not available for futures trading."
+                )
+                return
+        try:
+            bal = await self.exchange.get_balance()
+            free = bal.free_usdt
+        except Exception:
+            free = None
+        if free is not None and margin > free:
+            await event.reply(
+                f"❌ **Insufficient margin:** need `${margin:.2f}` but only "
+                f"`${free:.2f}` free. Reduce margin or leverage."
+            )
+            return
 
-    # Verify channel access
-    try:
-        channel = await client.get_entity(CHANNEL)
-        log.info(f"Channel found: {channel.title} (ID: {channel.id})")
-    except Exception as e:
-        log.error(f"Cannot access @{CHANNEL}: {e}")
-        log.info("Make sure the channel is public and accessible")
-        return
+        # ── Set leverage + margin type, then place the entry order ──────────
+        try:
+            if getattr(self.exchange, "futures", False):
+                await self.exchange.set_symbol_leverage(symbol, leverage)
+                margin_type = self.config.get("risk", {}).get("margin_type", "ISOLATED")
+                await self.exchange.set_margin_type(symbol, margin_type)
 
-    log.info("Listening for new messages... (Ctrl+C to stop)")
-    await client.run_until_disconnected()
+            entry_order: OrderInfo
+            if is_market:
+                entry_order = (
+                    await self.exchange.market_buy(symbol, quantity)
+                    if exchange_side == "BUY"
+                    else await self.exchange.market_sell(symbol, quantity)
+                )
+            else:
+                entry_order = (
+                    await self.exchange.limit_buy(symbol, quantity, price)
+                    if exchange_side == "BUY"
+                    else await self.exchange.limit_sell(symbol, quantity, price)
+                )
+        except Exception as e:
+            log.exception("Failed to place entry order for %s", symbol)
+            await event.reply(
+                f"❌ **Failed to place order — {symbol}**\n`{e}`"
+            )
+            return
 
+        if entry_order.status in ("FAILED", "REJECTED", "EXPIRED"):
+            await event.reply(
+                f"❌ **Order rejected — {symbol}**\n"
+                f"```{entry_order.error or 'unknown error'}```"
+            )
+            return
 
-if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        log.info("Listener stopped by user")
+        # ── Handle outcomes ───────────────────────────────────────────────
+        if is_market or entry_order.status == "FILLED":
+            # Filled (market, or limit that immediately filled).
+            fill_price = entry_order.avg_price or entry_order.price or entry_ref
+            filled_qty = entry_order.filled_quantity or quantity
+
+            # Attach SL/TP conditional orders (mirrors the signal pipeline).
+            tp_placed = sl_placed = False
+            if plan["sl"]:
+                sl_side = "SELL" if side == "LONG" else "BUY"
+                sl_o = await self.exchange.stop_loss(symbol, filled_qty, plan["sl"], sl_side)
+                sl_placed = bool(sl_o.order_id)
+            if plan["tp"]:
+                tp_side = "SELL" if side == "LONG" else "BUY"
+                tp_o = await self.exchange.take_profit(symbol, filled_qty, plan["tp"], tp_side)
+                if not tp_o.order_id:
+                    # Some contracts block conditional TP — fall back to Basic LIMIT.
+                    if tp_side == "SELL":
+                        tp_o = await self.exchange.limit_sell(symbol, filled_qty, plan["tp"])
+                    else:
+                        tp_o = await self.exchange.limit_buy(symbol, filled_qty, plan["tp"])
+                tp_placed = bool(tp_o.order_id)
+
+            # Register the position in the local DB so /close and /positions track it.
+            pm = getattr(self.orchestrator, "position_repo", None)
+            if pm is not None:
+                try:
+                    from src.domain.models import Position
+                    pm.create(Position(
+                        pair=symbol,
+                        direction=side,
+                        entry_price=fill_price,
+                        quantity=filled_qty,
+                        sl_price=plan["sl"],
+                        tp_prices=[plan["tp"]] if plan["tp"] else [],
+                        entry_order_id=entry_order.order_id,
+                    ))
+                    log.info("Registered position %s in DB (manual entry)", symbol)
+                except Exception as e:
+                    log.warning("DB position registration failed for %s: %s", symbol, e)
+
+            await event.reply(
+                f"✅ **Position opened — {symbol}**\n"
+                f"   ├ Side: `{side}`\n"
+                f"   ├ Entry: `{fmt_price(fill_price)}`\n"
+                f"   ├ Size: `{filled_qty:,.4f}`\n"
+                f"   ├ Margin: `${margin:.2f}` @ `{leverage}x`\n"
+                f"   ├ Notional: `${notional:,.2f}`\n"
+                + (f"   ├ 🛡 SL: `{fmt_price(plan['sl'])}`\n" if plan["sl"] else "")
+                + (f"   └ 🎯 TP: `{fmt_price(plan['tp'])}`\n" if plan["tp"] else "")
+                + f"   └ Order: `{entry_order.order_id}`"
+            )
+            return
+
+        # Resting limit order (not yet filled) — leave it on the book.
+        await event.reply(
+            f"⏳ **Limit order placed — {symbol}**\n"
+            f"   ├ Side (inferred): `{side}`\n"
+            f"   ├ Limit: `{fmt_price(price)}`\n"
+            f"   ├ Size: `{quantity:,.4f}`\n"
+            f"   ├ Margin: `${margin:.2f}` @ `{leverage}x`\n"
+            f"   └ Order: `{entry_order.order_id}`\n\n"
+            f"_Waiting for price to reach the limit. It will fill automatically; "
+            f"no position is recorded until then._"
+        )
+
+    async def _handle_balance(self, event):
+        """Handle /balance — show account balance from exchange."""
+        if not self.exchange:
+            await event.reply("❌ No exchange configured.")
+            return
+        log.info("Command: /balance")
+        try:
+            bal = await self.exchange.get_balance()
+            lines = [
+                "💰 **Binance Futures — Account Balance**\n",
+                f"   ┣ 💵 Free: `{bal.free_usdt:.2f} USDT`",
+                f"   ┣ 💰 Total: `{bal.total_usdt:.2f} USDT`",
+            ]
+            if bal.assets:
+                for asset, details in bal.assets.items():
+                    if asset != "USDT":
+                        continue
+                    lines.append(f"   ┗ Unrealized PnL: `{details.get('unrealized_pnl', 0):+.2f} USDT`")
+            await event.reply("\n".join(lines))
+        except Exception as e:
+            log.exception("Failed to fetch balance")
+            await event.reply(f"❌ **Error fetching balance:** `{e}`")
+
+    async def _handle_help(self, event):
+        """Handle /help — list available commands."""
+        port = self.config.get("risk", {}).get("port_usdt", 1.0)
+        await event.reply(
+            "📋 **Available Commands**\n\n"
+            "  /check <pair> — Show current price + 24h stats for a pair\n"
+            "  /balance    — Show futures account balance\n"
+            "  /positions  — Show all open futures positions\n"
+            "  /positions add [LONG|SHORT] <pair> <margin> <lev> <price|market> [tp] [sl] — Open a position\n"
+            "  /pending    — List pending conditional signals\n"
+            "  /cancel <id> — Cancel a pending signal\n"
+            "  /cancel all — Cancel all pending signals\n"
+            "  /health     — Run full system health check\n"
+            "  /setport N  — Set margin per trade to $N\n"
+            "  /getport    — Show current margin per trade\n"
+            "  /version    — Show bot version\n"
+            "  /help       — Show this message\n\n"
+            "  /close <PAIR> — Immediately market-close an active trade (cancels its SL/TP)\n\n"
+            "  /db <cmd> — Browse/edit the trade DB. Subcommands:\n"
+            "    /db tables — list tables + row counts\n"
+            "    /db list <table> [page] — page through rows (10/page)\n"
+            "    /db get <table> <id> — one row by primary key\n"
+            "    /db delete <table> <id> — remove a row (needs `!` confirm)\n"
+            "    /db update <table> <id> <col>=<val> [...] — edit (needs `!`)\n"
+            "    /db insert <table> (<col>=<val>, ...) — add (needs `!`)\n\n"
+            f"Current port setting: `$ {port:.2f}` per trade\n\n"
+            "The bot automatically processes signals from @YOUR_SIGNAL_CHANNEL and\n"
+            "executes trades on Binance Futures when conditions are met."
+        )
+
+    async def _handle_health(self, event):
+        """Handle /health — run a full system health check across all subsystems."""
+        log.info("Command: /health")
+        lines, n_ok, n_fail = await build_health_report(self)
+        overall = "✅ ALL SYSTEMS OK" if n_fail == 0 else f"⚠️ {n_fail} ISSUE(S)"
+        header = f"🩺 **Health Check** — {overall}"
+        # build_health_report already prepends the header line; just reply
+        await event.reply("\n".join(lines))
+
+    async def _handle_version(self, event):
+        """Handle /version — show bot version."""
+        ver = self.version or "unknown"
+        await event.reply(
+            f"📦 **Crypto Signal Auto-Trade**\n\n"
+            f"Version: `{ver}`\n"
+            f"Mode: `{'🚀 YOLO auto-trade' if self.config.get('agent', {}).get('auto_trade') else '🔍 Dry run (no trades)'}`\n\n"
+            f"_Deployed on Fly.io (Singapore)_"
+        )
+
+    async def _handle_setport(self, event):
+        """Handle /setport N — change margin per trade to $N."""
+        parts = (event.message.text or "").strip().split()
+        if len(parts) < 2:
+            current = self.config.get("risk", {}).get("port_usdt", 1.0)
+            await event.reply(
+                f"⚠️ **Usage:** `/setport <value>`\n"
+                f"Current port: `$ {current:.2f}` per trade\n\n"
+                f"Example: `/setport 2` → use $2 margin per trade"
+            )
+            return
+        try:
+            new_port = float(parts[1])
+            if new_port <= 0:
+                await event.reply("❌ Port must be a positive number (e.g. `/setport 1`).")
+                return
+            if new_port > 100:
+                await event.reply("⚠️ Port > $100 is unusually high. Set it again to confirm.")
+                return
+            self.config.setdefault("risk", {})["port_usdt"] = new_port
+            log.info("Port per trade changed to $%.2f", new_port)
+            await event.reply(
+                f"✅ **Port updated**\n"
+                f"Margin per trade: `$ {new_port:.2f}`\n\n"
+                f"Leverage will auto-adjust on the next trade:\n"
+                f"  `pos_value / ${new_port:.2f} = lev`"
+            )
+        except ValueError:
+            await event.reply(f"❌ Invalid number: `{parts[1]}`. Use e.g. `/setport 2`.")
+
+    async def _handle_getport(self, event):
+        """Handle /getport — show current margin per trade."""
+        port = self.config.get("risk", {}).get("port_usdt", 1.0)
+        await event.reply(
+            f"💰 **Current Margin Per Trade**\n\n"
+            f"Port: `$ {port:.2f}`\n\n"
+            f"This is the margin budget per trade.\n"
+            f"Leverage = position value ÷ ${port:.2f}\n\n"
+            f"Change it with `/setport <value>`"
+        )
+
+    async def _handle_pending(self, event):
+        """Handle /pending — list all pending conditional signals."""
+        psr = getattr(self.orchestrator, 'pending_signal_repo', None)
+        if not psr:
+            await event.reply("❌ Pending signal repository not configured.")
+            return
+        log.info("Command: /pending")
+        try:
+            pending = psr.get_pending()
+            if not pending:
+                await event.reply("📭 **No pending conditions**\n\nNo conditional signals waiting to trigger.")
+                return
+            lines = ["⏳ **Pending Conditional Signals**\n"]
+            for ps in pending:
+                emoji = "🟢" if ps.direction == "LONG" else "🔴"
+                cond = "close >" if ps.condition_type == "close_above" else "close <"
+                lines.append(
+                    f"{emoji} **#{ps.id} — {ps.pair}**\n"
+                    f"   ├ Direction: `{ps.direction}`\n"
+                    f"   ├ Condition: `{cond}` `{ps.trigger_price:.8f}`\n"
+                    f"   ├ Timeframe: `{ps.timeframe}`\n"
+                    f"   └ Created: `{ps.created_at}`\n"
+                )
+            lines.append(f"Cancel: `/cancel <id>` or `/cancel all`")
+            await event.reply("\n".join(lines))
+        except Exception as e:
+            log.exception("Failed to fetch pending signals")
+            await event.reply(f"❌ **Error:** `{e}`")
+
+    async def _handle_cancel(self, event):
+        """Handle /cancel <id> or /cancel all — cancel pending signals."""
+        psr = getattr(self.orchestrator, 'pending_signal_repo', None)
+        if not psr:
+            await event.reply("❌ Pending signal repository not configured.")
+            return
+        parts = (event.message.text or "").strip().split()
+        if len(parts) < 2:
+            await event.reply(
+                "⚠️ **Usage:**\n"
+                "  `/cancel <id>` — cancel a specific signal\n"
+                "  `/cancel all` — cancel all pending signals"
+            )
+            return
+        target = parts[1].lower()
+        log.info("Command: /cancel %s", target)
+        try:
+            if target == "all":
+                count = psr.cancel_all()
+                await event.reply(f"✅ **Cancelled {count}** pending signal(s)." if count else "📭 No pending signals to cancel.")
+            else:
+                signal_id = int(target)
+                ok = psr.cancel(signal_id)
+                if ok:
+                    await event.reply(f"✅ **Cancelled signal #{signal_id}**")
+                else:
+                    await event.reply(f"⚠️ Signal #{signal_id} not found or already processed.")
+        except ValueError:
+            await event.reply(f"❌ Invalid ID: `{parts[1]}`. Use `/cancel <id>` or `/cancel all`.")
+        except Exception as e:
+            log.exception("Failed to cancel signal")
+            await event.reply(f"❌ **Error:** `{e}`")
+
+    async def _handle_close(self, event):
+        """Handle /close <PAIR> — manually close an active trade.
+
+        Accepts a full pair (ENAUSDT), a bare base (#ENA / ENA), or a quoted
+        pair. Cancels resting SL/TP orders, closes the position at market, and
+        replies with the result (fill price, size, realised PnL).
+        """
+        if not self.exchange:
+            await event.reply("❌ No exchange configured.")
+            return
+        parts = (event.message.text or "").strip().split()
+        if len(parts) < 2:
+            await event.reply(
+                "⚠️ **Usage:** `/close <pair>`\n\n"
+                "Examples:\n"
+                "  `/close ENAUSDT` — close the ENAUSDT position\n"
+                "  `/close ENA`     — same (auto-appends USDT)\n"
+                "  `/close #ENA`    — same\n\n"
+                "This immediately market-closes the position and cancels its\n"
+                "resting SL/TP orders."
+            )
+            return
+        symbol = parts[1].strip()
+        log.info("Command: /close %s", symbol)
+
+        pm = getattr(self.orchestrator, "position_manager", None)
+        if pm is None:
+            await event.reply("❌ Position manager not available.")
+            return
+        try:
+            res = await pm.close_position_by_symbol(symbol, reason="Manual close (/close command)")
+        except Exception as e:
+            log.exception("Failed to close %s", symbol)
+            await event.reply(f"❌ **Error closing {symbol}:** `{e}`")
+            return
+
+        if not res["ok"]:
+            await event.reply(
+                f"⚠️ **Could not close `{res['symbol']}`**\n\n"
+                f"_{res['error']}_"
+            )
+            return
+
+        side_emoji = "🟢" if res["side"] == "LONG" else "🔴"
+        pnl = res["pnl"]
+        pnl_str = f"`{pnl:+.2f}`" if pnl is not None else "—"
+        pnl_emoji = "🟢" if (pnl or 0) >= 0 else "🔴"
+        await event.reply(
+            f"✅ **Position closed**\n\n"
+            f"{side_emoji} `{res['symbol']}` `{res['side']}`\n"
+            f"   Size: `{res['size']:,.4f}`\n"
+            f"   {pnl_emoji} Realised PnL: `{pnl_str}`\n\n"
+            f"_Closed manually via /close command._"
+        )
+
+    async def _handle_db(self, event):
+        """Handle /db ... — browse and edit the trade SQLite DB.
+
+        Subcommands mirror a tiny SQL REPL but are safe by design: reads are
+        free, writes (delete/update/insert) require a confirmation pass. The
+        actual command logic lives in `src/state/db_admin.run_db_command` so it
+        is unit-testable without Telegram.
+        """
+        raw = (event.message.text or "")[len("/db"):]
+        log.info("Command: /db %s", raw.strip())
+        try:
+            conn = get_connection()
+            reply = run_db_command(conn, raw)
+        except Exception as e:  # noqa: BLE001
+            log.exception("Failed to run /db command")
+            reply = f"❌ **Error:** `{e}`"
+        await event.reply(reply)

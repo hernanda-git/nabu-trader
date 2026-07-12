@@ -1,0 +1,26 @@
+# Session files (Telegram auth)
+sessions/
+*.session
+*.session-journal
+
+# Database (auto-created)
+data/
+
+# Logs
+logs/
+*.log
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Environment (contains secrets)
+.env
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Hermes agent internals
+.hermes/

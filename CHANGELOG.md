@@ -1,0 +1,174 @@
+# Changelog
+
+All notable changes to this project are documented here.
+
+## Manual trade commands: `/check` + `/positions add` — 2026-07-12
+
+### Added
+- **`/check <pair>`** — fetch live price + 24h stats (last/mark price, %
+  change, high/low, volume) from the exchange `get_ticker()` adapter method.
+  New `Ticker` dataclass + `Exchange.get_ticker()` implemented on the
+  Binance (futures + spot) and Paper adapters.
+- **`/positions add`** — open a futures position manually from Telegram:
+  `/positions add [LONG|SHORT] <pair> <margin> <leverage> <price|market> [tp] [sl]`.
+  - Margin budget in USDT; notional = margin × leverage (bounded by free
+    balance and a $100k guard).
+  - Side required for `market` entries; for a limit `price` it is inferred
+    from the book (buy-limit below market = LONG, sell-limit above = SHORT).
+  - Market fill attaches SL/TP as conditional orders and registers the
+    position in the DB (so `/close` + `/positions` track it).
+  - Resting limit orders are left on the book with **no** DB position until
+    they fill (mirrors the signal pipeline; avoids spurious position-manager
+    closes of not-yet-open trades).
+- Pure, unit-tested `parse_positions_add()` + `normalize_pair()` helpers
+  (`tests/test_positions_add_command.py`, 24 cases) cover the grammar and
+  all validation failure modes.
+- `/check` and `/positions` registered in the Telegram command menu
+  (`TelegramNotifier.set_commands`) and documented in `/help` + README.
+
+### Safety notes
+- Never opens a position without an explicit or inferable side.
+- Market orders reject when no side is given.
+- Pre-flight checks the symbol is tradeable and that margin ≤ free balance.
+
+### Fixed
+- **DB nested at `/data/data/trades.db` (data-loss trap)**: `src/config/loader.py`
+  `get_data_dir()` appended `"data"` to a root that is already the mounted
+  volume (`DATA_ROOT=/data`), so the live SQLite DB landed one level too deep
+  while a stale, schema-less `/data/trades.db` sat at the intended path. On
+  Fly (`DATA_ROOT`/`FLY_MODE` set) the volume root now IS the data dir → the DB
+  is `/data/trades.db`. Local dev unchanged (`ROOT_DIR/data`). Migrated the live
+  DB (71 signals, 2 pending rows) with a `premigrate-<ts>` backup before
+  deleting the nested dir. Commit `66cf92b` (branch `fix/code-review-fixes`).
+
+### Added / Enriched
+- **Docs corrected**: `AGENTS.md` + `docs/DEPLOYMENT.md` now document the real
+  `/data/trades.db` path (was `/data/data/...`), the git-bash `flyctl` deploy
+  flow (was stale `deploy.sh`/WSL/PowerShell guidance), and a working
+  `flyctl ssh console` heredoc for balance checks (the old `-C 'python -c'`
+  nested-quote form breaks).
+- **`scripts/deploy_and_verify.sh`**: the standing "verify → commit → push →
+  deploy" helper referenced by `AGENTS.md` and the `crypto-auto-trader-reliability`
+  / `fly-bot-deploy-verify` Hermes skills.
+- **Two Hermes skills capture this session's operational knowledge**:
+  - `crypto-auto-trader-reliability` — order-fix *content* (conditional
+    SL/TP, `/close` maker-LIMIT root cause, `market_close`/`reduceOnly`/`-2022`,
+    and why conditional setups like the AAVE "look for long if above 95.45 on 4H"
+    message are parked pending, not failed).
+  - `fly-bot-deploy-verify` (devops) — the *deploy + live-verify loop*: run
+    verification Python *inside* the deployed container (live keys + new code)
+    to prove a fix against the real Binance account, incl. the
+    `/fapi/v1/order/test` param check and the ENAUSDT open→close round-trip.
+
+### Earlier this branch (fix/code-review-fixes)
+- `cada131` — `feat: /close <PAIR>` manual market-close command.
+- market_close fix commits — `/close` now closes immediately via a MARKET
+  order with `reduceOnly=true` (was a resting maker LIMIT at mark that never
+  filled); retries without `reduceOnly` on Binance `-2022`. Live-verified on
+  ENAUSDT (position gone after `/close`).
+- `503abda` — conditional SL/TP orders (`STOP`/`TAKE_PROFIT` conditional LIMIT,
+  not market).
+
+- **Failure alert now delivers**: the "Failed to place order" alert was wrapped in nested backticks, which Telegram rejected with *"can't parse entities"* — so failed-trade alerts were silently **undelivered** in prod. Now uses a fenced code block for the raw error. Added markdown-safety tests.
+
+## Trade Execution Reliability Pass — 2026-07-09 (APE-1111)
+
+### Fixed
+- **Wrong-symbol filter match (`s = rules[0]`)**: `_load_futures_filters` now matches the exchangeInfo entry by the resolved futures symbol (then raw symbol, then first) and captures `minNotional`. This was the root cause of APEUSDT inheriting BTCUSDT's `tickSize`/`minNotional` and getting rejected with `-1111`.
+- **`_round_price` magnitude-flip inflation**: the old clamp forced a valid price up to `minPrice` (e.g. `0.162 → 100`) when `minPrice` was bogus. It now only clamps down when `minPrice` is within ~10× the requested price.
+- **`_round_quantity` ignored `minNotional`**: now (a) rounds to the symbol's `stepSize` + integer lots, and (b) loops increasing qty until `qty × price ≥ minNotional` using the **real** filter value, so low-priced coins no longer get `-4164`.
+- **Non-idempotent LIMIT**: `OrderRepository.get_active_for_decision` + a dedup guard in `_enter_position` guarantee one active entry per decision. (The `client_order_id UNIQUE` constraint remains as a DB backstop.)
+
+### Added
+- **Pre-submission validation gate** (`src/exchange/validation.py`, `validate_order`): every order is checked for price precision, min/max price, minQty, integer lots, and minNotional, and wired into `order_service` before entry/SL/TP. Invalid orders are skipped (`VALIDATION_SKIP`), never sent.
+- **Dynamic leverage** from the real exchange `minNotional` + `config.risk`: `port_usdt`, `max_leverage` (ceiling 50), `max_leverage_increase_pct` (cap at `baseline×(1+pct%)`). No hardcoded 5/1/50 literals in the sizing math.
+- **Deterministic repair** (`_repair_order`): replaces the removed LLM fallback. On rejection it re-derives qty/price from filters, recomputes leverage, validates, and resubmits exactly once; gives up with `VALIDATION_SKIP` if it still can't validate. **The LLM bypass (security/randomness risk) is gone.**
+- **Pair-matrix regression** (`tests/exchange/test_pair_matrix.py`): BTC/ETH/APE/DOGE/1000PEPE all flow through the same validated pipeline.
+- **AGENTS.md runbook** documenting the single deterministic execution path, config knobs, and the deploy note.
+
+
+
+- **Guaranteed alert delivery**: `send_message` now retries as **plain text** if Telegram rejects the Markdown ("can't parse entities"). No notification is ever silently dropped again — this was the root cause of failed-trade alerts not reaching you.
+
+## [v59] — 2026-07-09
+
+### Fixed
+- **Root-cause `-1111` precision rejection (the lost UAIUSDT trade)**: outgoing LIMIT/STOP/TP **prices** are now rounded to the pair's `PRICE_FILTER.tickSize` (and clamped to `minPrice`/`maxPrice`), not just quantity. `_place_order` now calls a new `_round_price()`. Previously only `quantity` was rounded, so a price with too many decimals (e.g. `0.413` on a 4-decimal pair) was rejected by Binance with `-1111` and the trade was silently dropped. Deterministic tests prove the wire values now align to exchange precision.
+- **LLM fallback crash on empty reasoning-model response**: `_llm_fallback` no longer calls `json.loads("")` when the model returns empty `content` (deepseek-v4-flash occasionally does). It now warns and returns `None` (trade left, per policy — no retry), instead of throwing `Expecting value` and crashing the safety net. Added a one-shot JSON-only retry on a malformed-but-non-empty response.
+- **Reasoning-model `max_tokens` raised** `2048 → 4096` in `agent._call_llm` to avoid truncated/empty completions from deepseek-v4-flash.
+- **Failure notification copy**: "❌ Order failed" → "❌ Failed to place order" (still no retry; signal is left after normal pipeline + LLM fallback both fail, since the price may no longer be relevant).
+
+### Added
+- **Gateway proxy-awareness** (default OFF): `exchange.binance.proxy` config lets the listener route ALL Binance REST calls through a signed relay (the `binance-gateway` Fly app) so the Binance key lives only on the gateway. Prod stays direct (key in its own Fly secrets). `config.yaml` documents the block.
+
+
+
+### Added
+- **Conditional SL/TP orders**: `stop_loss()` now places a `STOP` (stop-limit) order → Binance **Conditional tab**, fills as LIMIT (no slippage). New `take_profit()` method places `TAKE_PROFIT` (tp-limit) → Conditional tab, LIMIT fill. Both appear in the Conditional tab, exactly as the user requested.
+- **Per-contract fallbacks** when a contract blocks `STOP`/`TAKE_PROFIT` (`-4120`): SL → position-manager mark-price monitoring (closes via LIMIT on breach); TP → resting Basic-tab `LIMIT` at the TP price. No order type silently drops — TP always works.
+- **LIMIT-order resting policy (user correction)**: Entry LIMIT now rests on the book at the specified price and waits for the market to reach it. No auto-adjustment to current price, no timeout cancellation. Returns `PENDING` status + "⏳ waiting for price" notification.
+- **LLM fallback on order failure (v52)**: `OrderService` calls `_llm_fallback()` on `FAILED`/`REJECTED`/`EXPIRED` — sends full error context (code, qty, price, notional, leverage, balance) to the LLM, which returns corrected params or `ABORT`. On success, notifies user with root cause + fix applied. Wired via `agent=` param in `main.py`.
+- **TA context for decisions (v46)**: New `src/agent/ta_context.py` fetches 100 candles and computes ATR(14), swing highs/lows, EMA20/50, Fib, round levels — injected into the LLM prompt **only when a signal lacks SL/TP**.
+- **Slash commands `/pending` and `/cancel`** (v50): list pending conditional signals, cancel one or all.
+- **API endpoints for manual trade + pending management (v50)**: `POST /api/v1/trade` (auto pair-resolves ticker → Binance symbol, auto-sizes leverage to meet $5 min notional, LIMIT entry/TP), `GET /api/v1/pending`, `POST /api/v1/pending/{id}/cancel`, `POST /api/v1/pending/cancel_all`.
+- **Improved `/positions` display (v51)**: live mark price, entry→now %, margin in use, account summary.
+- **User-friendly Binance error formatting (v49)**: maps error codes to human-readable messages with full context (symbol, side, qty, price, notional, leverage); strips raw URL/signature.
+- **Double-notification fix (v45)**: `content_hash` dedup on startup + Telegram `setMyCommands` so the menu doesn't re-trigger the handler.
+
+### Changed
+- **LIMIT-only order policy (HARD RULE)**: entry, close, SL, TP all LIMIT. No MARKET orders anywhere.
+- `stop_loss()` signature now accepts `stop_price` and emits `STOP` instead of `STOP_LOSS`/`STOP_MARKET`.
+- `OrderService` constructor accepts optional `agent` for LLM fallback.
+- `_enter_position` returns `PENDING` (not failure) when the LIMIT hasn't filled yet.
+
+### Fixed
+- `_row_to_position` crash on extra DB columns (v48) — now filters to `Position` dataclass fields.
+
+## [v44 and earlier]
+
+### Added
+- **Comprehensive trade DB**: 5 new tables (`llm_interactions`, `trade_logs`, `position_events`, `config_snapshots`) + correlation_id columns on existing tables
+- **Full LLM request/response capture**: Every LLM call records prompt, response, token counts, latency, and model to `llm_interactions` table
+- **Structured pipeline logging**: `trade_logs` table with correlation IDs, levels, module names, and JSON metadata for every pipeline step
+- **Position lifecycle events**: `position_events` table tracks POSITION_OPENED, SL_HIT, TP_HIT, TIME_EXIT, AUTO_DETECTED_CLOSE per position
+- **Config snapshots**: Point-in-time config.yaml dump tied to trades via `config_snapshots` table
+- **Correlation ID tracing**: Every pipeline run gets a unique correlation_id that flows through signal → decision → order → position → logs → events
+- **Secure API bridge** (`src/api/`): FastAPI server on port 9090 with:
+  - API key authentication (constant-time HMAC comparison)
+  - HMAC-SHA256 request signing for write operations
+  - Rate limiting (30 req/min per IP)
+  - 15 read-only query endpoints (stats, trades, positions, LLM search, logs, config, events)
+  - Live Binance balance proxy endpoint
+  - Auto-generated OpenAPI docs at /docs
+- **Webhook emitter** (`src/api/webhook.py`): Push trade events (TRADE_ENTERED, etc.) to configurable HTTP endpoint with HMAC signing
+- **Hermes skill** (`fly-trade-bridge`): `mlops/fly-trade-bridge` skill with query workflows, security setup, and Machines API exec fallback
+- **Auto-migration**: `_run_migrations()` safely adds new columns to existing databases without data loss
+- **Background API server**: uvicorn starts as asyncio task alongside the trading bot
+- **deploy.sh**: Auto-versioning WSL→Windows sync and Fly.io deploy script
+- **Startup notification**: Versioned deploy message sent to Telegram on each restart
+- **/version command**: Telegram slash command showing bot version and trade mode
+- **setMyCommands registration**: Bot commands appear in Telegram command menu
+
+### Fixed
+- **Multiple `len` bugs in API server**: Replaced bare `len` function references with `len(rows)` across all paginated endpoints
+- **Dockerfile accuracy**: Updated docs to match actual Dockerfile (system deps, COPY patterns, ENV vars)
+
+### Changed
+- **Agent brain** (`agent.py`): `_call_llm` now returns `(text, prompt_tokens, completion_tokens, latency_ms)`; `_last_interaction` dict stored on instance
+- **Orchestrator** (`orchestrator.py`): Early decision save + LLM interaction capture + structured trade logging + config snapshot on ENTER + webhook emission
+- **Order service** (`order_service.py`): `execute()` accepts optional `decision_id` parameter to support pre-saved decisions
+- **Position manager** (`position_manager.py`): Accepts `PositionEventRepository`, logs lifecycle events on all close paths
+- **State layer**: `repositories.py` has 11 repos (4 new), `database.py` has 14 tables + migrations
+- **Domain models** (`models.py`): 4 new dataclasses (LLMInteraction, TradeLogEntry, PositionEvent, ConfigSnapshot)
+- **config.yaml**: Added `api` and `webhook` configuration sections
+- **requirements.txt**: Added `fastapi>=0.110` and `uvicorn>=0.29`
+- **Documentation**: AGENTS.md, README.md, ARCHITECTURE.md, DEPLOYMENT.md, CHANGELOG.md all updated
+  Message: {raw signal text}
+  Reason to Skip: {reason}
+  Current Positions: {list or "(none)"}
+  Current Pendings: {list or "(none)"}
+  Balance: {balance}
+  ```
+- **Gate1 rejections silenced**: Pre-LLM safety gate rejections (vague signal, no direction, duplicate) are no longer sent to Telegram — expected noise from channels posting unparseable content. Previously these generated spam like `⏭️ Skipped (Signal unclear...)`.
+- **Empty skip reason handling**: When the LLM returns a SKIP action with no `reason` field, the notification now shows `⏭️ Skipped (no reason provided)` instead of `⏭️ Skipped ()`.
+- **AGENTS.md updated**: Comprehensive section on 1000x contract quirks, SL/TP compatibility matrix, and deploy process.
