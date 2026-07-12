@@ -761,6 +761,42 @@ class BinanceExchange(Exchange):
             log.warning("Failed to fetch mark price for %s: %s", symbol, e)
             return None
 
+    async def get_ticker(self, symbol: str) -> "Ticker | None":
+        """Get 24h ticker stats for a symbol from Binance Futures.
+
+        Returns a Ticker with last/mark price, 24h % change, high/low, and
+        quote volume. On a lookup failure returns a Ticker with ``error`` set
+        (never raises) so command handlers can surface a clean message.
+        """
+        from src.exchange.base import Ticker
+        resolve_sym, _, _ = _resolve_futures_symbol(symbol)
+        try:
+            if self.futures:
+                resp = await self._public_request(
+                    "GET", "/fapi/v1/ticker/24hr", {"symbol": resolve_sym}
+                )
+            else:
+                resp = await self._public_request(
+                    "GET", "/api/v3/ticker/24hr", {"symbol": resolve_sym}
+                )
+            if isinstance(resp, list):
+                # Binance can return a list when no symbol is passed; guard.
+                resp = resp[0] if resp else {}
+            if not resp:
+                return Ticker(symbol=resolve_sym, error=f"Empty ticker for {resolve_sym}")
+            return Ticker(
+                symbol=resolve_sym,
+                last_price=float(resp.get("lastPrice", 0)),
+                mark_price=float(resp.get("markPrice", resp.get("lastPrice", 0))),
+                change_pct_24h=float(resp.get("priceChangePercent", 0)),
+                high_24h=float(resp.get("highPrice", 0)),
+                low_24h=float(resp.get("lowPrice", 0)),
+                volume_24h=float(resp.get("quoteVolume", 0)),
+            )
+        except Exception as e:
+            log.warning("Failed to fetch ticker for %s: %s", symbol, e)
+            return Ticker(symbol=resolve_sym, error=str(e))
+
     # ─── Orders ────────────────────────────────────────────────────────────────
 
     async def _place_order(self, symbol: str, side: str, order_type: str,

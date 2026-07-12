@@ -142,5 +142,19 @@ class PaperExchange(Exchange):
     async def get_order(self, symbol: str, order_id: str) -> OrderInfo:
         return self._orders.get(order_id, OrderInfo())
 
+    async def get_ticker(self, symbol: str) -> "Ticker | None":
+        """Simulated 24h ticker for a symbol."""
+        from src.exchange.base import Ticker
+        price = await self._simulate_price(symbol, "BUY")
+        return Ticker(
+            symbol=symbol,
+            last_price=price,
+            mark_price=price,
+            change_pct_24h=0.0,
+            high_24h=price * 1.01,
+            low_24h=price * 0.99,
+            volume_24h=0.0,
+        )
+
     async def get_open_orders(self, symbol: str | None = None) -> list[OrderInfo]:
         return [o for o in self._orders.values() if o.status in ("NEW", "PARTIALLY_FILLED")]

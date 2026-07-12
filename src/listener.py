@@ -21,6 +21,149 @@ from src.state.db_admin import run_db_command
 log = logging.getLogger("listener")
 
 
+def normalize_pair(raw: str) -> str:
+    """Normalize a user-supplied pair to a full futures symbol.
+
+    Accepts a bare base (``BTC``), a base with ``#``/``$`` prefix
+    (``#BTC``), or an already-quoted pair (``BTCUSDT``). Appends ``USDT``
+    for bare bases, using the live SymbolRegistry when available (so e.g.
+    ``PEPE`` → ``1000PEPEUSDT`` resolves correctly). Returns ``""`` for
+    empty input.
+    """
+    s = (raw or "").strip().upper().lstrip("#").lstrip("$").strip()
+    if not s:
+        return ""
+    if s.endswith(("USDT", "USD", "BUSD", "USDC")):
+        return s
+    try:
+        from src.exchange.symbol_registry import get_registry
+    except ImportError:
+        get_registry = None
+    registry = get_registry() if get_registry else None
+    if registry and registry.is_ready:
+        resolved, _ = registry.resolve(s)
+        if resolved:
+            return resolved
+    return f"{s}USDT"
+
+
+def parse_positions_add(args: list[str]) -> dict:
+    """Parse ``/positions add`` arguments into a structured, validated plan.
+
+    Pure and side-effect-free so it can be unit-tested without Telegram or
+    an exchange connection.
+
+    Accepted grammar (the optional side may be omitted — it is then
+    inferred from the limit price vs. market):
+
+        /positions add [LONG|SHORT] <pair> <margin_usdt> <leverage> \\
+                       <price|market> [tp] [sl]
+
+    Returns ``{"ok": True, "side", "pair", "margin_usdt", "leverage",
+    "price", "market", "tp", "sl"}`` on success, or
+    ``{"ok": False, "error": <str>}`` on any parse/validation failure.
+    ``side`` is ``None`` when it must be inferred at runtime; ``price`` is
+    ``None`` for a ``market`` entry; ``tp``/``sl`` are ``None`` when omitted.
+    """
+    if not args:
+        return {"ok": False, "error": "missing arguments"}
+    toks = [a for a in args if a != ""]
+    # Optional leading side token.
+    side: str | None = None
+    if toks and toks[0].upper() in ("LONG", "SHORT"):
+        side = toks[0].upper()
+        toks = toks[1:]
+    if len(toks) < 4:
+        return {
+            "ok": False,
+            "error": (
+                "expected: add [LONG|SHORT] <pair> <margin> <leverage> "
+                "<price|market> [tp] [sl]"
+            ),
+        }
+    pair_raw, margin_tok, lev_tok, price_tok = toks[0], toks[1], toks[2], toks[3]
+    opt = toks[4:]
+
+    pair = normalize_pair(pair_raw)
+    if not pair:
+        return {"ok": False, "error": f"invalid pair: {pair_raw!r}"}
+
+    # Margin (USDT) — positive, with a sane upper guard against fat-fingers.
+    try:
+        margin = float(margin_tok)
+    except ValueError:
+        return {"ok": False, "error": f"invalid margin: {margin_tok!r} (expected a number)"}
+    if margin <= 0:
+        return {"ok": False, "error": "margin must be > 0"}
+    if margin > 100_000:
+        return {"ok": False, "error": "margin > $100k rejected (use a smaller value)"}
+
+    # Leverage.
+    try:
+        leverage = int(float(lev_tok))
+    except ValueError:
+        return {"ok": False, "error": f"invalid leverage: {lev_tok!r} (expected an integer)"}
+    if leverage < 1:
+        return {"ok": False, "error": "leverage must be >= 1"}
+    if leverage > 125:
+        return {"ok": False, "error": "leverage must be <= 125 (Binance max)"}
+
+    # Entry price or market.
+    is_market = price_tok.lower() == "market"
+    price: float | None = None
+    if not is_market:
+        try:
+            price = float(price_tok)
+        except ValueError:
+            return {
+                "ok": False,
+                "error": f"invalid price: {price_tok!r} (expected a number or 'market')",
+            }
+        if price <= 0:
+            return {"ok": False, "error": "price must be > 0"}
+
+    # Optional TP / SL.
+    tp: float | None = None
+    sl: float | None = None
+    if len(opt) >= 1:
+        try:
+            tp = float(opt[0])
+        except ValueError:
+            return {"ok": False, "error": f"invalid tp: {opt[0]!r} (expected a number)"}
+        if tp <= 0:
+            return {"ok": False, "error": "tp must be > 0"}
+    if len(opt) >= 2:
+        try:
+            sl = float(opt[1])
+        except ValueError:
+            return {"ok": False, "error": f"invalid sl: {opt[1]!r} (expected a number)"}
+        if sl <= 0:
+            return {"ok": False, "error": "sl must be > 0"}
+
+    return {
+        "ok": True,
+        "side": side,
+        "pair": pair,
+        "margin_usdt": margin,
+        "leverage": leverage,
+        "price": price,
+        "market": is_market,
+        "tp": tp,
+        "sl": sl,
+    }
+
+
+def fmt_price(val: float) -> str:
+    """Format a price with sensible precision for display."""
+    if val <= 0:
+        return "—"
+    if val < 0.001:
+        return f"{val:.8f}"
+    if val < 1:
+        return f"{val:.6f}"
+    return f"{val:.4f}"
+
+
 class SignalListener:
     """Telethon-based listener that forwards messages to the orchestrator."""
 
@@ -149,6 +292,8 @@ class SignalListener:
                 await self._handle_close(event)
             elif cmd.startswith("/db"):
                 await self._handle_db(event)
+            elif cmd.startswith("/check"):
+                await self._handle_check(event)
 
         await self.client.run_until_disconnected()
 
@@ -284,6 +429,278 @@ class SignalListener:
             log.exception("Failed to fetch positions")
             await event.reply(f"❌ **Error fetching positions:** `{e}`")
 
+    async def _handle_check(self, event):
+        """Handle /check <pair> — show current price + 24h stats for a pair.
+
+        Usage:
+            /check btcusdt
+            /check #ETH
+            /check pepe           (auto-resolves to 1000PEPEUSDT)
+        """
+        if not self.exchange:
+            await event.reply("❌ No exchange configured.")
+            return
+        parts = (event.message.text or "").strip().split()
+        if len(parts) < 2:
+            await event.reply(
+                "⚠️ **Usage:** `/check <pair>`\n\n"
+                "Examples:\n"
+                "  `/check btcusdt`\n"
+                "  `/check #eth`\n"
+                "  `/check pepe`\n\n"
+                "Shows the current mark price, 24h change, high/low and volume."
+            )
+            return
+        raw = parts[1]
+        symbol = normalize_pair(raw)
+        log.info("Command: /check %s → %s", raw, symbol)
+        try:
+            ticker = await self.exchange.get_ticker(symbol)
+        except Exception as e:
+            log.exception("Failed to fetch ticker for %s", symbol)
+            await event.reply(f"❌ **Error fetching {symbol}:** `{e}`")
+            return
+        if ticker is None:
+            await event.reply(f"❌ Price feed not available for `{symbol}`.")
+            return
+        if ticker.error:
+            await event.reply(
+                f"❌ **Could not fetch `{symbol}`**\n`{ticker.error}`"
+            )
+            return
+
+        change = ticker.change_pct_24h
+        up = change >= 0
+        emoji = "🟢" if up else "🔴"
+        sign = "+" if up else ""
+        await event.reply(
+            f"💹 **{symbol}**\n\n"
+            f"   ├ Last: `{fmt_price(ticker.last_price)}`\n"
+            f"   ├ Mark: `{fmt_price(ticker.mark_price)}`\n"
+            f"   ├ 24h: {emoji} `{sign}{change:.2f}%`\n"
+            f"   ├ High: `{fmt_price(ticker.high_24h)}`\n"
+            f"   ├ Low:  `{fmt_price(ticker.low_24h)}`\n"
+            f"   └ Vol:  `${ticker.volume_24h:,.0f}` (24h)"
+        )
+
+    async def _handle_positions_add(self, event):
+        """Handle ``/positions add ...`` — open a new futures position.
+
+        Grammar:
+
+            /positions add [LONG|SHORT] <pair> <margin_usdt> <leverage> \\
+                           <price|market> [tp] [sl]
+
+        - Side is required when using ``market`` (a market order needs to know
+          whether to buy or sell). For a limit ``price`` the side is *inferred*
+          from the book: a buy-limit below market = LONG, a sell-limit above
+          market = SHORT (rejected if the price is on the wrong side of market).
+        - Margin is the USDT margin budget; position notional = margin × leverage.
+        - On a market fill, SL/TP conditional orders are attached automatically.
+        - A resting limit order is placed and left on the book (no DB position
+          until it fills) so the position manager never spuriously closes it.
+        """
+        if not self.exchange:
+            await event.reply("❌ No exchange configured.")
+            return
+        # text after "/positions"
+        rest = (event.message.text or "")[len("/positions"):].strip()
+        toks = rest.split()
+        # First token MUST be "add".
+        if not toks or toks[0].lower() != "add":
+            await event.reply(
+                "⚠️ **Usage:** `/positions add [LONG|SHORT] <pair> <margin> "
+                "<leverage> <price|market> [tp] [sl]`\n\n"
+                "Examples:\n"
+                "  `/positions add btcusdt 10 20 60000 65000 58000`\n"
+                "  `/positions add LONG ethusdt 5 10 market 3500 3200`\n"
+                "  `/positions add pepe 5 20 0.000012 market`"
+            )
+            return
+
+        plan = parse_positions_add(toks[1:])
+        if not plan["ok"]:
+            await event.reply(f"⚠️ **Invalid command:** {plan['error']}")
+            return
+
+        symbol = plan["pair"]
+        margin = plan["margin_usdt"]
+        leverage = plan["leverage"]
+        is_market = plan["market"]
+        price = plan["price"]
+        log.info(
+            "Command: /positions add %s margin=$%.2f lev=%dx market=%s price=%s",
+            symbol, margin, leverage, is_market, price,
+        )
+
+        # ── Resolve side (explicit, or inferred from limit price vs market) ──
+        side = plan["side"]
+        mark_price = None
+        if side is None:
+            if is_market:
+                await event.reply(
+                    "⚠️ **Side required for a market entry.**\n"
+                    "Use LONG or SHORT, e.g. `/positions add LONG btcusdt 10 20 market`."
+                )
+                return
+            # Limit order — infer side from price vs. current market.
+            try:
+                mark_price = await self.exchange.get_mark_price(symbol)
+            except Exception as e:
+                log.warning("Could not fetch mark price for %s: %s", symbol, e)
+            if not mark_price or mark_price <= 0:
+                await event.reply(
+                    f"⚠️ **Cannot infer side for {symbol}** — no market price "
+                    f"available. Use an explicit LONG/SHORT side."
+                )
+                return
+            if price < mark_price:
+                side = "LONG"        # buy the dip
+            elif price > mark_price:
+                side = "SHORT"       # sell the rip
+            else:
+                await event.reply(
+                    f"⚠️ Limit price `{fmt_price(price)}` equals mark "
+                    f"`{fmt_price(mark_price)}` — use `market` or a clearly "
+                    f"different limit price."
+                )
+                return
+
+        exchange_side = "BUY" if side == "LONG" else "SELL"
+        notional = margin * leverage
+        # Position size in base asset = notional / entry price.
+        entry_ref = price if not is_market else (mark_price or 0)
+        if entry_ref <= 0:
+            try:
+                entry_ref = await self.exchange.get_mark_price(symbol) or 0
+            except Exception:
+                entry_ref = 0
+        if entry_ref <= 0:
+            await event.reply(
+                f"❌ **Cannot size {symbol}** — no reference price available."
+            )
+            return
+        quantity = notional / entry_ref
+
+        # ── Pre-flight: symbol readiness + balance ────────────────────────
+        if not is_market:
+            if not await self.exchange._preflight_symbol(symbol):  # noqa: SLF001
+                await event.reply(
+                    f"❌ **{symbol}** is not available for futures trading."
+                )
+                return
+        try:
+            bal = await self.exchange.get_balance()
+            free = bal.free_usdt
+        except Exception:
+            free = None
+        if free is not None and margin > free:
+            await event.reply(
+                f"❌ **Insufficient margin:** need `${margin:.2f}` but only "
+                f"`${free:.2f}` free. Reduce margin or leverage."
+            )
+            return
+
+        # ── Set leverage + margin type, then place the entry order ──────────
+        try:
+            if getattr(self.exchange, "futures", False):
+                await self.exchange.set_symbol_leverage(symbol, leverage)
+                margin_type = self.config.get("risk", {}).get("margin_type", "ISOLATED")
+                await self.exchange.set_margin_type(symbol, margin_type)
+
+            entry_order: OrderInfo
+            if is_market:
+                entry_order = (
+                    await self.exchange.market_buy(symbol, quantity)
+                    if exchange_side == "BUY"
+                    else await self.exchange.market_sell(symbol, quantity)
+                )
+            else:
+                entry_order = (
+                    await self.exchange.limit_buy(symbol, quantity, price)
+                    if exchange_side == "BUY"
+                    else await self.exchange.limit_sell(symbol, quantity, price)
+                )
+        except Exception as e:
+            log.exception("Failed to place entry order for %s", symbol)
+            await event.reply(
+                f"❌ **Failed to place order — {symbol}**\n`{e}`"
+            )
+            return
+
+        if entry_order.status in ("FAILED", "REJECTED", "EXPIRED"):
+            await event.reply(
+                f"❌ **Order rejected — {symbol}**\n"
+                f"```{entry_order.error or 'unknown error'}```"
+            )
+            return
+
+        # ── Handle outcomes ───────────────────────────────────────────────
+        if is_market or entry_order.status == "FILLED":
+            # Filled (market, or limit that immediately filled).
+            fill_price = entry_order.avg_price or entry_order.price or entry_ref
+            filled_qty = entry_order.filled_quantity or quantity
+
+            # Attach SL/TP conditional orders (mirrors the signal pipeline).
+            tp_placed = sl_placed = False
+            if plan["sl"]:
+                sl_side = "SELL" if side == "LONG" else "BUY"
+                sl_o = await self.exchange.stop_loss(symbol, filled_qty, plan["sl"], sl_side)
+                sl_placed = bool(sl_o.order_id)
+            if plan["tp"]:
+                tp_side = "SELL" if side == "LONG" else "BUY"
+                tp_o = await self.exchange.take_profit(symbol, filled_qty, plan["tp"], tp_side)
+                if not tp_o.order_id:
+                    # Some contracts block conditional TP — fall back to Basic LIMIT.
+                    if tp_side == "SELL":
+                        tp_o = await self.exchange.limit_sell(symbol, filled_qty, plan["tp"])
+                    else:
+                        tp_o = await self.exchange.limit_buy(symbol, filled_qty, plan["tp"])
+                tp_placed = bool(tp_o.order_id)
+
+            # Register the position in the local DB so /close and /positions track it.
+            pm = getattr(self.orchestrator, "position_repo", None)
+            if pm is not None:
+                try:
+                    from src.domain.models import Position
+                    pm.create(Position(
+                        pair=symbol,
+                        direction=side,
+                        entry_price=fill_price,
+                        quantity=filled_qty,
+                        sl_price=plan["sl"],
+                        tp_prices=[plan["tp"]] if plan["tp"] else [],
+                        entry_order_id=entry_order.order_id,
+                    ))
+                    log.info("Registered position %s in DB (manual entry)", symbol)
+                except Exception as e:
+                    log.warning("DB position registration failed for %s: %s", symbol, e)
+
+            await event.reply(
+                f"✅ **Position opened — {symbol}**\n"
+                f"   ├ Side: `{side}`\n"
+                f"   ├ Entry: `{fmt_price(fill_price)}`\n"
+                f"   ├ Size: `{filled_qty:,.4f}`\n"
+                f"   ├ Margin: `${margin:.2f}` @ `{leverage}x`\n"
+                f"   ├ Notional: `${notional:,.2f}`\n"
+                + (f"   ├ 🛡 SL: `{fmt_price(plan['sl'])}`\n" if plan["sl"] else "")
+                + (f"   └ 🎯 TP: `{fmt_price(plan['tp'])}`\n" if plan["tp"] else "")
+                + f"   └ Order: `{entry_order.order_id}`"
+            )
+            return
+
+        # Resting limit order (not yet filled) — leave it on the book.
+        await event.reply(
+            f"⏳ **Limit order placed — {symbol}**\n"
+            f"   ├ Side (inferred): `{side}`\n"
+            f"   ├ Limit: `{fmt_price(price)}`\n"
+            f"   ├ Size: `{quantity:,.4f}`\n"
+            f"   ├ Margin: `${margin:.2f}` @ `{leverage}x`\n"
+            f"   └ Order: `{entry_order.order_id}`\n\n"
+            f"_Waiting for price to reach the limit. It will fill automatically; "
+            f"no position is recorded until then._"
+        )
+
     async def _handle_balance(self, event):
         """Handle /balance — show account balance from exchange."""
         if not self.exchange:
@@ -312,8 +729,10 @@ class SignalListener:
         port = self.config.get("risk", {}).get("port_usdt", 1.0)
         await event.reply(
             "📋 **Available Commands**\n\n"
+            "  /check <pair> — Show current price + 24h stats for a pair\n"
             "  /balance    — Show futures account balance\n"
             "  /positions  — Show all open futures positions\n"
+            "  /positions add [LONG|SHORT] <pair> <margin> <lev> <price|market> [tp] [sl] — Open a position\n"
             "  /pending    — List pending conditional signals\n"
             "  /cancel <id> — Cancel a pending signal\n"
             "  /cancel all — Cancel all pending signals\n"

@@ -30,7 +30,7 @@ fi
 
 # 2. Stage specific paths (NEVER -A — avoids .hermes/ + stray files).
 echo "==> [2] git add src/ tests/ + commit"
-git add src/ tests/ AGENTS.md CHANGELOG.md docs/ scripts/ 2>/dev/null || true
+git add src/ tests/ AGENTS.md CHANGELOG.md README.md docs/ scripts/ 2>/dev/null || true
 git commit -m "$MSG"
 
 # 3. Push.

@@ -110,7 +110,47 @@ Full reference: **[docs/CONFIGURATION.md](docs/CONFIGURATION.md)**
 | **[docs/SIGNAL_PARSING.md](docs/SIGNAL_PARSING.md)** | Regex & LLM signal analysis |
 | **[docs/API.md](docs/API.md)** | Exchange adapter API reference |
 
----
+## Bot Commands (Telegram, private chat)
+
+All commands are sent as private messages (Saved Messages or DM to the bot).
+Type `/` in Telegram to see the registered menu.
+
+| Command | Description |
+|---------|-------------|
+| `/check <pair>` | Current price + 24h stats (last/mark, % change, high/low, volume). e.g. `/check btcusdt`, `/check #eth`, `/check pepe` |
+| `/balance` | Futures account balance |
+| `/positions` | All open futures positions + PnL |
+| `/positions add [LONG\|SHORT] <pair> <margin> <lev> <price\|market> [tp] [sl]` | **Open a position manually** (see below) |
+| `/pending` | Pending conditional signals |
+| `/cancel <id>` / `/cancel all` | Cancel pending signal(s) |
+| `/close <pair>` | Market-close an open position |
+| `/health` | Full system health check |
+| `/setport N` / `/getport` | Margin budget per trade |
+
+### `/positions add` — manual entry
+
+```
+/positions add [LONG|SHORT] <pair> <margin_usdt> <leverage> <price|market> [tp] [sl]
+```
+
+- **`<pair>`** — `btcusdt`, `#eth`, `pepe` (auto-resolves 1000x like `1000PEPEUSDT`).
+- **`<margin_usdt>`** — USDT margin budget. Position notional = margin × leverage (must be ≤ free balance; capped at $100k).
+- **`<leverage>`** — 1–125.
+- **`<price>`** — limit entry. Side is **inferred**: a buy-limit below market = LONG, a sell-limit above market = SHORT.
+- **`market`** — fill at current price. A side **must** be given (`LONG`/`SHORT`) since a market order needs to know buy vs sell.
+- **`[tp]` / `[sl]`** — optional take-profit / stop-loss limit prices. On a market fill they are attached as conditional orders automatically.
+
+Examples:
+
+```
+/positions add btcusdt 10 20 60000 65000 58000   # LONG limit @60000, TP 65000, SL 58000 (side inferred)
+/positions add LONG  ethusdt 5 10 market 3500 3200 # market-long ETH, TP/SL attached
+/positions add SHORT solusdt 2 5 market           # market-short SOL, no TP/SL
+```
+
+Resting limit orders are left on the book (no position recorded until they fill), so the position manager never spuriously closes a not-yet-open trade.
+
+|-
 
 ## Safety Architecture
 

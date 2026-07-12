@@ -2,7 +2,34 @@
 
 All notable changes to this project are documented here.
 
-## Fly volume DB-path fix + docs/runbook enrichment — 2026-07-12
+## Manual trade commands: `/check` + `/positions add` — 2026-07-12
+
+### Added
+- **`/check <pair>`** — fetch live price + 24h stats (last/mark price, %
+  change, high/low, volume) from the exchange `get_ticker()` adapter method.
+  New `Ticker` dataclass + `Exchange.get_ticker()` implemented on the
+  Binance (futures + spot) and Paper adapters.
+- **`/positions add`** — open a futures position manually from Telegram:
+  `/positions add [LONG|SHORT] <pair> <margin> <leverage> <price|market> [tp] [sl]`.
+  - Margin budget in USDT; notional = margin × leverage (bounded by free
+    balance and a $100k guard).
+  - Side required for `market` entries; for a limit `price` it is inferred
+    from the book (buy-limit below market = LONG, sell-limit above = SHORT).
+  - Market fill attaches SL/TP as conditional orders and registers the
+    position in the DB (so `/close` + `/positions` track it).
+  - Resting limit orders are left on the book with **no** DB position until
+    they fill (mirrors the signal pipeline; avoids spurious position-manager
+    closes of not-yet-open trades).
+- Pure, unit-tested `parse_positions_add()` + `normalize_pair()` helpers
+  (`tests/test_positions_add_command.py`, 24 cases) cover the grammar and
+  all validation failure modes.
+- `/check` and `/positions` registered in the Telegram command menu
+  (`TelegramNotifier.set_commands`) and documented in `/help` + README.
+
+### Safety notes
+- Never opens a position without an explicit or inferable side.
+- Market orders reject when no side is given.
+- Pre-flight checks the symbol is tradeable and that margin ≤ free balance.
 
 ### Fixed
 - **DB nested at `/data/data/trades.db` (data-loss trap)**: `src/config/loader.py`

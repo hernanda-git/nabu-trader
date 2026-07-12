@@ -29,6 +29,19 @@ class OrderInfo:
 
 
 @dataclass
+class Ticker:
+    """24h ticker snapshot for a symbol (price + stats)."""
+    symbol: str = ""
+    last_price: float = 0.0
+    mark_price: float = 0.0
+    change_pct_24h: float = 0.0
+    high_24h: float = 0.0
+    low_24h: float = 0.0
+    volume_24h: float = 0.0
+    error: str | None = None
+
+
+@dataclass
 class PositionInfo:
     """An open futures position from the exchange."""
     symbol: str = ""
@@ -120,6 +133,15 @@ class Exchange(ABC):
     async def get_mark_price(self, symbol: str) -> float | None:
         """Get the current market price.
         Returns None if not supported by this exchange."""
+        return None
+
+    async def get_ticker(self, symbol: str) -> "Ticker | None":
+        """Get 24h ticker stats (last/mark price, 24h change, high/low, volume).
+
+        Returns a Ticker, or None if not supported by this exchange.
+        Implementations should return a Ticker with ``error`` set (rather than
+        raising) on lookup failure so callers can surface a clean message.
+        """
         return None
 
     async def cancel_all_orders(self, symbol: str) -> int:

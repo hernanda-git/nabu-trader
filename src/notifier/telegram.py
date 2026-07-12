@@ -191,7 +191,8 @@ class TelegramNotifier:
             json={
                 "commands": [
                     {"command": "balance", "description": "Show futures account balance"},
-                    {"command": "positions", "description": "Show all open futures positions"},
+                    {"command": "check", "description": "Show current price + 24h stats, e.g. /check btcusdt"},
+                    {"command": "positions", "description": "Show open positions; /positions add opens a new one"},
                     {"command": "health", "description": "Run full system health check"},
                     {"command": "setport", "description": "Set margin $ per trade (lev auto)"},
                     {"command": "getport", "description": "Show current margin per trade"},
