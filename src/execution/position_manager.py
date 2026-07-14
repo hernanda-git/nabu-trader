@@ -223,7 +223,9 @@ class PositionManager:
 
     async def _place_protection(self, pos_id: int, pos: "Position",
                                symbol: str, quantity: float,
-                               sl_price, tp_prices: list[float]) -> None:
+                               sl_price, tp_prices: list[float],
+                               skip_sl: bool = False,
+                               skip_tp: bool = False) -> None:
         """Place SL + TP for a (reconciled or opened) position.
 
         Shared by reconcile and the self-heal so protection logic lives in
@@ -231,27 +233,15 @@ class PositionManager:
         once a positions row exists (and the self-heal won't re-call after a
         successful placement, tracked in ``_protection_placed``).
 
-        Before placing, any existing open orders for the symbol are cancelled
-        so stale/duplicate protection (e.g. a plain resting LIMIT TP left from
-        a previous fallback) is replaced by the freshly computed conditional
-        SL/TP. Cancel is a no-op when there are no open orders.
+        ``skip_sl`` / ``skip_tp`` let the self-heal avoid re-placing an order
+        type that already has a live order on the exchange (so we never stack
+        a duplicate TP on top of an existing one across restarts).
         """
         try:
             filters = await self.exchange._load_futures_filters(symbol)
         except Exception:
             filters = None
         filters = filters or {}
-
-        # Cancel any stale/duplicate protection before placing fresh orders.
-        # ``cancel_all_orders`` covers both standard and algo (conditional)
-        # orders, so we never stack duplicates.
-        try:
-            cancelled = await self.exchange.cancel_all_orders(symbol)
-            if cancelled:
-                log.info("place_protection: cancelled %d stale order(s) for %s",
-                         cancelled, symbol)
-        except Exception as e:
-            log.debug("place_protection: cancel failed for %s: %s", symbol, e)
 
         placed_any = False
 
@@ -274,7 +264,7 @@ class PositionManager:
                 return q
             return qty
 
-        if sl_price:
+        if sl_price and not skip_sl:
             sl_side = "SELL" if pos.direction == "LONG" else "BUY"
             sl_qty = _bump_for_min_notional(quantity, sl_price, filters)
             sl_err = validate_order(symbol, sl_side, sl_price, sl_qty, filters)
@@ -296,29 +286,30 @@ class PositionManager:
                     log.warning("reconcile: SL NOT placed %s @ %s (%s)",
                                symbol, sl_price, sl_order.error)
         # Place TP orders
-        for i, tp_price in enumerate(tp_prices[:3]):
-            tp_side = "SELL" if pos.direction == "LONG" else "BUY"
-            tp_qty = _bump_for_min_notional(quantity, tp_price, filters)
-            tp_err = validate_order(symbol, tp_side, tp_price, tp_qty, filters)
-            if tp_err:
-                log.warning("reconcile: TP%d skipped %s @ %s: %s", i + 1, symbol, tp_price, tp_err)
-                continue
-            tp_order = await self.exchange.take_profit(symbol, tp_qty, tp_price, tp_side)
-            if tp_order.order_id:
-                log.info("reconcile: TP%d placed %s @ %s (qty=%s)", i + 1, symbol, tp_price, tp_qty)
-                placed_any = True
-            elif tp_order.status == "FAILED":
-                # Both standard and Algo Order API rejected — final fallback:
-                # a resting LIMIT (maker close) so TP can still fill.
-                log.warning("reconcile: TP%d blocked (%s) — LIMIT fallback @ %s",
-                            i + 1, tp_order.error, tp_price)
-                if tp_side == "SELL":
-                    await self.exchange.limit_sell(symbol, quantity, tp_price, reduce=True)
+        if not skip_tp and tp_prices:
+            for i, tp_price in enumerate(tp_prices[:3]):
+                tp_side = "SELL" if pos.direction == "LONG" else "BUY"
+                tp_qty = _bump_for_min_notional(quantity, tp_price, filters)
+                tp_err = validate_order(symbol, tp_side, tp_price, tp_qty, filters)
+                if tp_err:
+                    log.warning("reconcile: TP%d skipped %s @ %s: %s", i + 1, symbol, tp_price, tp_err)
+                    continue
+                tp_order = await self.exchange.take_profit(symbol, tp_qty, tp_price, tp_side)
+                if tp_order.order_id:
+                    log.info("reconcile: TP%d placed %s @ %s (qty=%s)", i + 1, symbol, tp_price, tp_qty)
+                    placed_any = True
+                elif tp_order.status == "FAILED":
+                    # Both standard and Algo Order API rejected — final fallback:
+                    # a resting LIMIT (maker close) so TP can still fill.
+                    log.warning("reconcile: TP%d blocked (%s) — LIMIT fallback @ %s",
+                                i + 1, tp_order.error, tp_price)
+                    if tp_side == "SELL":
+                        await self.exchange.limit_sell(symbol, quantity, tp_price, reduce=True)
+                    else:
+                        await self.exchange.limit_buy(symbol, quantity, tp_price, reduce=True)
                 else:
-                    await self.exchange.limit_buy(symbol, quantity, tp_price, reduce=True)
-            else:
-                log.warning("reconcile: TP%d NOT placed %s @ %s (%s)",
-                            i + 1, symbol, tp_price, tp_order.error)
+                    log.warning("reconcile: TP%d NOT placed %s @ %s (%s)",
+                                i + 1, symbol, tp_price, tp_order.error)
 
         # Mark protection placed so the self-heal won't re-run on the next tick.
         # (Only when at least one order actually went live — if everything
@@ -366,14 +357,13 @@ class PositionManager:
         # position was reconciled before the Algo Order API fallback existed,
         # or an order got cancelled externally), (re)place them — but only
         # once per session (tracked in _protection_placed) to avoid spamming.
-        # cancel_all_orders inside _place_protection also clears any stale
-        # plain-LIMIT TP so it's replaced by the correct conditional order.
         needs_protection = (not sl_ok or tp_count == 0) and pos.pair not in self._protection_placed
         if needs_protection and (pos.sl_price or pos.tp_prices):
             log.info("Self-heal: (re)placing missing protection for %s (sl_ok=%s tp=%d)",
                      pos.pair, sl_ok, tp_count)
             await self._place_protection(
-                pos.id, pos, pos.pair, pos.quantity, pos.sl_price, pos.tp_prices or []
+                pos.id, pos, pos.pair, pos.quantity, pos.sl_price, pos.tp_prices or [],
+                skip_sl=sl_ok, skip_tp=(tp_count > 0),
             )
 
         # Price-based SL check — for positions where exchange STOP orders aren't
