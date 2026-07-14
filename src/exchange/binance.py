@@ -1273,6 +1273,8 @@ class BinanceExchange(Exchange):
             params["reduceOnly"] = "true"
 
         try:
+            full_url = f"{self._base}/fapi/v1/algo/order"
+            log.error("DIAG algo POST url=%s testnet=%s", full_url, self.testnet)
             data = await self._signed_request("POST", "/fapi/v1/algo/order", params)
             algo_id = data.get("clientAlgoId") or data.get("algoId") or ""
             return OrderInfo(
@@ -1289,6 +1291,9 @@ class BinanceExchange(Exchange):
         except httpx.HTTPStatusError as e:
             status = e.response.status_code
             category = _categorize_error(status, e.response.text, e)
+            log.error("DIAG algo resp status=%s url=%s base=%s body=%s",
+                      status, str(e.response.url), self._base,
+                      e.response.text[:200])
             error_msg = _format_order_error(
                 symbol, side_upper, algo_type, qty, price,
                 getattr(self, "_last_leverage", 1), status, e.response.text,
