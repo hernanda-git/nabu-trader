@@ -12,6 +12,7 @@ import hashlib
 import hmac
 import json
 import logging
+import os
 import time
 from datetime import datetime, timezone
 from enum import Enum
@@ -267,6 +268,11 @@ class BinanceExchange(Exchange):
         # This keeps the Algo Order API (mainnet-only) OFF on testnet and avoids
         # 404s + rejected-order spam for pairs that need it.
         self.testnet = self.testnet or "testnet" in base_url
+        # Algo Order API (conditional STOP/TAKE_PROFIT for -4120 pairs like
+        # XPLUSDT) is opt-in: its exact endpoint route differs per environment
+        # and a wrong route 404s. Enable via env BINANCE_ALGO_ORDERS=1 once the
+        # correct endpoint is confirmed for the target account/environment.
+        self._algo_enabled = (os.environ.get("BINANCE_ALGO_ORDERS") == "1")
         # Cache symbol rules: stepSize/minQty/maxQty/valid
         self._filters: dict[str, dict] = {}
         self._invalid_symbols: dict[str, datetime] = {}
@@ -1095,34 +1101,30 @@ class BinanceExchange(Exchange):
         resolve_sym, _, _ = _resolve_futures_symbol(symbol)
         is_1000x = resolve_sym.startswith("1000")
 
-        if self.futures and is_1000x and not self.testnet:
-            # Mainnet 1000x: route through the algo API (only path that works).
-            return await self._algo_order(symbol, side, "STOP", quantity,
-                                          stop_price, price=stop_price, reduce=True)
-
         # STOP-LIMIT: triggers at stop_price, fills as LIMIT at stop_price.
         # This is a closing (reduce-only) order.
         result = await self._place_order(symbol, side, "STOP", quantity,
                                          price=stop_price, stop_price=stop_price,
                                          reduce=True)
         # Conditional STOP not supported on the standard endpoint for this pair
-        # (small/new futures, 1000x). On mainnet, retry via the Algo Order API
-        # (the supported path that yields a real conditional SL order). On
-        # testnet, the algo API 404s, so fall back to position-manager price
-        # monitoring (UNPROTECTED) so the position is still protected.
-        if result.status == "FAILED":
-            if self.testnet:
-                log.info("STOP rejected for %s on testnet — SL monitored by PM", resolve_sym)
-                return OrderInfo(
-                    order_id="", symbol=symbol, side=side.upper(),
-                    type="STOP", quantity=quantity,
-                    status="UNPROTECTED",
-                    error="STOP not supported on testnet; SL handled by position manager",
-                )
-            if self._is_4120(result):
+        # (small/new futures like XPLUSDT, 1000x contracts) — Binance rejects
+        # with -4120. The supported path is the Algo Order API, but that
+        # endpoint is opt-in (``_algo_enabled``) because its exact route differs
+        # per environment and a wrong route 404s. When disabled (default), the
+        # position is still protected: the monitor price-watches the SL and
+        # closes the position if price hits it.
+        if result.status == "FAILED" and self._is_4120(result):
+            if self._algo_enabled:
                 log.info("STOP rejected for %s (-4120) — retrying via Algo Order API", resolve_sym)
                 return await self._algo_order(symbol, side, "STOP", quantity,
                                               stop_price, price=stop_price, reduce=True)
+            log.info("STOP rejected for %s (-4120) — SL monitored by position manager", resolve_sym)
+            return OrderInfo(
+                order_id="", symbol=symbol, side=side.upper(),
+                type="STOP", quantity=quantity,
+                status="UNPROTECTED",
+                error="STOP not supported on this endpoint; SL handled by position manager",
+            )
         return result
 
     async def take_profit(self, symbol: str, quantity: float, tp_price: float,
@@ -1133,10 +1135,11 @@ class BinanceExchange(Exchange):
         Conditional tab and fills as a LIMIT order — no slippage.
 
         For pairs where the standard endpoint rejects conditional TP (-4120:
-        small/new futures like XPLUSDT, 1000x contracts), retries via the Algo
-        Order API on **mainnet** (real conditional TP). On **testnet** the algo
-        API 404s, so the caller falls back to a plain resting LIMIT (maker
-        close) which still fills at the TP price.
+        small/new futures like XPLUSDT, 1000x contracts), the supported path is
+        the Algo Order API. When that is disabled (default — its exact route
+        differs per environment), the caller falls back to a plain resting
+        LIMIT (maker close) which still fills at the TP price (visible in the
+        Basic orders tab).
         """
         # TAKE_PROFIT-LIMIT: triggers at tp_price, fills as LIMIT at tp_price.
         # Routed through the "TAKE_PROFIT_LIMIT" key so _map_type produces the
@@ -1145,16 +1148,13 @@ class BinanceExchange(Exchange):
         result = await self._place_order(symbol, side, "TAKE_PROFIT_LIMIT", quantity,
                                          price=tp_price, stop_price=tp_price,
                                          reduce=True)
-        if result.status == "FAILED":
-            if self.testnet:
-                # Testnet: algo API unavailable (404). Return FAILED so the
-                # caller places a plain resting LIMIT (which works on testnet).
-                log.info("TP rejected for %s on testnet — caller uses LIMIT fallback", symbol)
-                return result
-            if self._is_4120(result):
+        if result.status == "FAILED" and self._is_4120(result):
+            if self._algo_enabled:
                 log.info("TP rejected for %s (-4120) — retrying via Algo Order API", symbol)
                 return await self._algo_order(symbol, side, "TAKE_PROFIT", quantity,
                                               tp_price, price=tp_price, reduce=True)
+            # Algo disabled — caller places a plain resting LIMIT (works).
+            return result
         return result
 
     @staticmethod
@@ -1273,8 +1273,6 @@ class BinanceExchange(Exchange):
             params["reduceOnly"] = "true"
 
         try:
-            full_url = f"{self._base}/fapi/v1/algo/order"
-            log.error("DIAG algo POST url=%s testnet=%s", full_url, self.testnet)
             data = await self._signed_request("POST", "/fapi/v1/algo/order", params)
             algo_id = data.get("clientAlgoId") or data.get("algoId") or ""
             return OrderInfo(
@@ -1291,9 +1289,6 @@ class BinanceExchange(Exchange):
         except httpx.HTTPStatusError as e:
             status = e.response.status_code
             category = _categorize_error(status, e.response.text, e)
-            log.error("DIAG algo resp status=%s url=%s base=%s body=%s",
-                      status, str(e.response.url), self._base,
-                      e.response.text[:200])
             error_msg = _format_order_error(
                 symbol, side_upper, algo_type, qty, price,
                 getattr(self, "_last_leverage", 1), status, e.response.text,
@@ -1317,11 +1312,11 @@ class BinanceExchange(Exchange):
         so the monitor must query this endpoint to know whether a conditional
         SL/TP is already live (idempotency / self-heal).
 
-        The Algo Order API is only available on Binance **mainnet** — on
-        testnet it 404s, so we return [] (the monitor's standard openOrders
-        check is authoritative there).
+        The Algo Order API is opt-in (_algo_enabled) because its exact route
+        differs per environment and a wrong route 404s. When disabled we return
+        [] (the monitor's standard openOrders check is authoritative).
         """
-        if self.testnet:
+        if not self._algo_enabled:
             return []
         params = {}
         if symbol:
@@ -1349,9 +1344,9 @@ class BinanceExchange(Exchange):
     async def cancel_algo_order(self, symbol: str, algo_id: str) -> bool:
         """Cancel a single algo (conditional) order by its algoId.
 
-        No-op on testnet (Algo Order API unavailable there).
+        No-op unless the Algo Order API is enabled (_algo_enabled).
         """
-        if self.testnet or not algo_id:
+        if not self._algo_enabled or not algo_id:
             return False
         resolve_sym, _, _ = _resolve_futures_symbol(symbol)
         try:

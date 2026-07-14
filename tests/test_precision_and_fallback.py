@@ -288,6 +288,7 @@ async def test_1000x_and_new_futures_use_algo_order_api():
     UNPROTECTED / never-sent)."""
     # 1000x contract
     ex = _CaptureConditionalExchange(api_key="k", api_secret="s", testnet=False, futures=True)
+    ex._algo_enabled = True
     ex._client = _StubClient()
     ex.reject_standard_with_4120 = True
     _seed_filters(ex, "1000BONKUSDT", tick=0.0000001, step=1.0)
@@ -301,6 +302,7 @@ async def test_1000x_and_new_futures_use_algo_order_api():
 
     # Small/new futures (XPLUSDT-style): standard endpoint rejects, algo works.
     ex2 = _CaptureConditionalExchange(api_key="k", api_secret="s", testnet=False, futures=True)
+    ex2._algo_enabled = True
     ex2._client = _StubClient()
     ex2.reject_standard_with_4120 = True
     _seed_filters(ex2, "XPLUSDT", tick=0.0001, step=1.0)
