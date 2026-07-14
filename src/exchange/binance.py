@@ -362,12 +362,35 @@ class BinanceExchange(Exchange):
             return FUTURES_ORDER_TYPES.get(order_type.upper(), order_type.upper())
         return order_type.upper()
 
+    async def max_leverage_for(self, symbol: str) -> int:
+        """Return the pair's real Binance max leverage (from leverageBrackets).
+
+        Falls back to the configured ``max_leverage`` when the registry is
+        unavailable, so callers can always use it as a safe ceiling.
+        """
+        try:
+            from src.exchange.symbol_registry import get_registry
+            reg = get_registry()
+            if reg and reg.is_ready:
+                resolve_sym, _, _ = _resolve_futures_symbol(symbol)
+                info = reg.get_symbol_info(resolve_sym)
+                if info is not None and getattr(info, "max_leverage", 0) > 0:
+                    return int(info.max_leverage)
+        except Exception as e:  # noqa: BLE001 — best-effort
+            log.debug("max_leverage_for(%s) registry lookup failed: %s", symbol, e)
+        return int(self.config.get("risk", {}).get("max_leverage", 20))
+
     async def set_symbol_leverage(self, symbol: str, leverage: int):
-        """Set leverage for a specific symbol before trading."""
+        """Set leverage for a specific symbol before trading.
+
+        Clamps ``leverage`` to the pair's real Binance max (from
+        leverageBrackets) so we never send an invalid value (Binance -4021).
+        """
         if not self.futures:
             return
         resolve_sym, _, _ = _resolve_futures_symbol(symbol)
-        leverage = max(1, min(leverage, 125))
+        pair_max = await self.max_leverage_for(symbol)
+        leverage = max(1, min(int(leverage), pair_max, 125))
         try:
             params = {
                 "symbol": resolve_sym,
@@ -801,7 +824,8 @@ class BinanceExchange(Exchange):
 
     async def _place_order(self, symbol: str, side: str, order_type: str,
                      quantity: float, price: float | None = None,
-                     stop_price: float | None = None) -> OrderInfo:
+                     stop_price: float | None = None,
+                     reduce: bool = False) -> OrderInfo:
         """Place an order on Binance (Spot or Futures).
 
         For futures:
@@ -894,10 +918,16 @@ class BinanceExchange(Exchange):
 
         if mapped_type in ("LIMIT", "STOP", "TAKE_PROFIT"):
             params["timeInForce"] = "GTC"
-            # SL/TP on futures must be reduce-only so they can only close (never
-            # open/flip) the position. This is what makes them safe conditional
-            # exit orders rather than new entries.
-            params["reduceOnly"] = "true"
+            # reduceOnly is NEVER inferred from the order TYPE — it is an
+            # explicit per-call intent. Plain LIMIT is used for BOTH entry
+            # (opening) and exit (maker-close / TP-fallback): an opening order
+            # MUST NOT carry reduceOnly or Binance rejects it with -2022
+            # ("ReduceOnly Order is rejected"), while a closing order MUST carry
+            # it so it can only reduce — never flip — the position. Callers pass
+            # reduce=True for genuine exits (stop_loss / take_profit / closes);
+            # entry helpers default to reduce=False.
+            if reduce:
+                params["reduceOnly"] = "true"
 
         try:
             data = await self._signed_request("POST", self._order_path(), params)
@@ -1027,11 +1057,15 @@ class BinanceExchange(Exchange):
                              type="MARKET", quantity=qty, status="FAILED",
                              error=str(e))
 
-    async def limit_buy(self, symbol: str, quantity: float, price: float) -> OrderInfo:
-        return await self._place_order(symbol, "BUY", "LIMIT", quantity, price=price)
+    async def limit_buy(self, symbol: str, quantity: float, price: float,
+                      reduce: bool = False) -> OrderInfo:
+        return await self._place_order(symbol, "BUY", "LIMIT", quantity,
+                                       price=price, reduce=reduce)
 
-    async def limit_sell(self, symbol: str, quantity: float, price: float) -> OrderInfo:
-        return await self._place_order(symbol, "SELL", "LIMIT", quantity, price=price)
+    async def limit_sell(self, symbol: str, quantity: float, price: float,
+                       reduce: bool = False) -> OrderInfo:
+        return await self._place_order(symbol, "SELL", "LIMIT", quantity,
+                                       price=price, reduce=reduce)
 
     async def stop_loss(self, symbol: str, quantity: float, stop_price: float,
                         side: str = "SELL") -> OrderInfo:
@@ -1055,9 +1089,11 @@ class BinanceExchange(Exchange):
                 error="STOP not supported for 1000x; SL handled by position manager",
             )
 
-        # STOP-LIMIT: triggers at stop_price, fills as LIMIT at stop_price
+        # STOP-LIMIT: triggers at stop_price, fills as LIMIT at stop_price.
+        # This is a closing (reduce-only) order.
         return await self._place_order(symbol, side, "STOP", quantity,
-                                       price=stop_price, stop_price=stop_price)
+                                       price=stop_price, stop_price=stop_price,
+                                       reduce=True)
 
     async def take_profit(self, symbol: str, quantity: float, tp_price: float,
                           side: str = "SELL") -> OrderInfo:
@@ -1069,8 +1105,10 @@ class BinanceExchange(Exchange):
         # TAKE_PROFIT-LIMIT: triggers at tp_price, fills as LIMIT at tp_price.
         # Routed through the "TAKE_PROFIT_LIMIT" key so _map_type produces the
         # conditional-limit Futures type (TAKE_PROFIT), NOT the market variant.
+        # This is a closing (reduce-only) order.
         return await self._place_order(symbol, side, "TAKE_PROFIT_LIMIT", quantity,
-                                       price=tp_price, stop_price=tp_price)
+                                       price=tp_price, stop_price=tp_price,
+                                       reduce=True)
 
     async def cancel_order(self, symbol: str, order_id: str) -> bool:
         resolve_sym, _, _ = _resolve_futures_symbol(symbol)

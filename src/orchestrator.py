@@ -429,7 +429,19 @@ class TradeOrchestrator:
 
             # ── Step 6: Safety Gate 2 (post-LLM) — only for ENTER decisions
             bal_for_gate = (balance or {}).get("USDT", None)
-            allowed, reason, clamped_decision = self.gate2.check(decision, bal_for_gate)
+            # Resolve the pair's own Binance max leverage (from the SymbolRegistry
+            # that was populated at startup from exchangeInfo leverageBrackets).
+            pair_max_leverage = None
+            try:
+                registry = get_registry()
+                if registry and registry.is_ready and decision.pair:
+                    info = registry.get_symbol_info(decision.pair)
+                    if info is not None:
+                        pair_max_leverage = getattr(info, "max_leverage", None)
+            except Exception as e:  # noqa: BLE001 — registry lookup is best-effort
+                log.debug("Gate2 pair-max-leverage lookup failed: %s", e)
+            allowed, reason, clamped_decision = self.gate2.check(
+                decision, bal_for_gate, pair_max_leverage=pair_max_leverage)
             if not allowed:
                 log.info("Gate2 rejected: %s", reason)
                 result["action"] = "rejected"
@@ -458,6 +470,15 @@ class TradeOrchestrator:
                 await self.notifier.send_message(reject_text)
                 return result
             decision = clamped_decision
+            # Persist the Gate2-clamped size to the decisions row. The row was
+            # saved BEFORE Gate2 (step 3), so without this its quantity/leverage
+            # stay 0 — breaking analytics and daily_stats. See DecisionRepository.update_quantity.
+            try:
+                self.decision_repo.update_quantity(
+                    decision_db_id, decision.quantity, decision.leverage)
+            except Exception as e:  # noqa: BLE001 — never let bookkeeping block trading
+                log.warning("Failed to persist clamped quantity for decision %s: %s",
+                            decision_db_id, e)
             self._log(correlation_id, "INFO", "gate2",
                       f"Gate2 passed: {decision.pair} qty={decision.quantity:.4f} lev={decision.leverage}x",
                       {"pair": decision.pair, "quantity": decision.quantity,

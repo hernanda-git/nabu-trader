@@ -97,6 +97,15 @@ async def build_health_report(listener: Any) -> tuple[list[str], int, int]:
         pass
     checks.append(("💼 Portfolio", "OK", f"{n_open} open · {port_detail}"))
 
+    # ── 4c. Margin mode (isolated / cross) ───────────────────────
+    raw_mt = cfg.get("risk", {}).get("margin_type", "ISOLATED")
+    mt = "CROSS" if (raw_mt or "").strip().upper() in ("CROSSED", "CROSS") else "ISOLATED"
+    checks.append(("🔗 Margin Mode", "OK", f"{mt} (new positions)"))
+
+    # ── 4d. Default leverage ceiling ────────────────────────────
+    lev = cfg.get("risk", {}).get("max_leverage", 20)
+    checks.append(("⚙️ Leverage", "OK", f"default ceiling {lev}x (pair max clamps per trade)"))
+
     # ── 5. Symbol registry ────────────────────────────────────────
     try:
         from src.exchange.symbol_registry import get_registry

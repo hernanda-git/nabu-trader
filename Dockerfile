@@ -5,6 +5,14 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
+# Build-time version injection: a PLAIN INTEGER version (e.g. 62).
+# Set at deploy via: flyctl deploy --build-arg APP_VERSION=$(python -c "import src.version;print(src.version.__version__)")
+# The app (src/main.py) reads APP_VERSION first, so /version + the startup
+# banner + traded telemetry report the exact integer version. Falls back to
+# src/version.py if no build arg is supplied (local dev).
+ARG APP_VERSION=""
+ENV APP_VERSION="${APP_VERSION}"
+
 # System deps (sqlite3 for DB, ca-certificates for HTTPS)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     sqlite3 \

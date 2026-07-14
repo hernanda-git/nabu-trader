@@ -38,7 +38,12 @@ _BINANCE_VALID_LEVERAGES = sorted({1, 2, 3, 5, 7, 10, 15, 20, 25, 30, 50, 75, 10
 def _snap_leverage(leverage: float, max_lev: int) -> int:
     """Snap a computed leverage to the nearest valid Binance level, rounding up.
 
-    Example: 4 → 5, 6 → 7, 12 → 15, 17 → 20, 3.2 → 5
+    ``max_lev`` is the *effective* ceiling — the minimum of the bot's
+    configured ``risk.max_leverage`` and the pair's own Binance max leverage
+    (from ``leverageBrackets``). Levels above ``max_lev`` are unreachable, so
+    the snap never returns an invalid leverage for the pair.
+
+    Example: with max_lev=20 → 4→5, 6→7, 12→15, 17→20, 22→20.
     """
     if leverage <= 1:
         return 1
@@ -120,7 +125,7 @@ class SafetyGate2:
         self.position_repo = position_repo
 
     def check(self, decision: TradeDecision, balance_usdt: float | None = None,
-              filters: dict | None = None) -> tuple[bool, str, TradeDecision]:
+              filters: dict | None = None, pair_max_leverage: int | None = None) -> tuple[bool, str, TradeDecision]:
         """Returns (allowed: bool, reason: str, clamped_decision).
 
         Args:
@@ -131,6 +136,10 @@ class SafetyGate2:
                      MIN_NOTIONAL is used as the floor instead of (or in addition
                      to) the config min_notional_usdt, so leverage is driven by the
                      REAL exchange minimum, not a hardcoded value.
+            pair_max_leverage: The pair's own Binance max leverage (from
+                     leverageBrackets). The effective leverage ceiling is the
+                     MIN of this and the configured ``risk.max_leverage``, so a
+                     pair that permits less than the bot default is respected.
         """
         risk = self.config.get("risk", {})
         price = decision.entry_price or 0.0
@@ -145,6 +154,10 @@ class SafetyGate2:
         min_notional = risk.get("min_notional_usdt", 1.0)
         max_portfolio_lev = risk.get("max_portfolio_leverage", 10)
         max_lev_increase_pct = risk.get("max_leverage_increase_pct", 10)
+        # Effective leverage ceiling = MIN(bot default, pair's Binance max).
+        # This guarantees we never request a leverage higher than the pair allows.
+        if pair_max_leverage is not None and pair_max_leverage > 0:
+            max_lev = min(max_lev, int(pair_max_leverage))
         # Use the REAL exchange MIN_NOTIONAL when available (Task 6).
         if filters:
             exchange_min = filters.get("minNotional")

@@ -3,15 +3,20 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from typing import Any
 
 from src.domain.models import PendingSignal, Position
 from src.exchange.base import Exchange
+from src.exchange.validation import validate_order
 from src.state.repositories import (
+    DecisionRepository,
+    OrderRepository,
     PendingSignalRepository,
     PositionEventRepository,
     PositionRepository,
+    SignalRepository,
 )
 
 log = logging.getLogger("execution.position_manager")
@@ -29,6 +34,9 @@ class PositionManager:
                  position_repo: PositionRepository,
                  pending_signal_repo: PendingSignalRepository | None = None,
                  position_event_repo: PositionEventRepository | None = None,
+                 order_repo: OrderRepository | None = None,
+                 decision_repo: DecisionRepository | None = None,
+                 signal_repo: "SignalRepository | None" = None,
                  notifier=None,  # TelegramNotifier
                  orchestrator=None):  # TradeOrchestrator — for trigger execution
         self.exchange = exchange
@@ -36,6 +44,9 @@ class PositionManager:
         self.position_repo = position_repo
         self.pending_signal_repo = pending_signal_repo
         self.position_event_repo = position_event_repo
+        self.order_repo = order_repo
+        self.decision_repo = decision_repo
+        self.signal_repo = signal_repo
         self._notifier = notifier
         self._orchestrator = orchestrator
         self._running = False
@@ -65,11 +76,192 @@ class PositionManager:
         """Background loop that checks open positions and pending conditions."""
         while self._running:
             try:
+                await self._reconcile_pending_orders()
                 await self._check_positions()
                 await self._check_pending_conditions()
             except Exception:
                 log.exception("Error in position monitor loop")
             await asyncio.sleep(self._interval)
+
+    # ── Pending LIMIT reconciliation ────────────────────────────────────
+    # Root-cause guard: an ENTER that places a LIMIT entry resting on the
+    # book does NOT create a positions row until the order FILLS. If price
+    # comes back and fills the LIMIT later (after the synchronous entry path
+    # already returned PENDING), nothing records the fill — no positions row,
+    # no SL/TP, invisible to the monitor. This method closes that hole by
+    # polling every PENDING entry order against the exchange and, on fill,
+    # building the position + placing SL/TP exactly like OrderService does.
+    async def _reconcile_pending_orders(self):
+        if self.order_repo is None or self.decision_repo is None or self.signal_repo is None:
+            return
+        try:
+            rows = self._pending_entry_orders()
+        except Exception:
+            log.debug("reconcile: could not load pending orders")
+            return
+        for o in rows:
+            await self._reconcile_one(o)
+
+    def _pending_entry_orders(self) -> list[dict]:
+        """Return DB order rows still PENDING that represent entry orders.
+
+        Entry orders are BUY (LONG) or SELL (SHORT) LIMITs. We only
+        reconcile entries — SL/TP are reduce-only and handled elsewhere.
+        """
+        cur = self.position_repo.conn.execute(
+            "SELECT * FROM orders WHERE status = 'PENDING' "
+            "AND side IN ('BUY','SELL') AND order_type = 'LIMIT' "
+            "ORDER BY id ASC"
+        )
+        return [dict(r) for r in cur.fetchall()]
+
+    async def _reconcile_one(self, order_row: dict) -> None:
+        symbol = order_row["symbol"]
+        decision_id = order_row.get("decision_id")
+        # Idempotency 1: a positions row already exists -> nothing to do.
+        if self.position_repo.get_open_by_pair(symbol) is not None:
+            return
+        # Idempotency 2: order no longer PENDING on our side.
+        # (If SL/TP placement below fails we leave it PENDING and retry next tick.)
+        try:
+            live = await self.exchange.get_order(symbol, order_row["exchange_order_id"])
+        except Exception as e:
+            log.debug("reconcile: get_order failed for %s: %s", symbol, e)
+            return
+        if live.status != "FILLED":
+            # Still resting, or cancelled/expired — leave for the monitor/timeout.
+            if live.status in ("CANCELED", "EXPIRED", "REJECTED"):
+                self.order_repo.update_status(
+                    order_row["id"], live.status, live.order_id or "")
+            return
+
+        # Filled! Build the position from the original decision (source of SL/TP).
+        decision = self.decision_repo.get_by_id(decision_id) if decision_id else None
+        if not decision:
+            log.warning("reconcile: no decision %s for filled %s — skipping",
+                        decision_id, symbol)
+            return
+        # SL/TP for the entry are NOT stored on decisions (that table only
+        # carries action/pair/direction/qty/confidence/reason). They live on
+        # the originating signal row, which is the authoritative source.
+        sl_price = None
+        tp_prices: list[float] = []
+        signal_id = decision.get("signal_id")
+        signal_row = self.signal_repo.get_by_id(signal_id) if (self.signal_repo and signal_id) else None
+        if signal_row:
+            sl_price = signal_row.get("sl_price")
+            tp_raw = signal_row.get("tp_prices")
+            try:
+                tp_prices = json.loads(tp_raw) if tp_raw else []
+            except (json.JSONDecodeError, TypeError):
+                tp_prices = []
+        else:
+            # Fallback: the decision's own SL/TP if a future schema version adds them.
+            sl_price = decision.get("sl_price") or sl_price
+            if not tp_prices:
+                try:
+                    tp_prices = json.loads(decision.get("tp_prices") or "[]") if decision.get("tp_prices") else []
+                except (json.JSONDecodeError, TypeError):
+                    tp_prices = []
+        direction = decision.get("direction") or ("LONG" if order_row["side"] == "BUY" else "SHORT")
+        entry_price = float(live.avg_price or decision.get("entry_price") or 0)
+        quantity = float(live.filled_quantity or order_row.get("quantity") or 0)
+        if quantity <= 0 or entry_price <= 0:
+            log.warning("reconcile: bad fill size for %s (qty=%s px=%s) — skipping",
+                        symbol, quantity, entry_price)
+            return
+
+        from src.domain.models import Position
+        pos = Position(
+            pair=symbol,
+            direction=direction,
+            entry_price=entry_price,
+            quantity=quantity,
+            sl_price=sl_price,
+            tp_prices=tp_prices,
+            entry_order_id=live.order_id or str(order_row.get("exchange_order_id", "")),
+        )
+        pos_id = self.position_repo.create(pos)
+        self.order_repo.update_status(order_row["id"], "FILLED", live.order_id or "")
+
+        # Place SL/TP — mirrors OrderService._enter_position.
+        await self._place_protection(pos_id, pos, symbol, quantity, sl_price, tp_prices)
+
+        if self.position_event_repo:
+            self.position_event_repo.save_event(
+                position_id=pos_id,
+                event_type="POSITION_OPENED",
+                details=f"Reconciled {direction} @ {entry_price:.8f} qty={quantity:.4f} (late LIMIT fill)",
+                metadata={
+                    "pair": symbol, "direction": direction,
+                    "entry_price": entry_price, "quantity": quantity,
+                    "sl": sl_price, "tp": tp_prices,
+                    "reconciled": True,
+                },
+            )
+        log.info("Reconciled late-fill LIMIT: %s %s qty=%.4f @ %.8f",
+                 direction, symbol, quantity, entry_price)
+        if self._notifier:
+            try:
+                await self._notifier.send_message(
+                    f"🔄 **Position reconciled (late fill)** — `{symbol}`\n"
+                    f"   ├ Direction: `{direction}`\n"
+                    f"   ├ Qty: `{quantity:,.0f}`\n"
+                    f"   ├ Entry: `{entry_price:.8f}`\n"
+                    f"   ├ SL: `{sl_price or '—'}`\n"
+                    f"   └ TP: `{tp_prices or '—'}`"
+                )
+            except Exception:
+                log.debug("reconcile: notify failed")
+
+    async def _place_protection(self, pos_id: int, pos: "Position",
+                               symbol: str, quantity: float,
+                               sl_price, tp_prices: list[float]) -> None:
+        """Place SL + TP for a (reconciled or opened) position.
+
+        Shared by reconcile and any future open-path so protection logic
+        lives in exactly one place. Idempotent per position: callers
+        only invoke it once a positions row exists.
+        """
+        try:
+            filters = await self.exchange._load_futures_filters(symbol)
+        except Exception:
+            filters = None
+        filters = filters or {}
+        # Place SL order
+        if sl_price:
+            sl_side = "SELL" if pos.direction == "LONG" else "BUY"
+            sl_err = validate_order(symbol, sl_side, sl_price, quantity, filters)
+            if sl_err:
+                log.warning("reconcile: SL skipped %s @ %s: %s", symbol, sl_price, sl_err)
+            else:
+                sl_order = await self.exchange.stop_loss(symbol, quantity, sl_price, sl_side)
+                if sl_order.order_id:
+                    log.info("reconcile: SL placed %s @ %s", symbol, sl_price)
+                elif sl_order.status == "UNPROTECTED":
+                    log.warning("reconcile: SL NOT placed %s @ %s (monitored by PM)",
+                               symbol, sl_price)
+                else:
+                    log.warning("reconcile: SL NOT placed %s @ %s (%s)",
+                               symbol, sl_price, sl_order.error)
+        # Place TP orders
+        for i, tp_price in enumerate(tp_prices[:3]):
+            tp_side = "SELL" if pos.direction == "LONG" else "BUY"
+            tp_err = validate_order(symbol, tp_side, tp_price, quantity, filters)
+            if tp_err:
+                log.warning("reconcile: TP%d skipped %s @ %s: %s", i + 1, symbol, tp_price, tp_err)
+                continue
+            tp_order = await self.exchange.take_profit(symbol, quantity, tp_price, tp_side)
+            if tp_order.order_id:
+                log.info("reconcile: TP%d placed %s @ %s", i + 1, symbol, tp_price)
+            else:
+                # Conditional TP blocked (-4120) → fall back to resting LIMIT.
+                log.warning("reconcile: TP%d blocked (%s) — LIMIT fallback @ %s",
+                            i + 1, tp_order.error, tp_price)
+                if tp_side == "SELL":
+                    await self.exchange.limit_sell(symbol, quantity, tp_price, reduce=True)
+                else:
+                    await self.exchange.limit_buy(symbol, quantity, tp_price, reduce=True)
 
     async def _check_positions(self):
         """Check all open positions for SL/TP hits or timeouts."""
@@ -341,9 +533,9 @@ class PositionManager:
                 return False
 
             if side == "SELL":
-                order = await self.exchange.limit_sell(pos.pair, pos.quantity, close_price)
+                order = await self.exchange.limit_sell(pos.pair, pos.quantity, close_price, reduce=True)
             else:
-                order = await self.exchange.limit_buy(pos.pair, pos.quantity, close_price)
+                order = await self.exchange.limit_buy(pos.pair, pos.quantity, close_price, reduce=True)
 
             # Wait for fill (up to 30s)
             if order.order_id and order.status != "FILLED":

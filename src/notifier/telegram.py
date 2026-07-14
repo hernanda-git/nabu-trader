@@ -136,13 +136,12 @@ class TelegramNotifier:
                 f"Order: `{result.order_id}`"
             )
         else:
-            # Use a fenced code block for the raw error so we never nest
-            # backticks (Binance error text already contains inline `...`),
-            # which would make Telegram reject the message with
-            # "can't parse entities".
+            # Use a fenced code block for the raw error. The Binance error text
+            # itself contains inline `...` backticks, so escape them to avoid
+            # "can't parse entities" (Telegram rejects nested/duplicate backticks).
             text = (
                 "❌ **Failed to place order**\n"
-                f"```\n{result.error}\n```"
+                f"```\n{_md_escape(result.error)}\n```"
             )
         await self.send_message(text)
 
@@ -196,6 +195,10 @@ class TelegramNotifier:
                     {"command": "health", "description": "Run full system health check"},
                     {"command": "setport", "description": "Set margin $ per trade (lev auto)"},
                     {"command": "getport", "description": "Show current margin per trade"},
+                    {"command": "setmargintype", "description": "Set margin mode: /setmargintype isolated|cross"},
+                    {"command": "getmargintype", "description": "Show current margin mode (isolated/cross)"},
+                    {"command": "setleverage", "description": "Set default leverage ceiling: /setleverage 20"},
+                    {"command": "leverage", "description": "Show current default leverage ceiling"},
                     {"command": "version", "description": "Show bot version"},
                     {"command": "help", "description": "Show available commands"},
                     {"command": "close", "description": "Close an active trade, e.g. /close ENAUSDT"},

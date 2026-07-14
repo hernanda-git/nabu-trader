@@ -531,6 +531,33 @@ class SymbolRegistry:
         except (ValueError, TypeError):
             max_qty = 1_000_000
 
+        # ── Per-pair max leverage from leverageBrackets ────────────────
+        # exchangeInfo.symbols[].leverageBrackets is a list of one element
+        # (per symbol it's [[{initialLeverage, notionalCap, maintenanceMarginRate}...]]);
+        # bracket 0's initialLeverage is the maximum allowed leverage for the pair.
+        # Some responses use the legacy flat `maxLeverage` key instead.
+        max_leverage = 20
+        raw_brackets = s.get("leverageBrackets")
+        if isinstance(raw_brackets, list) and raw_brackets:
+            first = raw_brackets[0]
+            if isinstance(first, list) and first:
+                try:
+                    max_leverage = int(first[0].get("initialLeverage", max_leverage))
+                except (ValueError, TypeError, AttributeError):
+                    pass
+            elif isinstance(first, dict):
+                try:
+                    max_leverage = int(first.get("initialLeverage", max_leverage))
+                except (ValueError, TypeError, AttributeError):
+                    pass
+        elif isinstance(s.get("maxLeverage"), (int, float)):
+            try:
+                max_leverage = int(s["maxLeverage"])
+            except (ValueError, TypeError):
+                pass
+        if max_leverage < 1:
+            max_leverage = 1
+
         info = SymbolInfo(
             symbol=name,
             base_asset=base,
@@ -545,6 +572,7 @@ class SymbolRegistry:
             contract_type=s.get("contractType", "PERPETUAL"),
             onboard_date=str(s.get("onboardDate", "")),
             is_1000x=is_1000x,
+            max_leverage=max_leverage,
         )
 
         # Index by exact symbol (upper and lower)

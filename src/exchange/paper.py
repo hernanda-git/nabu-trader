@@ -123,10 +123,12 @@ class PaperExchange(Exchange):
     async def market_sell(self, symbol: str, quantity: float) -> OrderInfo:
         return await self._fill_order(symbol, "SELL", quantity, "MARKET")
 
-    async def limit_buy(self, symbol: str, quantity: float, price: float) -> OrderInfo:
+    async def limit_buy(self, symbol: str, quantity: float, price: float,
+                       reduce: bool = False) -> OrderInfo:
         return await self._fill_order(symbol, "BUY", quantity, "LIMIT", price)
 
-    async def limit_sell(self, symbol: str, quantity: float, price: float) -> OrderInfo:
+    async def limit_sell(self, symbol: str, quantity: float, price: float,
+                        reduce: bool = False) -> OrderInfo:
         return await self._fill_order(symbol, "SELL", quantity, "LIMIT", price)
 
     async def stop_loss(self, symbol: str, quantity: float, stop_price: float,

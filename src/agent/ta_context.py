@@ -134,6 +134,14 @@ async def fetch_ta_context(exchange: "Exchange", symbol: str,
     Returns a formatted markdown string ready to inject into the prompt.
     Returns empty string if data is unavailable.
     """
+    # Guard: never hit the exchange with an empty/invalid symbol. This was
+    # producing `klines?symbol=` → Binance 400 ("Failed to fetch klines for 4h").
+    # Skip silently (the caller already handles a missing TA context).
+    if not symbol or not str(symbol).strip():
+        log.warning("fetch_ta_context called with empty symbol — skipping TA context")
+        return ""
+    symbol = str(symbol).strip().upper()
+
     # Fetch 100 closed candles
     klines = await exchange.get_klines(symbol, interval=timeframe, limit=100)
     if not klines or len(klines) < 30:

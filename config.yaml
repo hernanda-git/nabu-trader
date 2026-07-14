@@ -20,11 +20,11 @@ risk:
   min_cooldown_minutes: 5
   min_notional_usdt: 5.0       # Binance minimum — scaled up to avoid rejection
   max_position_hold_hours: 48
-  max_leverage: 50             # ceiling for dynamic leverage (low-balance friendly)
+  max_leverage: 20          # bot default leverage ceiling (slash: /setleverage) — per-pair Binance max still clamps each trade
   max_leverage_increase_pct: 10 # cap dynamic leverage at baseline×(1 + this%) so it can't
                                 # be inflated far beyond what's needed to meet min notional
   margin_usage_pct: 80         # use up to 80% of balance as margin per trade
-  margin_type: ISOLATED        # ISOLATED or CROSS
+  margin_type: ISOLATED        # ISOLATED or CROSSED
   max_portfolio_leverage: 10   # total portfolio notional / balance cap (prevents over-concentration)
   # ── Gateway proxy (OPTIONAL, default OFF) ──────────────────────────────
   # When enabled, ALL Binance REST calls route through a signed gateway relay

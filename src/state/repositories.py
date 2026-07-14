@@ -53,6 +53,11 @@ class SignalRepository:
         row = cursor.fetchone()
         return row["id"] if row else 0
 
+    def get_by_id(self, signal_id: int) -> dict | None:
+        cursor = self.conn.execute("SELECT * FROM signals WHERE id = ?", (signal_id,))
+        row = cursor.fetchone()
+        return dict(row) if row else None
+
     def get_by_message_id(self, message_id: int) -> dict | None:
         cursor = self.conn.execute("SELECT * FROM signals WHERE message_id = ?", (message_id,))
         row = cursor.fetchone()
@@ -153,7 +158,35 @@ class DecisionRepository:
         return self.conn.execute("SELECT last_insert_rowid()").fetchone()[0]
 
 
-# ═════════════════════════════════════════════════════════════════════════════
+    def get_by_id(self, decision_id: int) -> dict | None:
+        """Fetch a stored decision by its primary key.
+
+        Used by the position manager to reconcile a resting PENDING LIMIT
+        entry that filled later — the SL/TP/direction it needs to build
+        the position row live in the original decision, which is the only
+        durable record of them once the synchronous entry path has returned.
+        """
+        cur = self.conn.execute("SELECT * FROM decisions WHERE id = ?", (decision_id,))
+        row = cur.fetchone()
+        return dict(row) if row else None
+
+    def update_quantity(self, decision_id: int, quantity: float,
+                        leverage: int) -> None:
+        """Persist the Gate2-clamped quantity/leverage.
+
+        The orchestrator saves the decision BEFORE Gate2 clamps the real
+        size, so the stored ``quantity`` would otherwise stay 0.0. This
+        corrects the persisted row in place (no duplicate), so analytics /
+        daily_stats see the true traded size. Idempotent.
+        """
+        self.conn.execute(
+            "UPDATE decisions SET quantity = ?, leverage = ? WHERE id = ?",
+            (quantity, leverage, decision_id),
+        )
+        self.conn.commit()
+
+
+# ═══════════════════════════════════════════════════════════════
 # Order Repository
 # ═════════════════════════════════════════════════════════════════════════════
 

@@ -290,9 +290,9 @@ class OrderService:
                 log.warning("TP%d conditional blocked (%s) — falling back to Basic LIMIT @ %s",
                             i + 1, tp_order.error, tp_price)
                 if tp_side == "SELL":
-                    fb = await self.exchange.limit_sell(symbol, quantity, tp_price)
+                    fb = await self.exchange.limit_sell(symbol, quantity, tp_price, reduce=True)
                 else:
-                    fb = await self.exchange.limit_buy(symbol, quantity, tp_price)
+                    fb = await self.exchange.limit_buy(symbol, quantity, tp_price, reduce=True)
                 if fb.order_id:
                     log.info("TP%d placed (Basic LIMIT fallback): %s @ %s", i + 1, symbol, tp_price)
 
@@ -436,8 +436,8 @@ class OrderService:
                 error=f"Cannot determine close price for {symbol}",
             )
 
-        order = await self.exchange.limit_sell(symbol, position.quantity, close_price) if side == "SELL" \
-            else await self.exchange.limit_buy(symbol, position.quantity, close_price)
+        order = await self.exchange.limit_sell(symbol, position.quantity, close_price, reduce=True) if side == "SELL" \
+            else await self.exchange.limit_buy(symbol, position.quantity, close_price, reduce=True)
 
         # Wait for close fill (up to 30s)
         if order.order_id and order.status != "FILLED":
@@ -534,8 +534,8 @@ class OrderService:
                 tp_placed += 1
                 log.info("New TP%d placed: %s @ %s", i + 1, symbol, tp_price)
             else:
-                fb = await self.exchange.limit_sell(symbol, position.quantity, tp_price) if tp_side == "SELL" \
-                    else await self.exchange.limit_buy(symbol, position.quantity, tp_price)
+                fb = await self.exchange.limit_sell(symbol, position.quantity, tp_price, reduce=True) if tp_side == "SELL" \
+                    else await self.exchange.limit_buy(symbol, position.quantity, tp_price, reduce=True)
                 if fb.order_id:
                     tp_placed += 1
                     log.info("New TP%d placed (Basic LIMIT fallback): %s @ %s", i + 1, symbol, tp_price)

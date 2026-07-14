@@ -191,7 +191,8 @@ class SymbolInfo:
     max_qty: float = 1_000_000           # from LOT_SIZE.maxQty
     contract_type: str = "PERPETUAL"     # PERPETUAL, CURRENT_MONTH, etc.
     onboard_date: str = ""               # timestamp when listed
-    is_1000x: bool = False               # True if base_asset starts with "1000" + letters
+    is_1000x: bool = False              # True if base_asset starts with "1000" + letters
+    max_leverage: int = 20             # pair-specific max leverage (from leverageBrackets[0])
 
     def clean_base(self) -> str:
         """Return the display-friendly base asset (strip 1000 prefix).

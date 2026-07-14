@@ -19,6 +19,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -158,32 +159,21 @@ async def main():
     # ── Notifier ─────────────────────────────────────────────────────────
     notifier = TelegramNotifier(bot_token=bot_token, chat_id=notify_chat_id)
 
-    # Determine version: explicit RELEASE_VERSION (set by deploy bump), Fly.io
-    # release version, git commit hash, or the package version.py fallback.
-    # NOTE: src/version.py is auto-incremented on every deploy by
-    # scripts/bump_version.py, so it always reflects the real build.
-    app_version = (
-        os.environ.get("RELEASE_VERSION")
-        or os.environ.get("FLY_RELEASE_VERSION")
-        or os.environ.get("SOURCE_VERSION", "")
-    )
-    if not app_version:
-        try:
-            import subprocess
-            result = subprocess.run(
-                ["git", "-C", str(Path(__file__).resolve().parent.parent), "rev-parse", "--short", "HEAD"],
-                capture_output=True, text=True, timeout=5,
-            )
-            app_version = result.stdout.strip()
-        except Exception:
-            app_version = ""
+    # Determine version for /version + startup banner + traded telemetry.
+    # The canonical version is a PLAIN INTEGER (e.g. 62) — not a git SHA and
+    # not a "v"-prefixed string. Primary source is APP_VERSION (injected at
+    # build time via `flyctl deploy --build-arg APP_VERSION=...`), falling back
+    # to the frozen src/version.py (local dev / no build arg). The container
+    # image has no git binary, so runtime git resolution was removed on purpose.
+    app_version = os.environ.get("APP_VERSION")
     if not app_version:
         try:
             from src.version import __version__  # type: ignore[import-untyped]
-            app_version = __version__
+            app_version = str(__version__)
         except Exception:
-            app_version = ""
-    version_str = f"v{app_version}" if app_version and not app_version.startswith("v") else app_version
+            app_version = "0"
+    # Integer-only: strip any non-digit (defensive against stray "v"/SHA input).
+    version_str = re.sub(r"\D", "", str(app_version)) or "0"
 
     if bot_token:
         log.info("Telegram notifier ready (chat_id=%s)", notify_chat_id)
@@ -195,6 +185,9 @@ async def main():
     position_manager = PositionManager(exchange, cfg, position_repo,
                                        pending_signal_repo=pending_signal_repo,
                                        position_event_repo=position_event_repo,
+                                       order_repo=order_repo,
+                                       decision_repo=decision_repo,
+                                       signal_repo=signal_repo,
                                        notifier=notifier)
 
     # ── API Server (background task) ──────────────────────────────────────
@@ -247,7 +240,8 @@ async def main():
 
     # ── Listener ─────────────────────────────────────────────────────────
     listener = SignalListener(orchestrator, cfg, exchange=exchange,
-                              version=version_str or None, notifier=notifier)
+                              version=version_str or None, notifier=notifier,
+                              config_path=str(ROOT / "config.yaml"))
 
     # ── Health Reporter (periodic /health post every 6h) ───────────────────
     health_interval = cfg.get("monitoring", {}).get("health_report_hours", 6)

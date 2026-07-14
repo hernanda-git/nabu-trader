@@ -37,9 +37,12 @@ git commit -m "$MSG"
 echo "==> [3] git push origin $BRANCH"
 git push origin "$BRANCH"
 
-# 4. Deploy (rolling update).
-echo "==> [4] flyctl deploy"
-flyctl deploy
+# 4. Deploy (rolling update). Inject the integer version (APP_VERSION) so
+#    /version, the startup banner, traded telemetry, and the API server all
+#    report the exact integer version defined in src/version.py.
+echo "==> [4] flyctl deploy --build-arg APP_VERSION"
+VERSION="$(python -c "import src.version;print(src.version.__version__)")"
+flyctl deploy --build-arg "APP_VERSION=$VERSION"
 
 # 5. Health check.
 echo "==> [5] health + boot logs"

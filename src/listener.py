@@ -12,7 +12,7 @@ from telethon import TelegramClient, events
 from telethon.sessions import StringSession
 
 from src.exchange.base import Exchange
-from src.config.loader import get_session_dir
+from src.config.loader import get_session_dir, DEFAULT_CONFIG_PATH
 from src.health.reporter import build_health_report
 from src.orchestrator import TradeOrchestrator
 from src.state.database import get_connection
@@ -167,9 +167,10 @@ def fmt_price(val: float) -> str:
 class SignalListener:
     """Telethon-based listener that forwards messages to the orchestrator."""
 
-    def __init__(self, orchestrator: TradeOrchestrator, config: dict, exchange: Exchange | None = None, version: str | None = None, notifier: "TelegramNotifier | None" = None):
+    def __init__(self, orchestrator: TradeOrchestrator, config: dict, exchange: Exchange | None = None, version: str | None = None, notifier: "TelegramNotifier | None" = None, config_path: "str | Path | None" = None):
         self.orchestrator = orchestrator
         self.config = config
+        self.config_path = Path(config_path) if config_path else DEFAULT_CONFIG_PATH
         self.exchange = exchange or getattr(orchestrator, 'exchange', None)
         self.version = version
 
@@ -282,6 +283,14 @@ class SignalListener:
                 await self._handle_setport(event)
             elif cmd == "/getport":
                 await self._handle_getport(event)
+            elif cmd.startswith("/setmargintype"):
+                await self._handle_setmargintype(event)
+            elif cmd == "/getmargintype":
+                await self._handle_getmargintype(event)
+            elif cmd.startswith("/setleverage"):
+                await self._handle_setleverage(event)
+            elif cmd == "/leverage":
+                await self._handle_getleverage(event)
             elif cmd == "/pending":
                 await self._handle_pending(event)
             elif cmd.startswith("/cancel"):
@@ -653,9 +662,9 @@ class SignalListener:
                 if not tp_o.order_id:
                     # Some contracts block conditional TP — fall back to Basic LIMIT.
                     if tp_side == "SELL":
-                        tp_o = await self.exchange.limit_sell(symbol, filled_qty, plan["tp"])
+                        tp_o = await self.exchange.limit_sell(symbol, filled_qty, plan["tp"], reduce=True)
                     else:
-                        tp_o = await self.exchange.limit_buy(symbol, filled_qty, plan["tp"])
+                        tp_o = await self.exchange.limit_buy(symbol, filled_qty, plan["tp"], reduce=True)
                 tp_placed = bool(tp_o.order_id)
 
             # Register the position in the local DB so /close and /positions track it.
@@ -739,6 +748,10 @@ class SignalListener:
             "  /health     — Run full system health check\n"
             "  /setport N  — Set margin per trade to $N\n"
             "  /getport    — Show current margin per trade\n"
+            "  /setmargintype <isolated|cross> — Set margin mode for new trades\n"
+            "  /getmargintype — Show current margin mode (isolated/cross)\n"
+            "  /setleverage <N> — Set default leverage ceiling (pair max clamps)\n"
+            "  /leverage — Show current default leverage ceiling\n"
             "  /version    — Show bot version\n"
             "  /help       — Show this message\n\n"
             "  /close <PAIR> — Immediately market-close an active trade (cancels its SL/TP)\n\n"
@@ -764,8 +777,8 @@ class SignalListener:
         await event.reply("\n".join(lines))
 
     async def _handle_version(self, event):
-        """Handle /version — show bot version."""
-        ver = self.version or "unknown"
+        """Handle /version — show bot version (plain integer)."""
+        ver = self.version or "0"
         await event.reply(
             f"📦 **Crypto Signal Auto-Trade**\n\n"
             f"Version: `{ver}`\n"
@@ -803,16 +816,177 @@ class SignalListener:
         except ValueError:
             await event.reply(f"❌ Invalid number: `{parts[1]}`. Use e.g. `/setport 2`.")
 
-    async def _handle_getport(self, event):
-        """Handle /getport — show current margin per trade."""
-        port = self.config.get("risk", {}).get("port_usdt", 1.0)
+    async def _handle_getmargintype(self, event):
+        """Handle /getmargintype — show current margin mode (isolated/cross)."""
+        raw = self.config.get("risk", {}).get("margin_type", "ISOLATED")
+        mode = self._normalize_margin_type(raw)
+        emoji = "🔗" if mode == "CROSSED" else "🧱"
+        label = "CROSS" if mode == "CROSSED" else "ISOLATED"
         await event.reply(
-            f"💰 **Current Margin Per Trade**\n\n"
-            f"Port: `$ {port:.2f}`\n\n"
-            f"This is the margin budget per trade.\n"
-            f"Leverage = position value ÷ ${port:.2f}\n\n"
-            f"Change it with `/setport <value>`"
+            f"{emoji} **Margin Mode**\n\n"
+            f"Current: `{label}`\n\n"
+            f"New positions use this margin type on Binance Futures.\n"
+            f"Change it with `/setmargintype isolated` or `/setmargintype cross`."
         )
+
+    async def _handle_setmargintype(self, event):
+        """Handle /setmargintype <isolated|cross> — change margin mode for new trades."""
+        parts = (event.message.text or "").strip().split()
+        current = self._normalize_margin_type(
+            self.config.get("risk", {}).get("margin_type", "ISOLATED")
+        )
+        if len(parts) < 2:
+            await event.reply(
+                f"⚠️ **Usage:** `/setmargintype <isolated|cross>`\n"
+                f"Current margin mode: `{current}`\n\n"
+                f"Example: `/setmargintype cross` → new positions use cross margin"
+            )
+            return
+        arg = parts[1].strip().lower()
+        if arg in ("isolated", "iso", "i"):
+            new_mode = "ISOLATED"
+            emoji = "🧱"
+        elif arg in ("cross", "crossed", "c"):
+            new_mode = "CROSSED"
+            emoji = "🔗"
+        else:
+            await event.reply(
+                f"❌ Invalid margin mode: `{arg}`.\n"
+                f"Use `/setmargintype isolated` or `/setmargintype cross`."
+            )
+            return
+        self.config.setdefault("risk", {})["margin_type"] = new_mode
+        log.info("Margin type changed to %s", new_mode)
+        # Persist to config.yaml so the setting survives a restart/deploy.
+        persisted = self._persist_margin_type(new_mode)
+        applied = "CROSS" if new_mode == "CROSSED" else "ISOLATED"
+        note = "" if persisted else "\n⚠️ (config.yaml not written — change is in-memory only for this session)"
+        await event.reply(
+            f"{emoji} **Margin Mode Updated**\n\n"
+            f"New positions will use `{applied}` margin.\n\n"
+            f"⚠️ Existing open positions keep their original margin type until closed."
+            f"{note}"
+        )
+
+    def _persist_margin_type(self, margin_type: str) -> bool:
+        """Rewrite the `margin_type:` line in config.yaml in place.
+
+        Preserves every other line (comments, indentation) and only swaps the
+        value, so a restart/deploy reloads the same margin mode. Returns True
+        if the file was updated, False if it couldn't be (non-fatal).
+        """
+        path = self.config_path
+        try:
+            if not path or not Path(path).exists():
+                log.warning("config.yaml not found at %s — skipping persist", path)
+                return False
+            text = Path(path).read_text(encoding="utf-8")
+            new_lines = []
+            found = False
+            for line in text.splitlines():
+                # Match the top-level `margin_type:` under the risk: block.
+                # Only touch an unindented (top-level) key to avoid any nested
+                # key that might coincidentally be named margin_type.
+                stripped = line.lstrip()
+                if not found and stripped.startswith("margin_type:") and not line.startswith((" ", "\t")):
+                    indent = line[: len(line) - len(stripped)]
+                    new_lines.append(f"{indent}margin_type: {margin_type}")
+                    found = True
+                else:
+                    new_lines.append(line)
+            if not found:
+                log.warning("margin_type key not found in %s — skipping persist", path)
+                return False
+            Path(path).write_text("\n".join(new_lines) + "\n", encoding="utf-8")
+            log.info("Persisted margin_type=%s to %s", margin_type, path)
+            return True
+        except Exception as e:  # noqa: BLE001 — persistence is best-effort
+            log.warning("Failed to persist margin_type to %s: %s", path, e)
+            return False
+
+
+    def _normalize_margin_type(self, raw: str) -> str:
+        """Normalize any accepted margin-type spelling to the Binance enum."""
+        r = (raw or "").strip().upper()
+        if r in ("CROSSED", "CROSS"):
+            return "CROSSED"
+        return "ISOLATED"
+
+    async def _handle_getleverage(self, event):
+        """Handle /leverage — show current default leverage ceiling."""
+        lev = self.config.get("risk", {}).get("max_leverage", 20)
+        await event.reply(
+            f"⚙️ **Default Leverage Ceiling**\n\n"
+            f"`{lev}x`\n\n"
+            f"This is the bot's default leverage ceiling for new trades.\n"
+            f"Each trade also respects the pair's own Binance max leverage — "
+            f"whichever is lower wins.\n\n"
+            f"Change it with `/setleverage <value>` (e.g. `/setleverage 10`)."
+        )
+
+    async def _handle_setleverage(self, event):
+        """Handle /setleverage N — change the default leverage ceiling for new trades."""
+        parts = (event.message.text or "").strip().split()
+        current = self.config.get("risk", {}).get("max_leverage", 20)
+        if len(parts) < 2:
+            await event.reply(
+                f"⚠️ **Usage:** `/setleverage <value>`\n"
+                f"Current default leverage ceiling: `{current}x`\n\n"
+                f"Example: `/setleverage 10` → new trades use up to 10x\n"
+                f"(each trade is still clamped to the pair's Binance max)"
+            )
+            return
+        try:
+            new_lev = int(float(parts[1]))
+        except ValueError:
+            await event.reply(f"❌ Invalid number: `{parts[1]}`. Use e.g. `/setleverage 20`.")
+            return
+        if new_lev < 1:
+            await event.reply("❌ Leverage must be ≥ 1.")
+            return
+        if new_lev > 125:
+            await event.reply("❌ Leverage cannot exceed 125x (Binance hard limit).")
+            return
+        self.config.setdefault("risk", {})["max_leverage"] = new_lev
+        log.info("Default leverage ceiling changed to %dx", new_lev)
+        # Persist to config.yaml so the setting survives a restart/deploy.
+        persisted = self._persist_leverage(new_lev)
+        note = "" if persisted else "\n⚠️ (config.yaml not written — change is in-memory only for this session)"
+        await event.reply(
+            f"⚙️ **Default Leverage Updated**\n\n"
+            f"New trades use up to `{new_lev}x` (clamped to each pair's Binance max).\n"
+            f"Effective leverage per trade is still computed from risk sizing and "
+            f"snapped to the nearest valid Binance step."
+            f"{note}"
+        )
+
+    def _persist_leverage(self, leverage: int) -> bool:
+        """Rewrite the `max_leverage:` line in config.yaml in place (best-effort)."""
+        path = self.config_path
+        try:
+            if not path or not Path(path).exists():
+                log.warning("config.yaml not found at %s — skipping leverage persist", path)
+                return False
+            text = Path(path).read_text(encoding="utf-8")
+            new_lines = []
+            found = False
+            for line in text.splitlines():
+                stripped = line.lstrip()
+                if not found and stripped.startswith("max_leverage:") and not line.startswith((" ", "\t")):
+                    indent = line[: len(line) - len(stripped)]
+                    new_lines.append(f"{indent}max_leverage: {leverage}")
+                    found = True
+                else:
+                    new_lines.append(line)
+            if not found:
+                log.warning("max_leverage key not found in %s — skipping persist", path)
+                return False
+            Path(path).write_text("\n".join(new_lines) + "\n", encoding="utf-8")
+            log.info("Persisted max_leverage=%d to %s", leverage, path)
+            return True
+        except Exception as e:  # noqa: BLE001 — persistence is best-effort
+            log.warning("Failed to persist max_leverage to %s: %s", path, e)
+            return False
 
     async def _handle_pending(self, event):
         """Handle /pending — list all pending conditional signals."""

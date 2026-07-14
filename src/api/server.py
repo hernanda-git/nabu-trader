@@ -32,6 +32,17 @@ from src.state.database import DB_PATH
 
 log = logging.getLogger("api.server")
 
+
+def _int_version(raw: str) -> int:
+    """Return ``raw`` coerced to a plain integer (e.g. '62' -> 62).
+
+    Strips any non-digit characters so a stray 'v' prefix or git SHA can
+    never break app construction. Falls back to 0.
+    """
+    digits = "".join(ch for ch in (raw or "") if ch.isdigit())
+    return int(digits) if digits else 0
+
+
 # ─── DB Connection ────────────────────────────────────────────────────────────
 
 
@@ -76,7 +87,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Fly Trade Bridge API",
-    version="1.0.0",
+    version=str(_int_version(os.environ.get("APP_VERSION", "0"))),
     lifespan=lifespan,
 )
 

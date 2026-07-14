@@ -2,6 +2,18 @@
 
 All notable changes to this project are documented here.
 
+## Fix: versioning pipeline reports real deployed commit — 2026-07-12
+
+### Fixed
+- Version was frozen at `v61` on every deploy: `scripts/bump_version.py` was never
+  invoked (dead code) and the runtime `git rev-parse` fallback failed (the container
+  image has no git binary). `/version` and the startup banner could not tell builds apart.
+- Now the **git commit SHA is injected at build time** (`flyctl deploy --build-arg GIT_SHA=...`
+  in `scripts/deploy_and_verify.sh`, surfaced via `ARG GIT_SHA`/`ENV APP_VERSION` in `Dockerfile`).
+  `src/main.py` reads `APP_VERSION` first; `/version`, the startup banner, and the API
+  server title (`src/api/server.py`) all show the exact running commit (`dev` locally).
+- Kept `src/version.py` as a local-dev-only fallback; removed the broken git fallback.
+
 ## Manual trade commands: `/check` + `/positions add` — 2026-07-12
 
 ### Added

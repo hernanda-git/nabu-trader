@@ -90,12 +90,14 @@ class Exchange(ABC):
         return await self.market_sell(symbol, quantity)
 
     @abstractmethod
-    async def limit_buy(self, symbol: str, quantity: float, price: float) -> OrderInfo:
-        """Limit buy order."""
+    async def limit_buy(self, symbol: str, quantity: float, price: float,
+                        reduce: bool = False) -> OrderInfo:
+        """Limit buy order. ``reduce=True`` marks it reduce-only (closing)."""
 
     @abstractmethod
-    async def limit_sell(self, symbol: str, quantity: float, price: float) -> OrderInfo:
-        """Limit sell order."""
+    async def limit_sell(self, symbol: str, quantity: float, price: float,
+                         reduce: bool = False) -> OrderInfo:
+        """Limit sell order. ``reduce=True`` marks it reduce-only (closing)."""
 
     @abstractmethod
     async def stop_loss(self, symbol: str, quantity: float, stop_price: float,
