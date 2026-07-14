@@ -242,3 +242,109 @@ def test_self_heal_replaces_missing_protection(repos):
     exch.placed.clear()
     asyncio.run(_run())
     assert len(exch.placed) == 0, f"self-heal re-placed on 2nd tick: {exch.placed}"
+
+
+def test_no_orders_but_live_position_is_not_auto_closed(repos):
+    """P0 regression: a position with zero resting orders but a LIVE exchange
+    position (e.g. SL/TP manually cancelled) must NOT be marked CLOSED by the
+    30-min heuristic. Doing so would silently drop a live, unprotected position
+    from all future monitoring."""
+    from datetime import datetime, timedelta, timezone
+
+    class LiveExchange(FakeExchange):
+        """No open orders, but a live position still exists on the exchange."""
+        async def get_open_orders(self, symbol=None):
+            return []
+        async def get_positions(self):
+            from src.exchange.base import PositionInfo
+            return [PositionInfo(symbol="XPLUSDT", direction="LONG", size=57.0,
+                                 entry_price=0.0892, mark_price=0.0892,
+                                 unrealized_pnl=0.0)]
+
+    exch = LiveExchange(avg_price=0.0892, filled_qty=57.0)
+    pm = PositionManager(
+        exchange=exch, config={}, position_repo=repos["position"],
+        order_repo=repos["order"], decision_repo=repos["decision"],
+        position_event_repo=repos["pevent"], signal_repo=SignalRepository(repos["conn"]),
+    )
+    old = (datetime.now(timezone.utc) - timedelta(minutes=45)).isoformat()
+    pos = Position(pair="XPLUSDT", direction="LONG", entry_price=0.0892,
+                   quantity=57.0, sl_price=0.08735, tp_prices=[0.0928],
+                   entry_time=old, status="OPEN")
+    repos["position"].create(pos)
+    pos = repos["position"].get_open_by_pair("XPLUSDT")  # DB-backed id, like production
+
+    async def _run():
+        await pm._check_position(pos)
+    asyncio.run(_run())
+
+    # Still OPEN — NOT auto-closed.
+    assert repos["position"].get_open_by_pair("XPLUSDT") is not None
+    assert len(repos["position"].get_open_positions()) == 1
+
+
+def test_no_orders_and_no_live_position_is_auto_closed(repos):
+    """Complement: when the exchange confirms NO live position, the 30-min
+    heuristic still closes the DB record (PnL=0 fallback on order-query fail)."""
+    from datetime import datetime, timedelta, timezone
+
+    class GoneExchange(FakeExchange):
+        """No orders AND no live position on the exchange."""
+        async def get_open_orders(self, symbol=None):
+            return []
+        async def get_positions(self):
+            return []  # position really is gone
+        async def get_order(self, symbol, order_id):
+            raise RuntimeError("order fetch failed")
+
+    exch = GoneExchange(avg_price=0.0892, filled_qty=57.0)
+    pm = PositionManager(
+        exchange=exch, config={}, position_repo=repos["position"],
+        order_repo=repos["order"], decision_repo=repos["decision"],
+        position_event_repo=repos["pevent"], signal_repo=SignalRepository(repos["conn"]),
+    )
+    old = (datetime.now(timezone.utc) - timedelta(minutes=45)).isoformat()
+    pos = Position(pair="XPLUSDT", direction="LONG", entry_price=0.0892,
+                   quantity=57.0, sl_price=0.08735, tp_prices=[0.0928],
+                   entry_time=old, status="OPEN")
+    repos["position"].create(pos)
+    pos = repos["position"].get_open_by_pair("XPLUSDT")  # DB-backed id, like production
+
+    async def _run():
+        await pm._check_position(pos)
+    asyncio.run(_run())
+
+    # Now closed (no live position).
+    assert repos["position"].get_open_by_pair("XPLUSDT") is None
+    assert len(repos["position"].get_open_positions()) == 0
+
+
+def test_exchange_unreachable_does_not_drop_live_position(repos):
+    """P0 edge: if get_positions() raises (network blip), we must NOT drop the
+    position at 0 PnL. Assume still-open and retry next tick."""
+    from datetime import datetime, timedelta, timezone
+
+    class FlakyExchange(FakeExchange):
+        async def get_open_orders(self, symbol=None):
+            return []
+        async def get_positions(self):
+            raise RuntimeError("timeout")
+
+    exch = FlakyExchange(avg_price=0.0892, filled_qty=57.0)
+    pm = PositionManager(
+        exchange=exch, config={}, position_repo=repos["position"],
+        order_repo=repos["order"], decision_repo=repos["decision"],
+        position_event_repo=repos["pevent"], signal_repo=SignalRepository(repos["conn"]),
+    )
+    old = (datetime.now(timezone.utc) - timedelta(minutes=45)).isoformat()
+    pos = Position(pair="XPLUSDT", direction="LONG", entry_price=0.0892,
+                   quantity=57.0, sl_price=0.08735, tp_prices=[0.0928],
+                   entry_time=old, status="OPEN")
+    repos["position"].create(pos)
+    pos = repos["position"].get_open_by_pair("XPLUSDT")  # DB-backed id, like production
+
+    async def _run():
+        await pm._check_position(pos)
+    asyncio.run(_run())
+
+    assert repos["position"].get_open_by_pair("XPLUSDT") is not None

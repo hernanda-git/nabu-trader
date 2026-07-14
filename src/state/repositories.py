@@ -246,9 +246,23 @@ class PositionRepository:
         self.conn = conn or get_connection()
 
     def create(self, position: Position) -> int:
+        # Persist entry_time explicitly as a tz-aware UTC ISO string. Relying on
+        # the column DEFAULT CURRENT_TIMESTAMP stores a NAIVE local string, which
+        # Python 3.11's datetime.fromisoformat parses as tz-naive — and the
+        # monitor's age check then treats it as "just now" (age ~0), so the
+        # 30-min auto-close / time-exit would never fire. Always store UTC.
+        entry_time = position.entry_time
+        # entry_time may be a datetime or an already-serialized ISO string.
+        if isinstance(entry_time, str):
+            try:
+                entry_time = datetime.fromisoformat(entry_time)
+            except ValueError:
+                entry_time = datetime.now(timezone.utc)
+        if entry_time.tzinfo is None:
+            entry_time = entry_time.replace(tzinfo=timezone.utc)
         self.conn.execute(
-            """INSERT INTO positions (pair, direction, entry_price, quantity, sl_price, tp_prices, entry_order_id)
-               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            """INSERT INTO positions (pair, direction, entry_price, quantity, sl_price, tp_prices, entry_order_id, entry_time)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 position.pair,
                 position.direction,
@@ -257,6 +271,7 @@ class PositionRepository:
                 position.sl_price,
                 json_dumps(position.tp_prices),
                 position.entry_order_id,
+                entry_time.isoformat(),
             ),
         )
         self.conn.commit()

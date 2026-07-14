@@ -244,8 +244,6 @@ class PositionManager:
         filters = filters or {}
 
         placed_any = False
-        sl_order_status = None  # "placed" | "unplaceable" | None
-        tp_placed_any = False
 
         def _bump_for_min_notional(qty: float, price: float, filters: dict) -> float:
             """Bump qty until qty*price meets MIN_NOTIONAL.
@@ -277,7 +275,6 @@ class PositionManager:
                 if sl_order.order_id:
                     log.info("reconcile: SL placed %s @ %s (qty=%s)", symbol, sl_price, sl_qty)
                     placed_any = True
-                    sl_order_status = "placed"
                 elif sl_order.status in ("FAILED", "UNPROTECTED"):
                     # Both standard and Algo Order API rejected (or the pair is
                     # not supported on the standard endpoint, e.g. XPLUSDT /
@@ -286,7 +283,6 @@ class PositionManager:
                     # a live exchange order. Mark as monitored so the self-heal
                     # won't keep re-attempting a never-placeable SL every tick.
                     self._sl_monitored.add(symbol)
-                    sl_order_status = "unplaceable"
                     log.warning("reconcile: SL NOT placed %s @ %s (monitored by PM): %s",
                                symbol, sl_price, sl_order.error)
                 else:
@@ -305,7 +301,6 @@ class PositionManager:
                 if tp_order.order_id:
                     log.info("reconcile: TP%d placed %s @ %s (qty=%s)", i + 1, symbol, tp_price, tp_qty)
                     placed_any = True
-                    tp_placed_any = True
                 elif tp_order.status == "FAILED":
                     # Both standard and Algo Order API rejected — final fallback:
                     # a resting LIMIT (maker close) so TP can still fill.
@@ -319,16 +314,11 @@ class PositionManager:
                     log.warning("reconcile: TP%d NOT placed %s @ %s (%s)",
                                 i + 1, symbol, tp_price, tp_order.error)
 
-        # Mark protection as handled so the self-heal won't re-run next tick.
-        # We set it once BOTH SL and TP have been addressed — i.e. placed,
-        # determined unplaceable (monitored), or skipped because an order of
-        # that type already exists on the exchange. This covers pairs like
-        # XPLUSDT / 1000x where the SL can never be a real exchange order:
-        # the SL branch adds the pair to _sl_monitored AND we mark it handled
-        # here, so the self-heal stops re-attempting a never-placeable SL.
-        sl_addressed = (not sl_price) or skip_sl or (sl_order_status in ("placed", "unplaceable"))
-        tp_addressed = (not tp_prices) or skip_tp or (tp_placed_any)
-        if sl_addressed and tp_addressed:
+        # The self-heal caller marks the pair handled (in _protection_placed /
+        # _sl_monitored) BEFORE calling this method, so idempotency is
+        # guaranteed there. This flag is only used by the one-shot reconcile
+        # path (position entry) where the caller does not pre-mark.
+        if placed_any:
             self._protection_placed.add(symbol)
 
     async def _check_positions(self):
@@ -380,6 +370,14 @@ class PositionManager:
         if (needs_sl or needs_tp) and (pos.sl_price or pos.tp_prices):
             log.info("Self-heal: (re)placing missing protection for %s (sl_ok=%s tp=%d)",
                      pos.pair, sl_ok, tp_count)
+            # Mark handled BEFORE placing so a partial failure inside
+            # _place_protection cannot defeat the idempotency guard and cause
+            # a per-tick retry loop (e.g. XPLUSDT/1000x SL which can never be a
+            # real exchange order — we attempt once per session, then rely on
+            # the price-monitor for SL and the resting LIMIT for TP).
+            self._protection_placed.add(pos.pair)
+            if needs_sl:
+                self._sl_monitored.add(pos.pair)
             await self._place_protection(
                 pos.id, pos, pos.pair, pos.quantity, pos.sl_price, pos.tp_prices or [],
                 skip_sl=not needs_sl, skip_tp=not needs_tp,
@@ -404,67 +402,123 @@ class PositionManager:
                     if pos.direction == "LONG" and current_price <= pos.sl_price:
                         log.warning("SL HIT for %s (via %s): current=%.8f <= sl=%.8f — closing",
                                     pos.pair, source, current_price, pos.sl_price)
-                        await self._close_position(pos, f"SL hit ({current_price:.8f})")
+                        await self._close_position(
+                            pos, f"SL hit ({current_price:.8f})",
+                            closed_by="SL", market=True,
+                        )
                         return
                     elif pos.direction == "SHORT" and current_price >= pos.sl_price:
                         log.warning("SL HIT for %s (via %s): current=%.8f >= sl=%.8f — closing",
                                     pos.pair, source, current_price, pos.sl_price)
-                        await self._close_position(pos, f"SL hit ({current_price:.8f})")
+                        await self._close_position(
+                            pos, f"SL hit ({current_price:.8f})",
+                            closed_by="SL", market=True,
+                        )
                         return
             except Exception as e:
                 log.debug("Price-based SL check failed for %s: %s", pos.pair, e)
 
         # If no SL/TP orders remain and position is OPEN, check if it was
         # already filled (closed by exchange). Use age as heuristic:
-        # if it's been open > 30 min and has no orders, it was likely closed.
+        # if it's been open > 30 min and has no orders, it was *likely* closed.
+        #
+        # CORRECTION (P0): a position can be genuinely OPEN with zero resting
+        # orders (SL/TP manually cancelled, or a pair with no conditional
+        # support whose protection is only price-monitored). Marking it CLOSED
+        # here would silently drop a live, unprotected position from all future
+        # monitoring. So before auto-closing we verify against the EXCHANGE
+        # positions feed (source of truth) — if a live position still exists,
+        # we skip the auto-close and let the self-heal re-attach protection.
         if len(open_orders) == 0 and pos.entry_time:
+            from datetime import datetime, timezone
+            if isinstance(pos.entry_time, str):
+                entry_dt = datetime.fromisoformat(pos.entry_time)
+                if entry_dt.tzinfo is None:
+                    # Defensive: a naive timestamp in the DB is assumed UTC, NOT
+                    # "just now". (create() now always stores tz-aware UTC, but
+                    # legacy/edge rows could be naive.)
+                    entry_dt = entry_dt.replace(tzinfo=timezone.utc)
+            else:
+                entry_dt = pos.entry_time
+                if entry_dt.tzinfo is None:
+                    entry_dt = entry_dt.replace(tzinfo=timezone.utc)
+            age_min = (datetime.now(timezone.utc) - entry_dt).total_seconds() / 60
+            if age_min > 30:
+                # Source-of-truth check: is there still a live exchange position?
+                live_open = True
+                try:
+                    live = await self.exchange.get_positions()
+                    live_open = any(
+                        p.symbol.upper() == pos.pair.upper() and p.size > 0
+                        for p in live
+                    )
+                except Exception as e:
+                    # Can't reach the exchange — treat as "unknown" and DO NOT
+                    # drop the position. Log and bail out so we retry next tick
+                    # instead of silently marking CLOSED at 0 PnL.
+                    log.warning(
+                        "Position %s: could not verify exchange state (%s) — "
+                        "skipping auto-close to avoid dropping a live position",
+                        pos.pair, e,
+                    )
+                    live_open = True  # conservative: assume still open
+
+                if live_open:
+                    log.info(
+                        "Position %s has no resting orders but a LIVE exchange "
+                        "position still exists (age=%.1f min) — NOT auto-closing; "
+                        "self-heal will re-attach protection",
+                        pos.pair, age_min,
+                    )
+                else:
+                    log.info("Position %s has no open orders (age=%.1f min) and no "
+                             "live exchange position — marking as closed",
+                             pos.pair, age_min)
+                    # Try to get latest trade info from exchange to calculate P&L
+                    try:
+                        order = await self.exchange.get_order(pos.pair, pos.entry_order_id)
+                        if order.status in ("FILLED", "CANCELED", "EXPIRED") or not order.order_id:
+                            exit_px = order.avg_price or pos.sl_price or pos.entry_price
+                            entry_cost = pos.entry_price * pos.quantity
+                            exit_value = exit_px * pos.quantity
+                            pnl = (exit_value - entry_cost) if pos.direction == "LONG" else (entry_cost - exit_value)
+                            self.position_repo.close_position(
+                                pos.id, exit_price=exit_px,
+                                pnl=pnl, reason="Auto-detected close (no orders remaining)",
+                                closed_by="SYSTEM",
+                            )
+                            log.info("Position %s auto-closed via exchange, PnL=%.2f", pos.pair, pnl)
+                    except Exception as e:
+                        # Verification reachable but order query failed: we have
+                        # confirmed the position is NOT live, so a 0-PnL close is
+                        # acceptable here (no risk of dropping a live position).
+                        log.warning("Could not verify %s close reason: %s — closing at 0 PnL",
+                                    pos.pair, e)
+                        self.position_repo.close_position(
+                            pos.id, exit_price=pos.entry_price,
+                            pnl=0.0, reason="Auto-closed (no orders, verification failed)",
+                            closed_by="SYSTEM",
+                        )
+        # Time-based exit — close if position has been open too long
+        max_hold_hours = self.config.get("risk", {}).get("max_position_hold_hours", 24)
+        if max_hold_hours > 0:
             from datetime import datetime, timezone
             if isinstance(pos.entry_time, str):
                 entry_dt = datetime.fromisoformat(pos.entry_time)
                 if entry_dt.tzinfo is None:
                     entry_dt = entry_dt.replace(tzinfo=timezone.utc)
             else:
-                entry_dt = pos.entry_time.replace(tzinfo=timezone.utc)
-            age_min = (datetime.now(timezone.utc) - entry_dt).total_seconds() / 60
-            if age_min > 30:
-                log.info("Position %s has no open orders (age=%.1f min) — marking as closed",
-                         pos.pair, age_min)
-                # Try to get latest trade info from exchange to calculate P&L
-                try:
-                    order = await self.exchange.get_order(pos.pair, pos.entry_order_id)
-                    if order.status in ("FILLED", "CANCELED", "EXPIRED") or not order.order_id:
-                        exit_px = order.avg_price or pos.sl_price or pos.entry_price
-                        entry_cost = pos.entry_price * pos.quantity
-                        exit_value = exit_px * pos.quantity
-                        pnl = (exit_value - entry_cost) if pos.direction == "LONG" else (entry_cost - exit_value)
-                        self.position_repo.close_position(
-                            pos.id, exit_price=exit_px,
-                            pnl=pnl, reason="Auto-detected close (no orders remaining)",
-                            closed_by="SYSTEM",
-                        )
-                        log.info("Position %s auto-closed via exchange, PnL=%.2f", pos.pair, pnl)
-                except Exception as e:
-                    # If we can't query the order, close with 0 P&L to unblock
-                    log.warning("Could not verify %s close reason: %s — closing anyway", pos.pair, e)
-                    self.position_repo.close_position(
-                        pos.id, exit_price=pos.entry_price,
-                        pnl=0.0, reason="Auto-closed (no orders, verification failed)",
-                        closed_by="SYSTEM",
-                    )
-
-        # Time-based exit — close if position has been open too long
-        max_hold_hours = self.config.get("risk", {}).get("max_position_hold_hours", 24)
-        if max_hold_hours > 0:
-            from datetime import datetime, timezone
-            if isinstance(pos.entry_time, str):
-                entry_dt = datetime.fromisoformat(pos.entry_time).replace(tzinfo=timezone.utc)
-            else:
-                entry_dt = pos.entry_time.replace(tzinfo=timezone.utc)
+                entry_dt = pos.entry_time
+                if entry_dt.tzinfo is None:
+                    entry_dt = entry_dt.replace(tzinfo=timezone.utc)
             age_hours = (datetime.now(timezone.utc) - entry_dt).total_seconds() / 3600
             if age_hours > max_hold_hours:
                 log.info("Time-based exit for %s (age=%.1fh > max=%dh)",
                          pos.pair, age_hours, max_hold_hours)
-                await self._close_position(pos, f"Time exit ({age_hours:.1f}h)")
+                await self._close_position(
+                    pos, f"Time exit ({age_hours:.1f}h)",
+                    closed_by="SYSTEM", market=True,
+                )
 
     async def close_position(self, pos: Position, reason: str,
                              closed_by: str = "MANUAL") -> bool:
