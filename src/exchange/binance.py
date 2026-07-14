@@ -260,6 +260,13 @@ class BinanceExchange(Exchange):
         base_url = urls["testnet"] if testnet else urls["mainnet"]
         self._base = base_url
         self._client = httpx.AsyncClient(base_url=base_url, timeout=10) if not self.proxy_enabled else None
+
+        # A testnet API key/secret (testnet.binancefuture.com / testnet.binance.vision)
+        # may be configured with active: binance instead of binance_testnet, so
+        # derive the authoritative testnet flag from the chosen base URL as well.
+        # This keeps the Algo Order API (mainnet-only) OFF on testnet and avoids
+        # 404s + rejected-order spam for pairs that need it.
+        self.testnet = self.testnet or "testnet" in base_url
         # Cache symbol rules: stepSize/minQty/maxQty/valid
         self._filters: dict[str, dict] = {}
         self._invalid_symbols: dict[str, datetime] = {}
