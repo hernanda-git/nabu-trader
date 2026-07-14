@@ -6,4 +6,4 @@ it surfaces in the /version command, the startup banner, traded telemetry, and
 the API server's reported version. Bump it on each release.
 """
 
-__version__ = 68
+__version__ = 69

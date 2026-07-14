@@ -244,6 +244,8 @@ class PositionManager:
         filters = filters or {}
 
         placed_any = False
+        sl_order_status = None  # "placed" | "unplaceable" | None
+        tp_placed_any = False
 
         def _bump_for_min_notional(qty: float, price: float, filters: dict) -> float:
             """Bump qty until qty*price meets MIN_NOTIONAL.
@@ -275,11 +277,16 @@ class PositionManager:
                 if sl_order.order_id:
                     log.info("reconcile: SL placed %s @ %s (qty=%s)", symbol, sl_price, sl_qty)
                     placed_any = True
-                elif sl_order.status == "FAILED":
-                    # Both standard and Algo Order API rejected — last resort:
-                    # price-monitor in _check_position (so the position is at
-                    # least closed if SL is hit, even without a live order).
+                    sl_order_status = "placed"
+                elif sl_order.status in ("FAILED", "UNPROTECTED"):
+                    # Both standard and Algo Order API rejected (or the pair is
+                    # not supported on the standard endpoint, e.g. XPLUSDT /
+                    # 1000x) — last resort: price-monitor in _check_position so
+                    # the position is at least closed if SL is hit, even without
+                    # a live exchange order. Mark as monitored so the self-heal
+                    # won't keep re-attempting a never-placeable SL every tick.
                     self._sl_monitored.add(symbol)
+                    sl_order_status = "unplaceable"
                     log.warning("reconcile: SL NOT placed %s @ %s (monitored by PM): %s",
                                symbol, sl_price, sl_order.error)
                 else:
@@ -298,6 +305,7 @@ class PositionManager:
                 if tp_order.order_id:
                     log.info("reconcile: TP%d placed %s @ %s (qty=%s)", i + 1, symbol, tp_price, tp_qty)
                     placed_any = True
+                    tp_placed_any = True
                 elif tp_order.status == "FAILED":
                     # Both standard and Algo Order API rejected — final fallback:
                     # a resting LIMIT (maker close) so TP can still fill.
@@ -311,10 +319,16 @@ class PositionManager:
                     log.warning("reconcile: TP%d NOT placed %s @ %s (%s)",
                                 i + 1, symbol, tp_price, tp_order.error)
 
-        # Mark protection placed so the self-heal won't re-run on the next tick.
-        # (Only when at least one order actually went live — if everything
-        # failed we leave it clear so the next cycle retries.)
-        if placed_any:
+        # Mark protection as handled so the self-heal won't re-run next tick.
+        # We set it once BOTH SL and TP have been addressed — i.e. placed,
+        # determined unplaceable (monitored), or skipped because an order of
+        # that type already exists on the exchange. This covers pairs like
+        # XPLUSDT / 1000x where the SL can never be a real exchange order:
+        # the SL branch adds the pair to _sl_monitored AND we mark it handled
+        # here, so the self-heal stops re-attempting a never-placeable SL.
+        sl_addressed = (not sl_price) or skip_sl or (sl_order_status in ("placed", "unplaceable"))
+        tp_addressed = (not tp_prices) or skip_tp or (tp_placed_any)
+        if sl_addressed and tp_addressed:
             self._protection_placed.add(symbol)
 
     async def _check_positions(self):
@@ -356,14 +370,19 @@ class PositionManager:
         # Self-heal: if SL and/or TP are missing on the exchange (e.g. the
         # position was reconciled before the Algo Order API fallback existed,
         # or an order got cancelled externally), (re)place them — but only
-        # once per session (tracked in _protection_placed) to avoid spamming.
-        needs_protection = (not sl_ok or tp_count == 0) and pos.pair not in self._protection_placed
-        if needs_protection and (pos.sl_price or pos.tp_prices):
+        # once per session per symbol (tracked in _protection_placed) so we
+        # never spam retries every tick. A pair whose SL can never be a real
+        # order (XPLUSDT / 1000x → handled by price-monitor) is also covered:
+        # _place_protection marks the pair handled once SL is either placed or
+        # determined unplaceable, so the self-heal stops re-attempting it.
+        needs_sl = (not sl_ok) and (pos.pair not in self._protection_placed)
+        needs_tp = (tp_count == 0) and (pos.pair not in self._protection_placed)
+        if (needs_sl or needs_tp) and (pos.sl_price or pos.tp_prices):
             log.info("Self-heal: (re)placing missing protection for %s (sl_ok=%s tp=%d)",
                      pos.pair, sl_ok, tp_count)
             await self._place_protection(
                 pos.id, pos, pos.pair, pos.quantity, pos.sl_price, pos.tp_prices or [],
-                skip_sl=sl_ok, skip_tp=(tp_count > 0),
+                skip_sl=not needs_sl, skip_tp=not needs_tp,
             )
 
         # Price-based SL check — for positions where exchange STOP orders aren't

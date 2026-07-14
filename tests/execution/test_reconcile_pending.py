@@ -49,7 +49,15 @@ class FakeExchange:
                 "minNotional": 1.0}
 
     async def get_open_orders(self, symbol=None):
-        return []
+        # Reflect placed SL/TP so the self-heal sees them and doesn't re-place.
+        out = []
+        for kind, sym, price, side, qty in self.placed:
+            t = "STOP" if kind == "SL" else "TAKE_PROFIT"
+            out.append(OrderInfo(
+                order_id=f"{kind}1", symbol=sym, side=side, type=t,
+                quantity=qty, price=price, status="NEW",
+            ))
+        return out
 
     async def get_algo_open_orders(self, symbol=None):
         return []
