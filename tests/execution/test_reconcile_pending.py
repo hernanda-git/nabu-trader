@@ -48,13 +48,25 @@ class FakeExchange:
         return {"stepSize": 1.0, "tickSize": 0.0001, "minQty": 1.0,
                 "minNotional": 1.0}
 
+    async def get_open_orders(self, symbol=None):
+        return []
+
+    async def get_algo_open_orders(self, symbol=None):
+        return []
+
+    async def get_mark_price(self, symbol):
+        return 0.089
+
+    async def cancel_all_orders(self, symbol):
+        return 0
+
     async def stop_loss(self, symbol, quantity, sl_price, side="SELL"):
-        self.placed.append(("SL", symbol, sl_price, side))
+        self.placed.append(("SL", symbol, sl_price, side, quantity))
         return OrderInfo(order_id="sl1", symbol=symbol, side=side, type="STOP",
                          quantity=quantity, price=sl_price, status="NEW")
 
     async def take_profit(self, symbol, quantity, tp_price, side="SELL"):
-        self.placed.append(("TP", symbol, tp_price, side))
+        self.placed.append(("TP", symbol, tp_price, side, quantity))
         return OrderInfo(order_id="tp1", symbol=symbol, side=side,
                          type="TAKE_PROFIT", quantity=quantity, price=tp_price,
                          status="NEW")
@@ -179,3 +191,46 @@ def test_reconcile_skips_still_resting(repos):
     asyncio.run(_run())
     assert repos["position"].get_open_by_pair("XPLUSDT") is None
     assert len(exch.placed) == 0
+
+
+def test_self_heal_replaces_missing_protection(repos):
+    """A position that has NO protection orders on the exchange (e.g. an
+    XPLUSDT position reconciled before the Algo Order API existed, or whose
+    conditional orders were cancelled externally) must have SL/TP (re)placed
+    by the self-heal — and exactly once (tracked in _protection_placed)."""
+    cid, oid = _seed(repos)
+    exch = FakeExchange(avg_price=0.0892, filled_qty=57.0)
+    pm = PositionManager(
+        exchange=exch, config={}, position_repo=repos["position"],
+        order_repo=repos["order"], decision_repo=repos["decision"],
+        position_event_repo=repos["pevent"], signal_repo=SignalRepository(repos["conn"]),
+    )
+
+    from datetime import datetime, timezone
+    # Pre-create the open position WITHOUT placing protection (simulates the
+    # old state where the bot reconciled but left SL/TP only price-monitored).
+    pos = Position(pair="XPLUSDT", direction="LONG", entry_price=0.0892,
+                   quantity=57.0, sl_price=0.08735, tp_prices=[0.0928],
+                   entry_time=datetime.now(timezone.utc).isoformat(),
+                   status="OPEN")
+    pid = repos["position"].create(pos)
+
+    async def _run():
+        await pm._check_position(pos)
+
+    asyncio.run(_run())
+
+    # Self-heal placed SL + TP via the exchange.
+    kinds = {p[0] for p in exch.placed}
+    assert "SL" in kinds and "TP" in kinds, f"self-heal placed: {exch.placed}"
+    sl = next(p for p in exch.placed if p[0] == "SL")
+    tp = next(p for p in exch.placed if p[0] == "TP")
+    assert sl[2] == 0.08735
+    assert tp[2] == 0.0928
+    # Recorded so the next tick won't re-place.
+    assert "XPLUSDT" in pm._protection_placed
+
+    # Second tick must NOT place again (idempotent via _protection_placed).
+    exch.placed.clear()
+    asyncio.run(_run())
+    assert len(exch.placed) == 0, f"self-heal re-placed on 2nd tick: {exch.placed}"

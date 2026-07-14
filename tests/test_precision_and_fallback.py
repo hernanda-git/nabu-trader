@@ -204,14 +204,39 @@ class _R:
 # reduceOnly, and the returned type must be the real Futures conditional type.
 
 class _CaptureConditionalExchange(BinanceExchange):
-    """Capture the params POSTed for SL/TP and echo back the sent type."""
+    """Capture the params POSTed for SL/TP and echo back the sent type.
+
+    Tracks BOTH the standard /fapi/v1/order endpoint AND the Algo Order API
+    (/fapi/v1/algo/order) so tests can assert which path a conditional order
+    took (algo is the fallback for pairs that reject STOP/TP on the standard
+    endpoint, e.g. 1000x contracts and small/new futures like XPLUSDT).
+    """
     def __init__(self, *a, **k):
         super().__init__(*a, **k)
         self.last_params: dict | None = None
         self.sent_type: str | None = None
+        self.last_algo_params: dict | None = None
+        self.algo_sent_type: str | None = None
+        # When True, simulate the standard endpoint rejecting with -4120 so the
+        # caller must fall back to the Algo Order API.
+        self.reject_standard_with_4120 = False
 
     async def _signed_request(self, method, path, params=None):
+        if path.endswith("/algo/order"):
+            self.last_algo_params = params
+            self.algo_sent_type = params.get("type")
+            return {
+                "algoId": "ALGO123", "clientAlgoId": "cALGO123",
+                "symbol": params.get("symbol"), "side": params.get("side"),
+                "type": params.get("type"), "origQty": params.get("quantity"),
+                "price": params.get("price"), "status": "NEW",
+            }
         if path.endswith("/order"):
+            if self.reject_standard_with_4120:
+                # Simulate Binance -4120 ("use the Algo Order API")
+                from httpx import HTTPStatusError, Request, Response
+                resp = Response(400, text='{"code":-4120,"msg":"Order type not supported for this endpoint. Please use the Algo Order API endpoints"}')
+                raise HTTPStatusError("4120", request=Request("POST", "x"), response=resp)
             self.last_params = params
             self.sent_type = params.get("type")
             return {
@@ -256,15 +281,35 @@ async def test_take_profit_is_conditional_limit_not_market():
 
 
 @pytest.mark.asyncio
-async def test_1000x_stop_loss_still_unprotected():
-    """1000x contracts block STOP (-4120): SL must be deferred to the
-    position manager, never sent as a rejected order."""
+async def test_1000x_and_new_futures_use_algo_order_api():
+    """1000x contracts and small/new futures (e.g. XPLUSDT) reject conditional
+    STOP/TP on the standard /order endpoint with -4120. Both must now fall back
+    to the Algo Order API and return a REAL placed conditional order (not
+    UNPROTECTED / never-sent)."""
+    # 1000x contract
     ex = _CaptureConditionalExchange(api_key="k", api_secret="s", testnet=False, futures=True)
     ex._client = _StubClient()
+    ex.reject_standard_with_4120 = True
     _seed_filters(ex, "1000BONKUSDT", tick=0.0000001, step=1.0)
     info = await ex.stop_loss("1000BONKUSDT", 1_000_000.0, 0.0000039, "SELL")
-    assert info.status == "UNPROTECTED", f"1000x SL should be UNPROTECTED: {info.status}"
-    assert info.order_id == "", "1000x SL must not be placed on the wire"
+    assert info.status != "FAILED", f"1000x SL wrongly failed: {info.error}"
+    assert info.order_id, "1000x SL algo order id missing"
+    assert ex.algo_sent_type == "STOP", f"1000x SL not routed to algo STOP: {ex.algo_sent_type}"
+    p = ex.last_algo_params
+    assert float(p["stopPrice"]) == 0.0000039, f"algo SL stopPrice wrong: {p}"
+    assert p["reduceOnly"] == "true", "algo SL must be reduceOnly"
+
+    # Small/new futures (XPLUSDT-style): standard endpoint rejects, algo works.
+    ex2 = _CaptureConditionalExchange(api_key="k", api_secret="s", testnet=False, futures=True)
+    ex2._client = _StubClient()
+    ex2.reject_standard_with_4120 = True
+    _seed_filters(ex2, "XPLUSDT", tick=0.0001, step=1.0)
+    info2 = await ex2.take_profit("XPLUSDT", 57.0, 0.0928, "SELL")
+    assert info2.status != "FAILED", f"XPLUSDT TP wrongly failed: {info2.error}"
+    assert info2.order_id, "XPLUSDT TP algo order id missing"
+    assert ex2.algo_sent_type == "TAKE_PROFIT", \
+        f"XPLUSDT TP not routed to algo TAKE_PROFIT: {ex2.algo_sent_type}"
+
 
 
 # ─── 5. Position monitor recognizes real conditional order types ────────────

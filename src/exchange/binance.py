@@ -1074,26 +1074,35 @@ class BinanceExchange(Exchange):
         Uses STOP (not STOP_MARKET) so it appears in the Conditional tab
         and fills as a LIMIT order at the specified price — no slippage.
 
-        For 1000x contracts where STOP is blocked (-4120), falls back to
-        position manager monitoring.
+        For pairs where the standard endpoint rejects conditional STOP (-4120:
+        1000x contracts AND small/new futures like XPLUSDT that require the
+        Algo Order API), retries via the algo endpoint so a REAL conditional
+        SL is placed (visible in the Conditional tab) instead of leaving the
+        position unprotected.
         """
         resolve_sym, _, _ = _resolve_futures_symbol(symbol)
         is_1000x = resolve_sym.startswith("1000")
 
         if self.futures and is_1000x:
-            log.info("STOP orders blocked for %s (1000x). SL monitored by position manager.", resolve_sym)
-            return OrderInfo(
-                order_id="", symbol=symbol, side=side.upper(),
-                type="STOP", quantity=quantity,
-                status="UNPROTECTED",
-                error="STOP not supported for 1000x; SL handled by position manager",
-            )
+            # 1000x STOP-specific behaviour: still route through the algo API
+            # (it's the only path that works for these contracts).
+            log.info("STOP for %s (1000x) → Algo Order API", resolve_sym)
+            return await self._algo_order(symbol, side, "STOP", quantity,
+                                          stop_price, price=stop_price, reduce=True)
 
         # STOP-LIMIT: triggers at stop_price, fills as LIMIT at stop_price.
         # This is a closing (reduce-only) order.
-        return await self._place_order(symbol, side, "STOP", quantity,
-                                       price=stop_price, stop_price=stop_price,
-                                       reduce=True)
+        result = await self._place_order(symbol, side, "STOP", quantity,
+                                         price=stop_price, stop_price=stop_price,
+                                         reduce=True)
+        # -4120: conditional STOP not on the standard endpoint for this pair
+        # (small/new futures). Retry via the Algo Order API — the supported
+        # path that yields a real conditional SL order.
+        if result.status == "FAILED" and result.error and "-4120" in result.error:
+            log.info("STOP rejected for %s (-4120) — retrying via Algo Order API", resolve_sym)
+            return await self._algo_order(symbol, side, "STOP", quantity,
+                                          stop_price, price=stop_price, reduce=True)
+        return result
 
     async def take_profit(self, symbol: str, quantity: float, tp_price: float,
                           side: str = "SELL") -> OrderInfo:
@@ -1101,14 +1110,24 @@ class BinanceExchange(Exchange):
 
         Uses TAKE_PROFIT (not TAKE_PROFIT_MARKET) so it appears in the
         Conditional tab and fills as a LIMIT order — no slippage.
+
+        For pairs where the standard endpoint rejects conditional TP (-4120:
+        small/new futures like XPLUSDT, 1000x contracts), retries via the Algo
+        Order API so a REAL conditional TP is placed instead of a plain resting
+        LIMIT.
         """
         # TAKE_PROFIT-LIMIT: triggers at tp_price, fills as LIMIT at tp_price.
         # Routed through the "TAKE_PROFIT_LIMIT" key so _map_type produces the
         # conditional-limit Futures type (TAKE_PROFIT), NOT the market variant.
         # This is a closing (reduce-only) order.
-        return await self._place_order(symbol, side, "TAKE_PROFIT_LIMIT", quantity,
-                                       price=tp_price, stop_price=tp_price,
-                                       reduce=True)
+        result = await self._place_order(symbol, side, "TAKE_PROFIT_LIMIT", quantity,
+                                         price=tp_price, stop_price=tp_price,
+                                         reduce=True)
+        if result.status == "FAILED" and result.error and "-4120" in result.error:
+            log.info("TP rejected for %s (-4120) — retrying via Algo Order API", symbol)
+            return await self._algo_order(symbol, side, "TAKE_PROFIT", quantity,
+                                          tp_price, price=tp_price, reduce=True)
+        return result
 
     async def cancel_order(self, symbol: str, order_id: str) -> bool:
         resolve_sym, _, _ = _resolve_futures_symbol(symbol)
@@ -1169,3 +1188,140 @@ class BinanceExchange(Exchange):
             return orders
         except Exception:
             return []
+
+    async def _algo_order(self, symbol: str, side: str, algo_type: str,
+                         quantity: float, stop_price: float,
+                         price: float | None = None,
+                         reduce: bool = True) -> OrderInfo:
+        """Place a conditional STOP/TAKE_PROFIT via the Binance Algo Order API.
+
+        Some pairs (small/new futures like XPLUSDT, and 1000x contracts) reject
+        conditional STOP/TP on the standard ``/fapi/v1/order`` endpoint with
+        -4120 ("use the Algo Order API"). The algo endpoint
+        (POST /fapi/v1/algo/order) is the supported path for those pairs and
+        produces a REAL conditional order the user sees in the Conditional tab.
+
+        Args:
+            symbol: Trading pair (e.g. 'XPLUSDT').
+            side: 'BUY'/'SELL'.
+            algo_type: 'STOP' or 'TAKE_PROFIT' (conditional limit variants).
+            quantity: Order quantity (base tokens).
+            stop_price: Trigger price.
+            price: Limit price (for STOP/TAKE_PROFIT limit). Defaults to stop_price.
+            reduce: Attach reduceOnly so the order can only close, never flip.
+        """
+        resolve_sym, _, _ = _resolve_futures_symbol(symbol)
+        side_upper = side.upper()
+        qty = quantity
+        if self.futures:
+            qty, _ = await self._round_quantity(resolve_sym, qty, price_ref=price or stop_price)
+            if price is not None:
+                price, _ = await self._round_price(resolve_sym, price)
+            stop_price, _ = await self._round_price(resolve_sym, stop_price)
+
+        params = {
+            "symbol": resolve_sym,
+            "side": side_upper,
+            "type": algo_type,
+            "quantity": qty,
+            "stopPrice": stop_price,
+            "urgency": "LOW",
+        }
+        if price is not None:
+            params["price"] = price
+        if reduce:
+            params["reduceOnly"] = "true"
+
+        try:
+            data = await self._signed_request("POST", "/fapi/v1/algo/order", params)
+            algo_id = data.get("clientAlgoId") or data.get("algoId") or ""
+            return OrderInfo(
+                order_id=str(algo_id),
+                symbol=data.get("symbol", resolve_sym),
+                side=side_upper,
+                type=algo_type,
+                quantity=float(data.get("origQty", qty)),
+                price=float(data.get("price", price or 0)) if data.get("price") else (price or 0.0),
+                status="NEW",
+                filled_quantity=0.0,
+                avg_price=0.0,
+            )
+        except httpx.HTTPStatusError as e:
+            status = e.response.status_code
+            category = _categorize_error(status, e.response.text, e)
+            error_msg = _format_order_error(
+                symbol, side_upper, algo_type, qty, price,
+                getattr(self, "_last_leverage", 1), status, e.response.text,
+            )
+            log.error("Algo order failed [%s]: %s", category.value, error_msg)
+            return OrderInfo(
+                order_id="", symbol=symbol, side=side, type=algo_type,
+                quantity=qty, status="FAILED", error=error_msg,
+            )
+        except Exception as e:
+            log.error("Algo order failed: %s", e)
+            return OrderInfo(
+                order_id="", symbol=symbol, side=side, type=algo_type,
+                quantity=qty, status="FAILED", error=str(e),
+            )
+
+    async def get_algo_open_orders(self, symbol: str | None = None) -> list[OrderInfo]:
+        """List open algo (conditional) orders via the Algo Order API.
+
+        Algo orders do NOT appear in the standard /fapi/v1/openOrders response,
+        so the monitor must query this endpoint to know whether a conditional
+        SL/TP is already live (idempotency / self-heal).
+        """
+        params = {}
+        if symbol:
+            resolve_sym, _, _ = _resolve_futures_symbol(symbol)
+            params["symbol"] = resolve_sym
+        try:
+            data = await self._signed_request("GET", "/fapi/v1/algo/orders", params)
+            orders = []
+            for o in data:
+                orders.append(OrderInfo(
+                    order_id=str(o.get("algoId", o.get("clientAlgoId", ""))),
+                    symbol=o.get("symbol", ""),
+                    side=o.get("side", ""),
+                    type=o.get("type", ""),
+                    quantity=float(o.get("origQty", o.get("quantity", 0)) or 0),
+                    price=float(o.get("price", 0)) if o.get("price") else 0.0,
+                    status=o.get("status", ""),
+                    filled_quantity=0.0,
+                    avg_price=0.0,
+                ))
+            return orders
+        except Exception:
+            return []
+
+    async def cancel_algo_order(self, symbol: str, algo_id: str) -> bool:
+        """Cancel a single algo (conditional) order by its algoId."""
+        if not algo_id:
+            return False
+        resolve_sym, _, _ = _resolve_futures_symbol(symbol)
+        try:
+            await self._signed_request("DELETE", "/fapi/v1/algo/order",
+                                       {"symbol": resolve_sym, "algoId": algo_id})
+            return True
+        except Exception:
+            return False
+
+    async def cancel_all_orders(self, symbol: str) -> int:
+        """Cancel all open orders for a symbol — standard AND algo (conditional).
+
+        Returns the total number of orders cancelled.
+        """
+        count = 0
+        # Standard resting orders (Basic tab / openOrders).
+        for o in await self.get_open_orders(symbol):
+            if await self.cancel_order(symbol, o.order_id):
+                count += 1
+        # Algo conditional orders (STOP/TAKE_PROFIT placed via the algo API).
+        try:
+            for o in await self.get_algo_open_orders(symbol):
+                if await self.cancel_algo_order(symbol, o.order_id):
+                    count += 1
+        except Exception:
+            pass
+        return count
