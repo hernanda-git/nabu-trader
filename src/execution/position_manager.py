@@ -582,8 +582,20 @@ class PositionManager:
             log.warning("Failed to cancel resting orders for %s: %s", resolved, e)
 
         # 3. Build a Position from the live info and close.
+        # Prefer the REAL local DB row id (if one exists) so that
+        # _finalize_close can persist the close + lifecycle event against the
+        # actual positions row. Using id=0 (or a fabricated id) would make
+        # _finalize_close insert a position_events row with a FK pointing at a
+        # non-existent positions row -> "FOREIGN KEY constraint failed", which
+        # was swallowed and reported the whole close as FAILED even though the
+        # Binance market order already filled. (See fix below.)
+        db_pos = None
+        try:
+            db_pos = self.position_repo.get_open_by_pair(resolved)
+        except Exception:
+            db_pos = None
         pos = _Position(
-            id=0,
+            id=db_pos.id if db_pos is not None else 0,
             pair=pos_info.symbol,
             direction=pos_info.direction,
             entry_price=pos_info.entry_price,
@@ -729,7 +741,14 @@ class PositionManager:
             pnl=pnl, reason=reason, closed_by=closed_by,
         )
 
-        # Log position event
+        # Log position event — BEST EFFORT, never roll back a successful close.
+        # pos.id may be 0 (manual close where the bot had no local positions row,
+        # e.g. a position opened directly on Binance). A 0/unknown id would make
+        # save_event() violate position_events.position_id REFERENCES positions(id)
+        # and throw — swallowing that exception previously made a *real, filled*
+        # Binance close report as FAILED. So we guard the insert: if there is no
+        # real positions row to attach to, we log a standalone event with a NULL
+        # position_id instead of crashing.
         if self.position_event_repo:
             event_type = {
                 "MANUAL": "POSITION_CLOSED",
@@ -738,19 +757,33 @@ class PositionManager:
                 "TRIGGER": "POSITION_CLOSED",
                 "SYSTEM": "AUTO_DETECTED_CLOSE",
             }.get(closed_by, "POSITION_CLOSED")
-            self.position_event_repo.save_event(
-                position_id=pos.id,
-                event_type=event_type,
-                details=f"Closed {pos.direction} @ {order.avg_price:.8f} PnL={pnl:.2f} ({reason})",
-                metadata={
-                    "pair": pos.pair,
-                    "direction": pos.direction,
-                    "exit_price": order.avg_price,
-                    "pnl": pnl,
-                    "reason": reason,
-                    "closed_by": closed_by,
-                },
-            )
+            try:
+                # A real, persisted positions row exists -> attach normally.
+                if pos.id and pos.id > 0:
+                    self.position_event_repo.save_event(
+                        position_id=pos.id,
+                        event_type=event_type,
+                        details=f"Closed {pos.direction} @ {order.avg_price:.8f} PnL={pnl:.2f} ({reason})",
+                        metadata={
+                            "pair": pos.pair,
+                            "direction": pos.direction,
+                            "exit_price": order.avg_price,
+                            "pnl": pnl,
+                            "reason": reason,
+                            "closed_by": closed_by,
+                        },
+                    )
+                else:
+                    # No local positions row (e.g. a position opened directly on
+                    # Binance, never tracked by the bot). position_events.position_id
+                    # is NOT NULL + FK-restricted, so we cannot attach an event to a
+                    # non-existent row — the close has ALREADY been applied on the
+                    # exchange, so we simply skip the lifecycle event. The close is
+                    # still reported as successful to the caller.
+                    log.debug("Close applied for %s with no local positions row (externally opened)", pos.pair)
+            except Exception as e:
+                log.warning("Failed to record close event for %s (close already applied): %s",
+                            pos.pair, e)
         log.info("Position closed: %s %s PnL=%.2f (%s)", pos.direction, pos.pair, pnl, closed_by)
         return True
 
