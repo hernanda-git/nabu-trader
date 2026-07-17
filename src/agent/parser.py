@@ -198,7 +198,8 @@ def extract_leverage(text: str) -> int | None:
 # ─── Management command detection ──────────────────────────────────────────
 # Channel management messages like "sl to entry" / "sl at entry" are replies to
 # a previous signal. They are NOT fresh entries — they are instructions to
-# modify the open position (move its Stop Loss to the entry/breakeven price).
+# modify the open position (move its Stop Loss to the entry/breakeven price),
+# move a take-profit level (tp1/tp2/tp3), or fully close it ("full").
 _MANAGEMENT_PATTERNS = [
     re.compile(r"\bsl\s+(?:to|at|@)\s+entry\b", re.I),
     re.compile(r"\bsl\s*=\s*entry\b", re.I),
@@ -207,45 +208,97 @@ _MANAGEMENT_PATTERNS = [
     re.compile(r"\bbe\b", re.I),  # "be" shorthand often used as "move to breakeven"
 ]
 
+# "tp1" / "tp2" / "tp3" — optional explicit price after a separator.
+_MGMT_TP_RE = re.compile(r"\btp\s*(\d)\b\s*(?:[:@\-]\s*([\d,]+(?:\.\d+)?))?", re.I)
+# "full" (standalone) — full market close of the position.
+_MGMT_FULL_RE = re.compile(r"\bfull\b", re.I)
+
+# Management action sentinels.
+_MGMT_SL_ENTRY = "SL_ENTRY"
+_MGMT_TP = "TP"
+_MGMT_FULL = "FULL"
+
 
 def is_management_command(raw_text: str) -> bool:
-    """Return True if the message looks like a position-management command."""
+    """Return True if the message looks like a position-management command.
+
+    Covers sl-to-entry, tpN, and full-close. These skip the LLM and are
+    handled directly by the orchestrator's management path.
+    """
     if not raw_text:
         return False
-    return any(p.search(raw_text) for p in _MANAGEMENT_PATTERNS)
+    if any(p.search(raw_text) for p in _MANAGEMENT_PATTERNS):
+        return True
+    if _MGMT_FULL_RE.search(raw_text):
+        return True
+    if _MGMT_TP_RE.search(raw_text):
+        return True
+    return False
+
+
+def _mgmt_signal(message_id, channel, raw_text, pair, *, action, tp_index=None,
+                 tp_price=None, sl_price=None):
+    """Helper to build a management TradeSignal with the right routing fields."""
+    tp_prices = [tp_price] if tp_price is not None else []
+    return TradeSignal(
+        message_id=message_id, channel=channel, raw_text=raw_text,
+        pair=pair, direction=None,
+        sl_price=sl_price if sl_price is not None else _SL_TO_ENTRY if action == _MGMT_SL_ENTRY else None,
+        tp_prices=tp_prices,
+        mgmt_action=action,
+        tp_index=tp_index,
+    )
 
 
 def parse_management_command(message_id: int, channel: str, raw_text: str,
                              reply_pair: str | None = None) -> TradeSignal | None:
-    """Detect a 'sl to entry' style management command.
+    """Detect and classify a position-management command.
 
-    Returns a TradeSignal with direction=None and a special ``sl_price`` marker
-    meaning "move SL to the position's entry price" — or None if this is not a
-    management command. The pair is resolved from the reply context first, then
-    from the message's own text.
+    Returns a TradeSignal carrying ``mgmt_action`` (SL_ENTRY / TP / FULL) and
+    any level/price info, or None if this is not a management command. The pair
+    is resolved from the reply context first, then from the message's own text.
 
-    The resulting decision is always a MODIFY (handled by the orchestrator's
-    management path, NOT the LLM), with ``sl_price`` set to the sentinel
-    ``_SL_TO_ENTRY`` so the orchestrator substitutes the live entry price.
+    The orchestrator's management path handles these directly (NOT the LLM):
+      * SL_ENTRY — move SL to the position's entry price (breakeven).
+      * TP       — move/refresh take-profit level tpN (rest of position stays open).
+      * FULL     — full market close of the position.
     """
-    if not is_management_command(raw_text):
+    text = raw_text or ""
+    if not is_management_command(text):
         return None
 
     # Pair: prefer the replied-to message's pair, then try own text.
-    pair = reply_pair or _resolve_pair(raw_text)
-    if not pair:
-        # No pair resolvable — let the orchestrator report it clearly.
-        return TradeSignal(
-            message_id=message_id, channel=channel, raw_text=raw_text,
-            pair=None, direction=None,
-        )
+    pair = reply_pair or _resolve_pair(text)
 
-    return TradeSignal(
-        message_id=message_id, channel=channel, raw_text=raw_text,
-        pair=pair, direction=None,
-        # Sentinel: SL should be moved to the open position's entry price.
-        sl_price=_SL_TO_ENTRY,
-    )
+    # 1) sl to entry (breakeven)
+    if any(p.search(text) for p in _MANAGEMENT_PATTERNS):
+        if not pair:
+            return _mgmt_signal(message_id, channel, raw_text, None, action=_MGMT_SL_ENTRY)
+        return _mgmt_signal(message_id, channel, raw_text, pair, action=_MGMT_SL_ENTRY)
+
+    # 2) full close — decisive; takes priority over tpN if both appear.
+    if _MGMT_FULL_RE.search(text):
+        if not pair:
+            return _mgmt_signal(message_id, channel, raw_text, None, action=_MGMT_FULL)
+        return _mgmt_signal(message_id, channel, raw_text, pair, action=_MGMT_FULL)
+
+    # 3) tpN — move/refresh that TP level.
+    m = _MGMT_TP_RE.search(text)
+    if m:
+        tp_index = int(m.group(1)) - 1
+        tp_price = None
+        if m.group(2):
+            try:
+                tp_price = float(m.group(2).replace(",", ""))
+            except ValueError:
+                tp_price = None
+        if not pair:
+            return _mgmt_signal(message_id, channel, raw_text, None, action=_MGMT_TP,
+                                tp_index=tp_index, tp_price=tp_price)
+        return _mgmt_signal(message_id, channel, raw_text, pair, action=_MGMT_TP,
+                            tp_index=tp_index, tp_price=tp_price)
+
+    return None
 
 
 # Sentinel sl_price meaning "set SL to the position's entry price (breakeven)".

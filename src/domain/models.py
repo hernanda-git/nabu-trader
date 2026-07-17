@@ -22,6 +22,12 @@ class TradeSignal:
     tp_prices: list[float] = field(default_factory=list)
     has_media: bool = False
     timestamp: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    # ── Management-command routing ───────────────────────────────────────
+    # When a message is a position-management command (sl to entry / tpN / full),
+    # mgmt_action carries the kind and tp_index the 0-based TP level. Entry
+    # signals leave these as None.
+    mgmt_action: str | None = None   # "SL_ENTRY" | "TP" | "FULL"
+    tp_index: int | None = None      # 0-based index for "tpN" commands
 
 
 # ─── Decision ──────────────────────────────────────────────────────────────────

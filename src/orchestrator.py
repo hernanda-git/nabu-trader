@@ -76,6 +76,35 @@ def _config_hash(config: dict) -> str:
     return hashlib.sha256(json_mod.dumps(safe, sort_keys=True, default=str).encode()).hexdigest()[:16]
 
 
+
+# ── Management-command helpers ────────────────────────────────────────────
+
+def _cmd_word(action: str) -> str:
+    """Human-readable command word for user-facing skip messages."""
+    return {
+        "SL_ENTRY": "sl to entry",
+        "TP": "tpN",
+        "FULL": "full",
+    }.get(action, action.lower())
+
+
+def _resolve_tp_price(mgmt: "TradeSignal", position: "Position") -> float | None:
+    """Resolve the TP price for a tpN command.
+
+    Priority:
+      1. Explicit price given in the text (e.g. 'tp1 5.2') — mgmt.tp_prices[0].
+      2. The position's stored tp_prices[tp_index] from when it was opened.
+    Returns None if neither is available.
+    """
+    if mgmt.tp_prices:
+        return mgmt.tp_prices[0]
+    idx = mgmt.tp_index or 0
+    stored = position.tp_prices or []
+    if 0 <= idx < len(stored) and stored[idx] is not None:
+        return stored[idx]
+    return None
+
+
 class TradeOrchestrator:
     """Central pipeline coordinator for the auto-trade system."""
 
@@ -616,58 +645,159 @@ class TradeOrchestrator:
     async def _handle_management(self, correlation_id: str, message_id: int,
                                  raw_text: str, mgmt: "TradeSignal",
                                  result: dict) -> dict:
-        """Handle a position-management command (e.g. 'sl to entry').
+        """Handle a position-management command (sl to entry / tpN / full).
 
-        Resolves the target open position, moves its Stop Loss to the entry
-        price (breakeven), and reports back. No LLM call is made.
+        Resolves the target open position and acts on it directly — NO LLM call.
+        The command kind comes from ``mgmt.mgmt_action``:
+
+          * SL_ENTRY — move SL to the position's entry price (breakeven).
+          * TP       — move/refresh take-profit level tpN (rest stays open).
+          * FULL     — full market close of the position.
+
+        A pair derived from the reply context or the message text is
+        authoritative: if it has no open position we SKIP with a clear message
+        and never touch a different position. Only SL_ENTRY keeps the legacy
+        "no pair given -> single open position" fallback, because tpN/full are
+        too destructive to apply to the wrong position by guess.
         """
-        log.info("Management command: pair=%s", mgmt.pair)
+        action = mgmt.mgmt_action or "SL_ENTRY"
+        log.info("Management command: action=%s pair=%s", action, mgmt.pair)
         self._log(correlation_id, "INFO", "orchestrator",
-                  f"Management command: {raw_text[:120]}", {"pair": mgmt.pair})
+                  f"Management command: {raw_text[:120]}",
+                  {"action": action, "pair": mgmt.pair})
 
-        # Resolve target position.
-        # A pair derived from the reply context or the message text is
-        # authoritative — we must NOT silently retarget it to a different open
-        # position (e.g. a "sl to entry" reply on CAKE must not mutate INJUSDT).
-        # The single-open-position fallback only applies when NO pair was given
-        # at all (pair is None), so an untargeted command still resolves cleanly.
         resolved_pair = mgmt.pair
+
+        def _resolve_open(sym: str):
+            s = sym.replace("#", "").replace("$", "").upper()
+            if not s.endswith("USDT"):
+                s += "USDT"
+            return self.position_repo.get_open_by_pair(s)
+
         if resolved_pair:
-            # Normalize to the symbol used by the position repo (always *USDT).
-            sym = resolved_pair.replace("#", "").replace("$", "").upper()
-            if not sym.endswith("USDT"):
-                sym += "USDT"
-            position = self.position_repo.get_open_by_pair(sym)
+            position = _resolve_open(resolved_pair)
             if position is None:
                 result["action"] = "skipped"
                 result["skipped"] = True
                 result["reason"] = f"No open position for {resolved_pair}"
                 self.signal_repo.mark_processed(message_id, raw_text)
                 await self.notifier.send_message(
-                    f"⚠️ **sl to entry** — no open position found for `{resolved_pair}`.\n"
-                    f"Reply to the specific signal, or include the pair (e.g. `#BTC sl to entry`)."
+                    f"⚠️ **{action}** — no open position found for `{resolved_pair}`.\n"
+                    f"Reply to the specific signal, or include the pair "
+                    f"(e.g. `#BTC {_cmd_word(action)}`)."
                 )
                 return result
         else:
-            position = None
-
-        if position is None:
-            # No pair given at all — fall back to the single open position.
-            opens = self.position_repo.get_open_positions()
-            if len(opens) == 1:
-                position = opens[0]
+            # Only SL_ENTRY falls back to the single open position when untargeted.
+            if action == "SL_ENTRY":
+                opens = self.position_repo.get_open_positions()
+                position = opens[0] if len(opens) == 1 else None
             else:
+                position = None
+            if position is None:
                 result["action"] = "skipped"
                 result["skipped"] = True
-                result["reason"] = "Could not determine which position 'sl to entry' refers to (no pair in reply/text and 0 or >1 open positions)"
+                result["reason"] = (
+                    f"Could not determine which position '{_cmd_word(action)}' "
+                    f"refers to (no pair in reply/text and 0 or >1 open positions)"
+                )
                 self.signal_repo.mark_processed(message_id, raw_text)
                 await self.notifier.send_message(
-                    f"⚠️ **sl to entry** — could not determine the position.\n"
-                    f"Reply to the specific signal, or include the pair (e.g. `#BTC sl to entry`)."
+                    f"⚠️ **{action}** — could not determine the position.\n"
+                    f"Reply to the specific signal, or include the pair "
+                    f"(e.g. `#BTC {_cmd_word(action)}`)."
                 )
                 return result
 
-        # Build a MODIFY decision: SL → position entry price (breakeven).
+        # ── FULL: full market close ──────────────────────────────────────
+        if action == "FULL":
+            from src.domain.models import TradeDecision
+            decision = TradeDecision(
+                action="CLOSE",
+                pair=position.pair,
+                direction=position.direction,
+                entry_price=position.entry_price,
+                quantity=position.quantity,
+                sl_price=position.sl_price,
+                tp_prices=position.tp_prices or [],
+                reason=f"full close (manual command) — {position.pair}",
+            )
+            signal_db_id = self.signal_repo.save(mgmt)
+            exec_result = await self.order_service.execute(signal_db_id, decision)
+            self.signal_repo.mark_processed(message_id, raw_text)
+            result["action"] = "closed" if exec_result.success else "failed"
+            result["reason"] = decision.reason
+            if exec_result.success:
+                await self.notifier.send_message(
+                    f"🔴 **Position closed (full)** — `{position.pair}`\n"
+                    f"   ├ Direction: `{position.direction}`\n"
+                    f"   └ Qty: `{position.quantity}`"
+                )
+                self._log(correlation_id, "INFO", "orchestrator",
+                          f"Full close executed for {position.pair}")
+            else:
+                await self.notifier.send_message(
+                    f"❌ **full close failed** — {position.pair}\n"
+                    f"`{exec_result.error or 'unknown error'}`"
+                )
+                result["error"] = exec_result.error
+            return result
+
+        # ── TP: move/refresh take-profit level tpN ───────────────────────
+        if action == "TP":
+            tp_price = _resolve_tp_price(mgmt, position)
+            if tp_price is None:
+                result["action"] = "skipped"
+                result["skipped"] = True
+                result["reason"] = (
+                    f"No TP price for tp{mgmt.tp_index + 1} on {position.pair} "
+                    f"(position has no stored tp_prices and none given in text)"
+                )
+                self.signal_repo.mark_processed(message_id, raw_text)
+                await self.notifier.send_message(
+                    f"⚠️ **tp{mgmt.tp_index + 1}** — no TP price available for "
+                    f"`{position.pair}`.\nInclude a price (e.g. `tp{mgmt.tp_index + 1} 5.2`) "
+                    f"or set TP when opening the position."
+                )
+                return result
+            from src.domain.models import TradeDecision
+            decision = TradeDecision(
+                action="MODIFY",
+                pair=position.pair,
+                direction=position.direction,
+                entry_price=position.entry_price,
+                quantity=position.quantity,
+                sl_price=position.sl_price,
+                tp_prices=[tp_price],
+                reason=f"move TP{mgmt.tp_index + 1} to {tp_price} (rest of position stays open)",
+            )
+            signal_db_id = self.signal_repo.save(mgmt)
+            exec_result = await self.order_service.execute(signal_db_id, decision)
+            self.signal_repo.mark_processed(message_id, raw_text)
+            result["action"] = "modified" if exec_result.success else "failed"
+            result["reason"] = decision.reason
+            if exec_result.success:
+                await self.notifier.send_message(
+                    f"🎯 **TP moved — {position.pair}**\n"
+                    f"   ├ Level: `tp{mgmt.tp_index + 1}`\n"
+                    f"   ├ New TP: `{tp_price}`\n"
+                    f"   └ SL kept at `{position.sl_price}` (position stays open)"
+                )
+                self._log(correlation_id, "INFO", "orchestrator",
+                          f"TP{mgmt.tp_index + 1} moved for {position.pair} -> {tp_price}")
+            else:
+                await self.notifier.send_message(
+                    f"❌ **tp{mgmt.tp_index + 1} failed** — {position.pair}\n"
+                    f"`{exec_result.error or 'unknown error'}`"
+                )
+                result["error"] = exec_result.error
+            if self.event_bus:
+                self.event_bus.emit(Event("PositionModified", {
+                    "pair": position.pair, "tp": tp_price, "reason": decision.reason,
+                }))
+            return result
+
+        # ── SL_ENTRY: move SL to breakeven (entry price) ─────────────────
         # mgmt.sl_price is the sentinel _SL_TO_ENTRY (-1.0); substitute entry.
         if mgmt.sl_price == _SL_TO_ENTRY:
             new_sl = position.entry_price
@@ -725,7 +855,7 @@ class TradeOrchestrator:
             await self.notifier.send_message(
                 f"🔒 **SL → entry (breakeven)** — `{position.pair}`\n"
                 f"   ├ Direction: `{position.direction}`\n"
-                f"   ├ New SL: `{new_sl}` (was `{old_sl}`)\n"
+                f"   ├ New SL: `{new_sl}` (was `{old_sl}`)\\n"
                 f"   └ Entry: `{position.entry_price}`"
             )
             self._log(correlation_id, "INFO", "orchestrator",
