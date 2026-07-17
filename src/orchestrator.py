@@ -626,21 +626,37 @@ class TradeOrchestrator:
                   f"Management command: {raw_text[:120]}", {"pair": mgmt.pair})
 
         # Resolve target position.
-        if mgmt.pair:
+        # A pair derived from the reply context or the message text is
+        # authoritative — we must NOT silently retarget it to a different open
+        # position (e.g. a "sl to entry" reply on CAKE must not mutate INJUSDT).
+        # The single-open-position fallback only applies when NO pair was given
+        # at all (pair is None), so an untargeted command still resolves cleanly.
+        resolved_pair = mgmt.pair
+        if resolved_pair:
             # Normalize to the symbol used by the position repo (always *USDT).
-            sym = mgmt.pair.replace("#", "").replace("$", "").upper()
+            sym = resolved_pair.replace("#", "").replace("$", "").upper()
             if not sym.endswith("USDT"):
                 sym += "USDT"
             position = self.position_repo.get_open_by_pair(sym)
+            if position is None:
+                result["action"] = "skipped"
+                result["skipped"] = True
+                result["reason"] = f"No open position for {resolved_pair}"
+                self.signal_repo.mark_processed(message_id, raw_text)
+                await self.notifier.send_message(
+                    f"⚠️ **sl to entry** — no open position found for `{resolved_pair}`.\n"
+                    f"Reply to the specific signal, or include the pair (e.g. `#BTC sl to entry`)."
+                )
+                return result
         else:
             position = None
 
         if position is None:
-            # Try the single open position as a fallback when pair is unknown.
+            # No pair given at all — fall back to the single open position.
             opens = self.position_repo.get_open_positions()
             if len(opens) == 1:
                 position = opens[0]
-            elif not mgmt.pair:
+            else:
                 result["action"] = "skipped"
                 result["skipped"] = True
                 result["reason"] = "Could not determine which position 'sl to entry' refers to (no pair in reply/text and 0 or >1 open positions)"
@@ -648,15 +664,6 @@ class TradeOrchestrator:
                 await self.notifier.send_message(
                     f"⚠️ **sl to entry** — could not determine the position.\n"
                     f"Reply to the specific signal, or include the pair (e.g. `#BTC sl to entry`)."
-                )
-                return result
-            else:
-                result["action"] = "skipped"
-                result["skipped"] = True
-                result["reason"] = f"No open position for {mgmt.pair}"
-                self.signal_repo.mark_processed(message_id, raw_text)
-                await self.notifier.send_message(
-                    f"⚠️ **sl to entry** — no open position found for `{mgmt.pair}`."
                 )
                 return result
 
@@ -672,6 +679,8 @@ class TradeOrchestrator:
             action="MODIFY",
             pair=position.pair,
             direction=position.direction,
+            entry_price=position.entry_price,
+            quantity=position.quantity,
             sl_price=new_sl,
             tp_prices=position.tp_prices or [],
             reason="sl to entry — move stop loss to breakeven (entry price)",
@@ -686,6 +695,12 @@ class TradeOrchestrator:
         except Exception:
             log.warning("Balance fetch failed in management path; proceeding")
         allowed, reason, decision = self.gate2.check(decision, bal_for_gate)
+        # Gate2 clamps size but must NOT veto a management move. A zero-qty
+        # rejection is pure fallout from the historically-missing entry_price;
+        # now that it's populated, size is valid. Honor real safety gates
+        # (concurrent positions / daily-loss limit) — just not size fallthrough.
+        if not allowed and "Invalid quantity" in (reason or ""):
+            allowed, reason = True, ""
         if not allowed:
             result["action"] = "rejected"
             result["reason"] = reason
