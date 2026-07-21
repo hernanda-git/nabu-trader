@@ -20,7 +20,7 @@ from typing import Any
 
 from src.agent.agent import AgentBrain
 from src.agent.gate import SafetyGate1, SafetyGate2
-from src.agent.parser import parse_signal, parse_management_command, _MGMT_TP1_PARTIAL
+from src.agent.parser import parse_signal, parse_management_command, _MGMT_TP1_PARTIAL, _MGMT_FULL
 from src.agent.ta_context import fetch_ta_context
 from src.domain.models import (
     ConfigSnapshot,
@@ -239,6 +239,10 @@ class TradeOrchestrator:
                     return await self._handle_tp1_booked(
                         correlation_id, message_id, raw_text, mgmt, result
                     )
+                if mgmt.mgmt_action == _MGMT_FULL:
+                    return await self._handle_full_close(
+                        correlation_id, message_id, raw_text, mgmt, result
+                    )
                 return await self._handle_management(
                     correlation_id, message_id, raw_text, mgmt, result
                 )
@@ -424,41 +428,76 @@ class TradeOrchestrator:
                     }))
                 return result
 
-            # ── Step 6: Early exit for SKIP / CLOSE (LLM declined) ─────
-            if decision.action != "ENTER":  # SKIP / CLOSE — no gate needed
+            # ── Step 6: Handle SKIP / CLOSE ──────────────────────────
+            if decision.action == "SKIP":
                 self.signal_repo.mark_processed(message_id, raw_text)
-                result["action"] = decision.action.lower()
+                result["action"] = "skipped"
                 result["skipped"] = True
                 result["reason"] = decision.reason
                 self._log(correlation_id, "INFO", "orchestrator",
-                          f"{decision.action} {decision.pair}: {decision.reason[:100]}",
-                          {"action": decision.action, "pair": decision.pair,
+                          f"SKIP {decision.pair}: {decision.reason[:100]}",
+                          {"action": "SKIP", "pair": decision.pair,
                            "reason": decision.reason})
-                if decision.action == "SKIP":
-                    reason_text = decision.reason or "no reason provided"
-                    pos_lines = "\n".join(
-                        f"  • `{p['pair']}` {p['direction']} @ `{p['entry_price']}` × `{p['quantity']}`"
-                        for p in open_positions
-                    ) or "  (none)"
-                    pend_lines = "\n".join(
-                        f"  • `{ps.pair}` {ps.direction} `{ps.condition_type}` `{ps.trigger_price}` ({ps.timeframe})"
-                        for ps in pending_rows
-                    ) or "  (none)"
-                    bal_str = f"`{balance['USDT']:.2f}` USDT" if balance else "(unavailable)"
-                    skip_text = (
-                        f"⏭️ **Skipped**\n"
-                        f"Message: {raw_text[:300]}\n"
-                        f"Reason to Skip: {reason_text}\n"
-                        f"Current Positions:\n{pos_lines}\n"
-                        f"Current Pendings:\n{pend_lines}\n"
-                        f"Balance: {bal_str}"
-                    )
-                    await self.notifier.send_message(skip_text)
-                elif decision.action == "CLOSE":
-                    await self.notifier.send_message(
-                        f"🔴 **Close signal received** `{signal.pair}` — processing"
-                    )
+                reason_text = decision.reason or "no reason provided"
+                pos_lines = "\n".join(
+                    f"  • `{p['pair']}` {p['direction']} @ `{p['entry_price']}` × `{p['quantity']}`"
+                    for p in open_positions
+                ) or "  (none)"
+                pend_lines = "\n".join(
+                    f"  • `{ps.pair}` {ps.direction} `{ps.condition_type}` `{ps.trigger_price}` ({ps.timeframe})"
+                    for ps in pending_rows
+                ) or "  (none)"
+                bal_str = f"`{balance['USDT']:.2f}` USDT" if balance else "(unavailable)"
+                skip_text = (
+                    f"⏭️ **Skipped**\n"
+                    f"Message: {raw_text[:300]}\n"
+                    f"Reason to Skip: {reason_text}\n"
+                    f"Current Positions:\n{pos_lines}\n"
+                    f"Current Pendings:\n{pend_lines}\n"
+                    f"Balance: {bal_str}"
+                )
+                await self.notifier.send_message(skip_text)
                 return result
+
+            elif decision.action == "CLOSE":
+                self._log(correlation_id, "INFO", "orchestrator",
+                          f"CLOSE {decision.pair}: {decision.reason[:100]}",
+                          {"action": "CLOSE", "pair": decision.pair,
+                           "reason": decision.reason})
+                await self.notifier.send_message(
+                    f"🔴 **Close signal received** `{decision.pair}` — executing..."
+                )
+                # EXECUTE the close — order_service._close_position handles it
+                exec_result = await self.order_service.execute(
+                    signal_db_id, decision, decision_id=decision_db_id)
+                result["execution"] = {
+                    "success": exec_result.success,
+                    "order_id": exec_result.order_id,
+                    "symbol": exec_result.symbol,
+                    "price": exec_result.avg_price,
+                    "quantity": exec_result.filled_quantity,
+                }
+                self.signal_repo.mark_processed(message_id, raw_text)
+                if exec_result.success:
+                    result["action"] = "closed"
+                    await self.notifier.send_message(
+                        f"✅ **Position closed** — `{exec_result.symbol}`\n"
+                        f"   ├ Exit: `{exec_result.avg_price}`\n"
+                        f"   └ PnL: `{exec_result.error or '—'}`"
+                    )
+                else:
+                    result["action"] = "close_failed"
+                    result["reason"] = exec_result.error
+                    await self.notifier.send_message(
+                        f"❌ **Close failed** — `{decision.pair}`\n`{exec_result.error}`"
+                    )
+                if self.event_bus:
+                    self.event_bus.emit(Event("PositionClosed", {
+                        "pair": decision.pair, "reason": decision.reason,
+                    }))
+                return result
+
+            # ── Must be ENTER from here — proceed with Gate2 ────────
 
             # ── Step 6: Safety Gate 2 (post-LLM) — only for ENTER decisions
             bal_for_gate = (balance or {}).get("USDT", None)
@@ -1055,6 +1094,72 @@ class TradeOrchestrator:
             )
 
         self.signal_repo.mark_processed(message_id, raw_text)
+        return result
+
+    # ── Full close handler ─────────────────────────────────────────────────
+
+    async def _handle_full_close(self, correlation_id: str, message_id: int,
+                                  raw_text: str, mgmt: "TradeSignal",
+                                  result: dict) -> dict:
+        """Handle a 'closed at entry' / 'full' management command.
+
+        Market-closes the resolved position immediately without LLM.
+        """
+        log.info("Full close command: pair=%s text=%s", mgmt.pair, raw_text[:80])
+        self._log(correlation_id, "INFO", "orchestrator",
+                  f"Full close: {raw_text[:120]}", {"pair": mgmt.pair})
+
+        # Resolve position
+        sym = None
+        if mgmt.pair:
+            sym = mgmt.pair.replace("#", "").replace("$", "").upper()
+            if not sym.endswith("USDT"):
+                sym += "USDT"
+        position = self.position_repo.get_open_by_pair(sym) if sym else None
+
+        if position is None:
+            opens = self.position_repo.get_open_positions()
+            if len(opens) == 1:
+                position = opens[0]
+                sym = position.pair
+            else:
+                result["action"] = "skipped"
+                result["skipped"] = True
+                result["reason"] = f"Can't resolve position for {mgmt.pair}" if mgmt.pair else "No open position"
+                self.signal_repo.mark_processed(message_id, raw_text)
+                await self.notifier.send_message(
+                    f"⚠️ **Close command** — could not resolve position.\n"
+                    f"Specify a pair like `#ENA closed at entry`."
+                )
+                return result
+
+        if sym is None:
+            sym = position.pair
+
+        # Execute via position manager (market close)
+        ok = await self.position_manager.close_position(
+            position, f"Management close: {raw_text[:60]}", closed_by="MANUAL"
+        )
+
+        self.signal_repo.mark_processed(message_id, raw_text)
+        if ok:
+            result["action"] = "closed"
+            result["reason"] = "Position closed via management command"
+            await self.notifier.send_message(
+                f"✅ **Position closed** — `{sym}`\n"
+                f"Management command: `{raw_text[:100]}`"
+            )
+        else:
+            result["action"] = "failed"
+            result["error"] = "Close order did not fill"
+            await self.notifier.send_message(
+                f"❌ **Close failed** — `{sym}`\nMarket close did not fill. Check Binance."
+            )
+
+        if self.event_bus:
+            self.event_bus.emit(Event("PositionClosed", {
+                "pair": sym, "reason": raw_text[:100],
+            }))
         return result
 
     # ── Trigger execution ──────────────────────────────────────────────────

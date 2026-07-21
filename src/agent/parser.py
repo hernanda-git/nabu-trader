@@ -207,6 +207,10 @@ _MANAGEMENT_PATTERNS = [
     re.compile(r"\bbe\b", re.I),  # "be" shorthand for "breakeven"
 ]
 
+# Close-trigger patterns — channel posts "closed at entry", "cutting it here",
+# or similar to signal the position should be closed.
+_MGMT_CLOSE_RE = re.compile(r"(?:closed|close|cutting|cancel)\s+(?:at|it|the|my)?\s*(?:entry|here|\-?\d)", re.I)
+
 # "tp1" / "tp2" / "tp3" — optional explicit price after a separator.
 _MGMT_TP_RE = re.compile(r"\btp\s*(\d)\b\s*(?:[:@\-]\s*([\d,]+(?:\.\d+)?))?", re.I)
 # "full" (standalone) — full market close of the position.
@@ -229,12 +233,15 @@ _MGMT_TP1_PARTIAL = "TP1_PARTIAL"
 def is_management_command(raw_text: str) -> bool:
     """Return True if the message looks like a position-management command.
 
-    Covers sl-to-entry, tpN, full-close, and TP1-partial. These skip the
-    LLM and are handled directly by the orchestrator's management path.
+    Covers sl-to-entry, close-trigger, tpN, full-close, and TP1-partial.
+    These skip the LLM and are handled directly by the orchestrator's
+    management path.
     """
     if not raw_text:
         return False
     if any(p.search(raw_text) for p in _MANAGEMENT_PATTERNS):
+        return True
+    if _MGMT_CLOSE_RE.search(raw_text):
         return True
     if _MGMT_FULL_RE.search(raw_text):
         return True
@@ -289,10 +296,16 @@ def parse_management_command(message_id: int, channel: str, raw_text: str,
             return _mgmt_signal(
                 message_id, channel, raw_text, pair,
                 action=_MGMT_TP1_PARTIAL,
-                sl_price=-2.0,  # sentinel — orchestrator recognises this
+                sl_price=-2.0,
             )
 
-    # 2) sl to entry (breakeven)
+    # 2) Close-trigger commands (e.g. "closed at entry", "cutting it here")
+    if _MGMT_CLOSE_RE.search(text):
+        if not pair:
+            return _mgmt_signal(message_id, channel, raw_text, None, action=_MGMT_FULL)
+        return _mgmt_signal(message_id, channel, raw_text, pair, action=_MGMT_FULL)
+
+    # 3) sl to entry (breakeven)
     if any(p.search(text) for p in _MANAGEMENT_PATTERNS):
         if not pair:
             return _mgmt_signal(message_id, channel, raw_text, None, action=_MGMT_SL_ENTRY)
