@@ -933,9 +933,9 @@ class TradeOrchestrator:
         if sym is None:
             sym = position.pair
 
-        # ── Step 1: Calculate 1/3 partial close quantity ────────────────
+        # ── Step 1: Calculate 1/2 partial close quantity ────────────────
         total_qty = position.quantity
-        close_qty = total_qty / 3.0
+        close_qty = total_qty / 2.0
         remain_qty = total_qty - close_qty
 
         # Round to exchange precision
