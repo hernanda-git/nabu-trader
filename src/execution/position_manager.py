@@ -288,11 +288,14 @@ class PositionManager:
                 else:
                     log.warning("reconcile: SL NOT placed %s @ %s (%s)",
                                symbol, sl_price, sl_order.error)
-        # Place TP orders
+        # Place TP orders — divide quantity evenly across TP levels
+        # so TP1 doesn't close the full position.
         if not skip_tp and tp_prices:
-            for i, tp_price in enumerate(tp_prices[:3]):
+            tp_levels = tp_prices[:3]
+            tp_qty_base = quantity / len(tp_levels) if len(tp_levels) > 1 else quantity
+            for i, tp_price in enumerate(tp_levels):
                 tp_side = "SELL" if pos.direction == "LONG" else "BUY"
-                tp_qty = _bump_for_min_notional(quantity, tp_price, filters)
+                tp_qty = _bump_for_min_notional(tp_qty_base, tp_price, filters)
                 tp_err = validate_order(symbol, tp_side, tp_price, tp_qty, filters)
                 if tp_err:
                     log.warning("reconcile: TP%d skipped %s @ %s: %s", i + 1, symbol, tp_price, tp_err)
@@ -307,9 +310,9 @@ class PositionManager:
                     log.warning("reconcile: TP%d blocked (%s) — LIMIT fallback @ %s",
                                 i + 1, tp_order.error, tp_price)
                     if tp_side == "SELL":
-                        await self.exchange.limit_sell(symbol, quantity, tp_price, reduce=True)
+                        await self.exchange.limit_sell(symbol, tp_qty, tp_price, reduce=True)
                     else:
-                        await self.exchange.limit_buy(symbol, quantity, tp_price, reduce=True)
+                        await self.exchange.limit_buy(symbol, tp_qty, tp_price, reduce=True)
                 else:
                     log.warning("reconcile: TP%d NOT placed %s @ %s (%s)",
                                 i + 1, symbol, tp_price, tp_order.error)

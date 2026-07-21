@@ -316,6 +316,14 @@ class PositionRepository:
             )
         self.conn.commit()
 
+    def update_quantity(self, position_id: int, quantity: float) -> None:
+        """Update the remaining quantity of an open position (e.g. after partial close)."""
+        self.conn.execute(
+            "UPDATE positions SET quantity = ? WHERE id = ?",
+            (quantity, position_id),
+        )
+        self.conn.commit()
+
     def get_daily_pnl(self) -> float:
         """Sum P&L of positions closed today."""
         cursor = self.conn.execute(

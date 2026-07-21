@@ -274,14 +274,17 @@ class OrderService:
                     log.warning("SL NOT placed for %s @ %s — position UNPROTECTED (%s)",
                                 symbol, decision.sl_price, sl_order.error)
 
-        # Place TP orders (conditional TAKE_PROFIT-LIMIT, fallback to Basic LIMIT)
-        for i, tp_price in enumerate(decision.tp_prices[:3]):
+        # Place TP orders — divide quantity evenly across TP levels
+        # so TP1 doesn't close the full position.
+        tp_levels = decision.tp_prices[:3]
+        tp_qty_base = quantity / len(tp_levels) if len(tp_levels) > 1 else quantity
+        for i, tp_price in enumerate(tp_levels):
             tp_side = "SELL" if decision.direction == "LONG" else "BUY"
-            tp_err = validate_order(symbol, tp_side, tp_price, quantity, filters or {})
+            tp_err = validate_order(symbol, tp_side, tp_price, tp_qty_base, filters or {})
             if tp_err:
                 log.warning("Validation gate SKIPPED TP%d %s @ %s: %s", i + 1, symbol, tp_price, tp_err)
                 continue
-            tp_order = await self.exchange.take_profit(symbol, quantity, tp_price, tp_side)
+            tp_order = await self.exchange.take_profit(symbol, tp_qty_base, tp_price, tp_side)
             if tp_order.order_id:
                 log.info("TP%d placed: %s @ %s (conditional)", i + 1, symbol, tp_price)
             else:
@@ -290,9 +293,9 @@ class OrderService:
                 log.warning("TP%d conditional blocked (%s) — falling back to Basic LIMIT @ %s",
                             i + 1, tp_order.error, tp_price)
                 if tp_side == "SELL":
-                    fb = await self.exchange.limit_sell(symbol, quantity, tp_price, reduce=True)
+                    fb = await self.exchange.limit_sell(symbol, tp_qty_base, tp_price, reduce=True)
                 else:
-                    fb = await self.exchange.limit_buy(symbol, quantity, tp_price, reduce=True)
+                    fb = await self.exchange.limit_buy(symbol, tp_qty_base, tp_price, reduce=True)
                 if fb.order_id:
                     log.info("TP%d placed (Basic LIMIT fallback): %s @ %s", i + 1, symbol, tp_price)
 
@@ -393,9 +396,12 @@ class OrderService:
                     entry_order_id=retry.order_id,
                 )
                 self.position_repo.create(pos)
-                for tp_price in decision.tp_prices[:3]:
+                # Divide TP quantity across levels
+                tp_levels = decision.tp_prices[:3]
+                tp_qty = qty / len(tp_levels) if len(tp_levels) > 1 else qty
+                for tp_price in tp_levels:
                     tp_side = "SELL" if decision.direction == "LONG" else "BUY"
-                    await self.exchange.take_profit(symbol, qty, tp_price, tp_side)
+                    await self.exchange.take_profit(symbol, tp_qty, tp_price, tp_side)
                 return ExecutionResult(
                     success=True, order_id=retry.order_id, symbol=symbol, side=side,
                     filled_quantity=retry.filled_quantity or qty,
@@ -523,19 +529,21 @@ class OrderService:
             else:
                 log.warning("New SL NOT placed for %s @ %s (%s)", symbol, decision.sl_price, sl_order.error)
 
-        # Place new TP orders if specified (conditional, fallback to Basic LIMIT)
+        # Place new TP orders if specified — divide quantity across levels
         tp_placed = 0
-        for i, tp_price in enumerate(decision.tp_prices[:3]):
+        tp_levels = decision.tp_prices[:3]
+        tp_qty_base = position.quantity / len(tp_levels) if len(tp_levels) > 1 else position.quantity
+        for i, tp_price in enumerate(tp_levels):
             if tp_price <= 0:
                 continue
             tp_side = "SELL" if position.direction == "LONG" else "BUY"
-            tp_order = await self.exchange.take_profit(symbol, position.quantity, tp_price, tp_side)
+            tp_order = await self.exchange.take_profit(symbol, tp_qty_base, tp_price, tp_side)
             if tp_order.order_id:
                 tp_placed += 1
                 log.info("New TP%d placed: %s @ %s", i + 1, symbol, tp_price)
             else:
-                fb = await self.exchange.limit_sell(symbol, position.quantity, tp_price, reduce=True) if tp_side == "SELL" \
-                    else await self.exchange.limit_buy(symbol, position.quantity, tp_price, reduce=True)
+                fb = await self.exchange.limit_sell(symbol, tp_qty_base, tp_price, reduce=True) if tp_side == "SELL" \
+                    else await self.exchange.limit_buy(symbol, tp_qty_base, tp_price, reduce=True)
                 if fb.order_id:
                     tp_placed += 1
                     log.info("New TP%d placed (Basic LIMIT fallback): %s @ %s", i + 1, symbol, tp_price)

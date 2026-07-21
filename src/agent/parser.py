@@ -32,19 +32,19 @@ DIRECTION_PATTERNS = [
 ]
 
 ENTRY_PATTERNS = [
-    re.compile(r'(?:entry|enter|open|buy\s*at|sell\s*at|limit|@\s*)\s*[:-]?\s*([\d,]+\.?\d*)', re.I),
-    re.compile(r'(?:zone|range|area)\s*[:-]?\s*([\d,]+\.?\d*)', re.I),
+    re.compile(r'(?:entry|enter|open|buy\s*at|sell\s*at|limit|@\s*)\s*[:-]?\s*([\d,]+\'?\.?\d*)', re.I),
+    re.compile(r'(?:zone|range|area)\s*[:-]?\s*([\d,]+\'?\.?\d*)', re.I),
 ]
 
 SL_PATTERNS = [
-    re.compile(r'(?:sl|stop\s*(?:loss)?|stoploss)\s*[:-]?\s*([\d,]+\.?\d*)', re.I),
-    re.compile(r'(?:invalidat|invalid)\s*[:-]?\s*([\d,]+\.?\d*)', re.I),
+    re.compile(r'(?:sl|stop\s*(?:loss)?|stoploss)\s*[:-]?\s*([\d,]+\'?\.?\d*)', re.I),
+    re.compile(r'(?:invalidat|invalid)\s*[:-]?\s*([\d,]+\'?\.?\d*)', re.I),
 ]
 
 TP_PATTERNS = [
-    re.compile(r'(?:tp\s*1?|take\s*profit\s*1?|target\s*1?|tgt\s*1?)\s*[:-]?\s*([\d,]+\.?\d*)', re.I),
-    re.compile(r'(?:tp\s*2|take\s*profit\s*2|target\s*2|tgt\s*2)\s*[:-]?\s*([\d,]+\.?\d*)', re.I),
-    re.compile(r'(?:tp\s*3|take\s*profit\s*3|target\s*3|tgt\s*3)\s*[:-]?\s*([\d,]+\.?\d*)', re.I),
+    re.compile(r'(?:tp\s*1?|take\s*profit\s*1?|target\s*1?|tgt\s*1?)\s*[:-]?\s*([\d,]+\'?\.?\d*)', re.I),
+    re.compile(r'(?:tp\s*2|take\s*profit\s*2|target\s*2|tgt\s*2)\s*[:-]?\s*([\d,]+\'?\.?\d*)', re.I),
+    re.compile(r'(?:tp\s*3|take\s*profit\s*3|target\s*3|tgt\s*3)\s*[:-]?\s*([\d,]+\'?\.?\d*)', re.I),
 ]
 
 # Additional patterns for extended signal metadata
@@ -108,13 +108,13 @@ def _resolve_pair(text: str) -> str | None:
 
     # Fallback: very basic generic pair extraction without hardcoded symbols
     # This catches #BTC, BTC/USDT patterns without needing a registry
-    fallback = re.search(r'[#\$]?([A-Z]{2,10})\s*/?\s*(USDT|USD|BUSD)\b', text, re.I)
+    fallback = re.search(r'[#\$]?([A-Za-z]{2,10})\s*/?\s*(USDT|USD|BUSD)\b', text, re.I)
     if fallback:
         base = fallback.group(1).upper()
         quote = fallback.group(2).upper()
         return f"{base}{quote}"
 
-    fallback2 = re.search(r'\b([A-Z]{2,10}USDT)\b', text, re.I)
+    fallback2 = re.search(r'\b([A-Za-z]{2,10}USDT)\b', text, re.I)
     if fallback2:
         return fallback2.group(1).upper()
 
@@ -196,16 +196,15 @@ def extract_leverage(text: str) -> int | None:
 
 
 # ─── Management command detection ──────────────────────────────────────────
-# Channel management messages like "sl to entry" / "sl at entry" are replies to
-# a previous signal. They are NOT fresh entries — they are instructions to
-# modify the open position (move its Stop Loss to the entry/breakeven price),
-# move a take-profit level (tp1/tp2/tp3), or fully close it ("full").
+# Channel management messages like "sl to entry" / "tp1" / "full" are replies
+# to a previous signal. They are NOT fresh entries — they are instructions to
+# modify the open position.
 _MANAGEMENT_PATTERNS = [
     re.compile(r"\bsl\s+(?:to|at|@)\s+entry\b", re.I),
     re.compile(r"\bsl\s*=\s*entry\b", re.I),
     re.compile(r"\bstop\s*(?:loss)?\s+(?:to|at)\s+entry\b", re.I),
     re.compile(r"\bbreakeven\b", re.I),
-    re.compile(r"\bbe\b", re.I),  # "be" shorthand often used as "move to breakeven"
+    re.compile(r"\bbe\b", re.I),  # "be" shorthand for "breakeven"
 ]
 
 # "tp1" / "tp2" / "tp3" — optional explicit price after a separator.
@@ -213,17 +212,25 @@ _MGMT_TP_RE = re.compile(r"\btp\s*(\d)\b\s*(?:[:@\-]\s*([\d,]+(?:\.\d+)?))?", re
 # "full" (standalone) — full market close of the position.
 _MGMT_FULL_RE = re.compile(r"\bfull\b", re.I)
 
+# TP1 / partial-exit patterns — channel posts "tp1 booked", "tp1 done",
+# "partial taken" etc. to signal a partial exit at the first target.
+_TP1_PARTIAL_PATTERNS = [
+    re.compile(r"\btp1?\s*(?:booked|done|hit|filled|reached|taken)\b", re.I),
+    re.compile(r"\bpartial\s*(?:close|profit|taken|done|booked)?\b", re.I),
+]
+
 # Management action sentinels.
 _MGMT_SL_ENTRY = "SL_ENTRY"
 _MGMT_TP = "TP"
 _MGMT_FULL = "FULL"
+_MGMT_TP1_PARTIAL = "TP1_PARTIAL"
 
 
 def is_management_command(raw_text: str) -> bool:
     """Return True if the message looks like a position-management command.
 
-    Covers sl-to-entry, tpN, and full-close. These skip the LLM and are
-    handled directly by the orchestrator's management path.
+    Covers sl-to-entry, tpN, full-close, and TP1-partial. These skip the
+    LLM and are handled directly by the orchestrator's management path.
     """
     if not raw_text:
         return False
@@ -232,6 +239,8 @@ def is_management_command(raw_text: str) -> bool:
     if _MGMT_FULL_RE.search(raw_text):
         return True
     if _MGMT_TP_RE.search(raw_text):
+        return True
+    if any(p.search(raw_text) for p in _TP1_PARTIAL_PATTERNS):
         return True
     return False
 
@@ -254,14 +263,17 @@ def parse_management_command(message_id: int, channel: str, raw_text: str,
                              reply_pair: str | None = None) -> TradeSignal | None:
     """Detect and classify a position-management command.
 
-    Returns a TradeSignal carrying ``mgmt_action`` (SL_ENTRY / TP / FULL) and
-    any level/price info, or None if this is not a management command. The pair
-    is resolved from the reply context first, then from the message's own text.
+    Returns a TradeSignal carrying ``mgmt_action`` (SL_ENTRY / TP / FULL /
+    TP1_PARTIAL) and any level/price info, or None if this is not a management
+    command. The pair is resolved from the reply context first, then from the
+    message's own text.
 
     The orchestrator's management path handles these directly (NOT the LLM):
-      * SL_ENTRY — move SL to the position's entry price (breakeven).
-      * TP       — move/refresh take-profit level tpN (rest of position stays open).
-      * FULL     — full market close of the position.
+      * SL_ENTRY     — move SL to the position's entry price (breakeven).
+      * TP           — move/refresh take-profit level tpN (rest of position stays open).
+      * FULL         — full market close of the position.
+      * TP1_PARTIAL  — TP1 was hit: close 1/3 of position, move SL to entry,
+                       adjust remaining TP for the rest.
     """
     text = raw_text or ""
     if not is_management_command(text):
@@ -270,19 +282,29 @@ def parse_management_command(message_id: int, channel: str, raw_text: str,
     # Pair: prefer the replied-to message's pair, then try own text.
     pair = reply_pair or _resolve_pair(text)
 
-    # 1) sl to entry (breakeven)
+    # 1) TP1 / partial-exit command — check BEFORE generic tpN so "tp1 booked"
+    #    is routed to the partial-close handler, not the generic tp-modify path.
+    for p in _TP1_PARTIAL_PATTERNS:
+        if p.search(text):
+            return _mgmt_signal(
+                message_id, channel, raw_text, pair,
+                action=_MGMT_TP1_PARTIAL,
+                sl_price=-2.0,  # sentinel — orchestrator recognises this
+            )
+
+    # 2) sl to entry (breakeven)
     if any(p.search(text) for p in _MANAGEMENT_PATTERNS):
         if not pair:
             return _mgmt_signal(message_id, channel, raw_text, None, action=_MGMT_SL_ENTRY)
         return _mgmt_signal(message_id, channel, raw_text, pair, action=_MGMT_SL_ENTRY)
 
-    # 2) full close — decisive; takes priority over tpN if both appear.
+    # 3) full close — decisive; takes priority over tpN if both appear.
     if _MGMT_FULL_RE.search(text):
         if not pair:
             return _mgmt_signal(message_id, channel, raw_text, None, action=_MGMT_FULL)
         return _mgmt_signal(message_id, channel, raw_text, pair, action=_MGMT_FULL)
 
-    # 3) tpN — move/refresh that TP level.
+    # 4) tpN — move/refresh that TP level.
     m = _MGMT_TP_RE.search(text)
     if m:
         tp_index = int(m.group(1)) - 1
@@ -301,5 +323,5 @@ def parse_management_command(message_id: int, channel: str, raw_text: str,
     return None
 
 
-# Sentinel sl_price meaning "set SL to the position's entry price (breakeven)".
+# Management sentinel for sl-to-entry fallback.
 _SL_TO_ENTRY = -1.0

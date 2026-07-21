@@ -20,7 +20,7 @@ from typing import Any
 
 from src.agent.agent import AgentBrain
 from src.agent.gate import SafetyGate1, SafetyGate2
-from src.agent.parser import parse_signal, parse_management_command, _SL_TO_ENTRY
+from src.agent.parser import parse_signal, parse_management_command, _MGMT_TP1_PARTIAL
 from src.agent.ta_context import fetch_ta_context
 from src.domain.models import (
     ConfigSnapshot,
@@ -230,11 +230,15 @@ class TradeOrchestrator:
                 result["skipped"] = True
                 return result
 
-            # ── Step 0b: Management command (e.g. "sl to entry") ──────────────
+            # ── Step 0b: Management command (e.g. "sl to entry", "tp1 booked") ──
             # These are replies to a previous signal. They do NOT go through the
-            # LLM — they modify the open position directly (move SL to entry).
+            # LLM — they modify the open position directly.
             mgmt = parse_management_command(message_id, channel, raw_text, reply_pair)
             if mgmt is not None:
+                if mgmt.mgmt_action == _MGMT_TP1_PARTIAL:
+                    return await self._handle_tp1_booked(
+                        correlation_id, message_id, raw_text, mgmt, result
+                    )
                 return await self._handle_management(
                     correlation_id, message_id, raw_text, mgmt, result
                 )
@@ -872,6 +876,185 @@ class TradeOrchestrator:
             self.event_bus.emit(Event("PositionModified", {
                 "pair": position.pair, "sl": new_sl, "reason": decision.reason,
             }))
+        return result
+
+    # ── TP1 / partial-exit handler ──────────────────────────────────────────
+
+    async def _handle_tp1_booked(self, correlation_id: str, message_id: int,
+                                  raw_text: str, mgmt: "TradeSignal",
+                                  result: dict) -> dict:
+        """Handle a 'tp1 booked' / 'tp1 done' management command.
+
+        Flow:
+          1. Find the open position for the message's pair.
+          2. Market-close 1/3 of the position (take partial profit).
+          3. Move SL to entry price (breakeven).
+          4. Update the remaining TP so the rest of the position runs.
+
+        No LLM call is made — this is a deterministic management action.
+        """
+        log.info("TP1 management command: pair=%s text=%s", mgmt.pair, raw_text[:80])
+        self._log(correlation_id, "INFO", "orchestrator",
+                  f"TP1 command: {raw_text[:120]}", {"pair": mgmt.pair})
+
+        # Resolve the target position
+        sym = None
+        if mgmt.pair:
+            sym = mgmt.pair.replace("#", "").replace("$", "").upper()
+            if not sym.endswith("USDT"):
+                sym += "USDT"
+        position = self.position_repo.get_open_by_pair(sym) if sym else None
+
+        if position is None:
+            opens = self.position_repo.get_open_positions()
+            if len(opens) == 1:
+                position = opens[0]
+                sym = position.pair
+            elif len(opens) > 1:
+                result["action"] = "skipped"
+                result["skipped"] = True
+                result["reason"] = "Multiple open positions — specify pair for TP1"
+                self.signal_repo.mark_processed(message_id, raw_text)
+                await self.notifier.send_message(
+                    "⚠️ **TP1 partial close** — multiple positions open.\n"
+                    "Include the pair (e.g. `#ENA tp1 booked`)."
+                )
+                return result
+            else:
+                result["action"] = "skipped"
+                result["skipped"] = True
+                result["reason"] = f"No open position for {mgmt.pair}"
+                self.signal_repo.mark_processed(message_id, raw_text)
+                await self.notifier.send_message(
+                    f"⚠️ **TP1 partial close** — no open position for `{mgmt.pair}`."
+                )
+                return result
+
+        if sym is None:
+            sym = position.pair
+
+        # ── Step 1: Calculate 1/3 partial close quantity ────────────────
+        total_qty = position.quantity
+        close_qty = total_qty / 3.0
+        remain_qty = total_qty - close_qty
+
+        # Round to exchange precision
+        try:
+            remain_qty, _ = await self.exchange._round_quantity(sym, remain_qty)
+            close_qty = total_qty - remain_qty  # adjust close to match remainder
+            if close_qty <= 0:
+                close_qty, _ = await self.exchange._round_quantity(sym, total_qty * 0.33)
+                remain_qty = total_qty - close_qty
+        except Exception:
+            pass  # use approximate values
+
+        # Fetch current mark price for the close and new TP
+        mark_price = None
+        try:
+            mark_price = await self.exchange.get_mark_price(sym)
+        except Exception:
+            log.warning("TP1: could not fetch mark price for %s", sym)
+
+        # ── Step 2: Market-close 1/3 of position ────────────────────────
+        close_side = "SELL" if position.direction == "LONG" else "BUY"
+        partial_close_ok = False
+        try:
+            close_order = await self.exchange.market_close(sym, close_qty, close_side)
+            if close_order.status in ("FILLED", "NEW", "PARTIALLY_FILLED"):
+                partial_close_ok = True
+                log.info("TP1 partial close: %s %.4f @ %s (status=%s)",
+                         sym, close_qty, close_order.avg_price or mark_price, close_order.status)
+            else:
+                log.warning("TP1 partial close failed for %s: %s", sym, close_order.error)
+        except Exception as e:
+            log.warning("TP1 partial close exception for %s: %s", sym, e)
+
+        # ── Step 3: Cancel old SL/TP, place new SL (breakeven) + TP for remainder ──
+        if partial_close_ok and remain_qty > 0:
+            # Cancel existing orders
+            try:
+                await self.exchange.cancel_all_orders(sym)
+            except Exception as e:
+                log.debug("TP1: cancel_all_orders warning: %s", e)
+
+            # Update position in DB: reduce qty, set SL to entry, keep TP price
+            new_tp = position.tp_prices[0] if position.tp_prices else None
+            self.position_repo.update_sl_tp(
+                position.id,
+                sl_price=position.entry_price,  # breakeven
+                tp_prices=[new_tp] if new_tp else [],
+            )
+            # Reduce the open position qty in DB
+            self.position_repo.update_quantity(position.id, remain_qty)
+
+            # Place new SL at entry (breakeven)
+            sl_side = "SELL" if position.direction == "LONG" else "BUY"
+            try:
+                await self.exchange.stop_loss(sym, remain_qty, position.entry_price, sl_side)
+                log.info("TP1: breakeven SL placed for %s @ %s", sym, position.entry_price)
+            except Exception as e:
+                log.warning("TP1: breakeven SL not placed for %s: %s", sym, e)
+
+            # Place new TP for remaining position (at the original TP price)
+            if new_tp and new_tp > 0:
+                tp_side = "SELL" if position.direction == "LONG" else "BUY"
+                try:
+                    await self.exchange.take_profit(sym, remain_qty, new_tp, tp_side)
+                    log.info("TP1: remaining TP placed for %s @ %s (qty=%.4f)",
+                             sym, new_tp, remain_qty)
+                except Exception as e:
+                    log.warning("TP1: remaining TP not placed: %s", e)
+
+            # Log position event
+            if self.position_event_repo:
+                self.position_event_repo.save_event(
+                    position_id=position.id,
+                    event_type="PARTIAL_EXIT",
+                    details=f"TP1 partial close: {close_qty:.4f} @ {close_order.avg_price or mark_price or '?'}, "
+                            f"remaining {remain_qty:.4f}, SL moved to entry",
+                    metadata={
+                        "pair": sym,
+                        "direction": position.direction,
+                        "close_qty": close_qty,
+                        "remain_qty": remain_qty,
+                        "close_price": close_order.avg_price or mark_price,
+                        "entry_price": position.entry_price,
+                        "remaining_tp": new_tp,
+                    },
+                )
+
+            result["action"] = "tp1_partial"
+            result["reason"] = f"Closed {close_qty:.4f} @ TP1, remaining {remain_qty:.4f} with SL at entry"
+
+            await self.notifier.send_message(
+                f"📊 **TP1 Partial Close — {sym}**\n"
+                f"   ├ Closed: `{close_qty:.4f}` @ `{close_order.avg_price or mark_price or '?'}`\n"
+                f"   ├ Remaining: `{remain_qty:.4f}`\n"
+                f"   ├ SL → Entry: `{position.entry_price}` (breakeven)\n"
+                f"   ├ TP: `{new_tp or '—'}`\n"
+                f"   └ Entry: `{position.entry_price}`"
+            )
+
+            if self.event_bus:
+                self.event_bus.emit(Event("TP1PartialExit", {
+                    "pair": sym,
+                    "direction": position.direction,
+                    "close_qty": close_qty,
+                    "close_price": close_order.avg_price or mark_price,
+                    "remain_qty": remain_qty,
+                    "sl_price": position.entry_price,
+                }))
+        else:
+            result["action"] = "failed"
+            result["error"] = "Partial close order was not filled"
+            log.warning("TP1 partial close NOT executed for %s (ok=%s, remain=%.4f)",
+                        sym, partial_close_ok, remain_qty)
+            await self.notifier.send_message(
+                f"⚠️ **TP1 partial close failed** — `{sym}`\n"
+                f"Market close did not fill. Check Binance."
+            )
+
+        self.signal_repo.mark_processed(message_id, raw_text)
         return result
 
     # ── Trigger execution ──────────────────────────────────────────────────
