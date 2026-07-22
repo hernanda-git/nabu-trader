@@ -945,6 +945,18 @@ class TradeOrchestrator:
         position = self.position_repo.get_open_by_pair(sym) if sym else None
 
         if position is None:
+            # If the message explicitly specified a pair, don't fall back to
+            # a different open position — reject with a clear message instead.
+            if mgmt.pair:
+                result["action"] = "skipped"
+                result["skipped"] = True
+                result["reason"] = f"No open position for {sym}"
+                self.signal_repo.mark_processed(message_id, raw_text)
+                await self.notifier.send_message(
+                    f"⚠️ **TP1 partial close** — no open position for `{sym}`.\n"
+                    f"Command was for {sym} but that trade is already closed."
+                )
+                return result
             opens = self.position_repo.get_open_positions()
             if len(opens) == 1:
                 position = opens[0]
@@ -1118,6 +1130,18 @@ class TradeOrchestrator:
         position = self.position_repo.get_open_by_pair(sym) if sym else None
 
         if position is None:
+            # If the message explicitly specified a pair, don't fall back to
+            # a different open position — reject with a clear message instead.
+            if mgmt.pair:
+                result["action"] = "skipped"
+                result["skipped"] = True
+                result["reason"] = f"No open position for {sym}"
+                self.signal_repo.mark_processed(message_id, raw_text)
+                await self.notifier.send_message(
+                    f"⚠️ **Close command** — no open position for `{sym}`.\n"
+                    f"Command was for {sym} but that trade is already closed."
+                )
+                return result
             opens = self.position_repo.get_open_positions()
             if len(opens) == 1:
                 position = opens[0]
@@ -1125,7 +1149,7 @@ class TradeOrchestrator:
             else:
                 result["action"] = "skipped"
                 result["skipped"] = True
-                result["reason"] = f"Can't resolve position for {mgmt.pair}" if mgmt.pair else "No open position"
+                result["reason"] = "No open position"
                 self.signal_repo.mark_processed(message_id, raw_text)
                 await self.notifier.send_message(
                     f"⚠️ **Close command** — could not resolve position.\n"
