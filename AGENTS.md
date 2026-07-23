@@ -174,6 +174,8 @@ src/
 | **Rate limited by API bridge** | 429 Too Many Requests | Wait 60s or reduce query frequency (30 req/min per IP) |
 | **DB migration skipped columns** | New columns show as NULL | Safe — `_run_migrations()` uses try/except for ALTER TABLE |
 | **Webhook URL not set** | Trade events not pushed | Set `WEBHOOK_URL` env var on Fly.io; push is fire-and-forget |
+| **close notification not sent** | SL/TP close position but Telegram not notified | Fixed v103: `_finalize_close` now sends Telegram notification with PnL, direction, reason |
+| **Health report markdown error** | Telegram "can't parse entities" on /health | Fixed v103: dynamic health check fields now escaped with `_md_escape()` |
 | **uvicorn fails to start** | API bridge not available | Check port conflicts; bot continues without API, log shows "API bridge not started" |
 
 ### ⚠️ 1000x Contract Compatibility
@@ -463,9 +465,10 @@ test signal in paper mode and checking the Telegram notification says either
 | [`docs/RISK_MANAGEMENT.md`](docs/RISK_MANAGEMENT.md) | Safety gates + risk rules |
 | [`docs/API.md`](docs/API.md) | Exchange adapter API reference |
 | [`docs/SIGNAL_PARSING.md`](docs/SIGNAL_PARSING.md) | Regex patterns for signal formats |
-| [`docs/Fly-health-check.md`](docs/Fly-health-check.md) | Quick health check reference |
+| [`docs/FLY_OPERATIONS.md`](docs/FLY_OPERATIONS.md) | Fly.io operations, health checks, logs, SSH |
+| [`docs/SIGNAL_PARSING.md`](docs/SIGNAL_PARSING.md) | Regex patterns for signal formats |
 | [`src/api/server.py`](src/api/server.py) | API bridge server (15 endpoints) |
 | [`src/api/auth.py`](src/api/auth.py) | Auth middleware + rate limiter |
-| [`docs/CHANGELOG.md`](CHANGELOG.md) | Version history |
+| [`CHANGELOG.md`](CHANGELOG.md) | Version history |
 | [`PLAN.md`](PLAN.md) | Original design plan |
 | [`PLAN_REVISE.md`](PLAN_REVISE.md) | Revised plan |

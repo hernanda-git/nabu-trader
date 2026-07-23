@@ -12,154 +12,134 @@ class Exchange(ABC):
     async def get_balance(self) -> BalanceInfo: ...
     async def market_buy(self, symbol: str, quantity: float) -> OrderInfo: ...
     async def market_sell(self, symbol: str, quantity: float) -> OrderInfo: ...
-    async def limit_buy(self, symbol: str, quantity: float, price: float) -> OrderInfo: ...
-    async def limit_sell(self, symbol: str, quantity: float, price: float) -> OrderInfo: ...
-    async def stop_loss(self, symbol: str, quantity: float, stop_price: float, side: str = "SELL") -> OrderInfo: ...
-    async def take_profit(self, symbol: str, quantity: float, tp_price: float, side: str = "SELL") -> OrderInfo: ...
+    async def limit_buy(self, symbol: str, quantity: float, price: float, reduce: bool = False) -> OrderInfo: ...
+    async def limit_sell(self, symbol: str, quantity: float, price: float, reduce: bool = False) -> OrderInfo: ...
+    async def stop_loss(self, symbol: str, quantity: float, stop_price: float, limit_price: float, reduce: bool = True) -> OrderInfo: ...
+    async def take_profit(self, symbol: str, quantity: float, stop_price: float, limit_price: float, reduce: bool = True) -> OrderInfo: ...
+    async def market_close(self, symbol: str, quantity: float, side: str) -> OrderInfo: ...
     async def cancel_order(self, symbol: str, order_id: str) -> bool: ...
+    async def cancel_all_orders(self, symbol: str) -> int: ...
     async def get_order(self, symbol: str, order_id: str) -> OrderInfo: ...
-    async def get_open_orders(self, symbol: str | None = None) -> list[OrderInfo]: ...
-
-    # Optional (no-op by default):
-    async def set_symbol_leverage(self, symbol: str, leverage: int): ...
-    async def set_margin_type(self, symbol: str, margin_type: str = "ISOLATED"): ...
+    async def get_open_orders(self, symbol: str) -> list[OrderInfo]: ...
+    async def get_positions(self) -> list[PositionInfo]: ...
+    async def get_mark_price(self, symbol: str) -> float: ...
+    async def get_klines_close(self, symbol: str, interval: str) -> float: ...
+    async def get_ticker_24hr(self, symbol: str) -> TickerInfo: ...
+    async def set_leverage(self, symbol: str, leverage: int) -> bool: ...
+    async def set_margin_mode(self, symbol: str, margin_type: str) -> bool: ...
 ```
 
-### Data Types
+## Return Types
 
 ```python
-@dataclass
-class BalanceInfo:
-    total_usdt: float = 0.0      # Total equity
-    free_usdt: float = 0.0       # Available for trading
-    assets: dict[str, dict] | None = None
-
-@dataclass
+@dataclass(frozen=True)
 class OrderInfo:
-    order_id: str = ""
-    symbol: str = ""
-    side: str = ""
-    type: str = ""
-    quantity: float = 0.0
-    price: float = 0.0
-    status: str = ""
-    filled_quantity: float = 0.0
-    avg_price: float = 0.0
-    error: str | None = None
+    symbol: str
+    order_id: str
+    client_order_id: str | None
+    side: str                        # BUY / SELL
+    type: str                        # LIMIT / MARKET / STOP / TAKE_PROFIT
+    quantity: float
+    price: float
+    stop_price: float | None
+    status: str                      # NEW / FILLED / PARTIALLY_FILLED / CANCELED / EXPIRED / REJECTED
+    filled_quantity: float
+    avg_price: float
+    reduce_only: bool
+    error: str | None
+
+@dataclass(frozen=True)
+class BalanceInfo:
+    total_wallet_balance: float
+    total_usdt: float
+    available_balance: float
+
+@dataclass(frozen=True)
+class PositionInfo:
+    symbol: str
+    direction: str                   # LONG / SHORT
+    size: float                      # positive = LONG, negative = SHORT
+    entry_price: float
+    mark_price: float
+    liquidation_price: float
+    unrealized_pnl: float
+    leverage: int
+
+@dataclass(frozen=True)
+class TickerInfo:
+    symbol: str
+    last_price: float
+    mark_price: float
+    price_change_percent: float
+    high_price: float
+    low_price: float
+    volume: float
+    quote_volume: float
 ```
-
-## Paper Exchange (`src/exchange/paper.py`)
-
-Simulated trading for testing:
-
-| Feature | Behavior |
-|---------|----------|
-| Balance | Configurable starting balance (default: $10,000) |
-| Fill price | 100% at requested price (no slippage) |
-| Fill time | Instant (no latency) |
-| Balance tracking | Deducts from balance on buy, adds on sell |
-| Leverage | Not supported (1x always) |
-
-**Use for:** Testing the pipeline logic without real money or API keys.
 
 ## Binance Exchange (`src/exchange/binance.py`)
 
-Real Binance REST API adapter. Supports both Spot and USDⓈ-M Futures.
+The primary exchange adapter. Supports:
+- Spot trading (`api.binance.com`)
+- USDⓈ-M Futures (`fapi.binance.com`)
+- Testnet for both (`testnet.binance.vision` / `testnet.binancefuture.com`)
 
-### API Endpoints Used
+### Key Features
 
-| Function | Endpoint | Auth |
-|----------|----------|------|
-| Account balance | `GET /fapi/v2/account` | Signed |
-| Set leverage | `POST /fapi/v1/leverage` | Signed |
-| Set margin type | `POST /fapi/v1/marginType` | Signed |
-| Place order | `POST /fapi/v1/order` | Signed |
-| Cancel order | `DELETE /fapi/v1/order` | Signed |
-| Get order | `GET /fapi/v1/order` | Signed |
-| Open orders | `GET /fapi/v1/openOrders` | Signed |
+| Feature | Implementation |
+|---------|---------------|
+| **Auth** | HMAC-SHA256 signature, timestamp + recvWindow |
+| **Futures** | Uses `fapi.binance.com` endpoints |
+| **Testnet** | Switch via `testnet=True` constructor parameter |
+| **Reduce-Only** | Explicit `reduce` flag on LIMIT/STOP/TAKE_PROFIT orders (fix v81) |
+| **Symbol Resolution** | Internal `_resolve_futures_symbol()` normalizes tickers |
+| **Min Notional** | Validated pre-submission + bumped if below minimum |
+| **Step Size** | Quantity rounded to exchange's `stepSize` |
+| **Leverage** | `set_leverage()` calls Binance before placing orders |
+| **Margin Mode** | `set_margin_mode()` switches between ISOLATED and CROSSED |
+| **Error Handling** | Parses Binance error codes (`-1121`, `-2022`, `-4120`, etc.) |
 
-For Spot mode, uses `/api/v3/` equivalents.
+### Rate Limits
 
-### Order Type Mapping (Futures)
+- 1200 requests per minute (futures API)
+- Order placement: 10 per 10 seconds per symbol (heavy users: 100 per 10s)
+- The bot respects rate limits via `recv_window` and non-blocking httpx
 
-| Input Type | Futures Equivalent | Tab | Fill |
-|------------|-------------------|-----|------|
-| `MARKET` | `MARKET` | — | Immediate (taker) |
-| `LIMIT` | `LIMIT` | Basic | Rests at price (maker) |
-| `STOP_LOSS` (stop_loss) | `STOP` (stop-limit) | Conditional | Triggers at stopPrice, fills as LIMIT |
-| `TAKE_PROFIT` (take_profit) | `TAKE_PROFIT` (tp-limit) | Conditional | Triggers at tpPrice, fills as LIMIT |
+### Error Codes
 
-**SL/TP strategy (v54+):** `stop_loss()` places a `STOP` (stop-limit) conditional
-order; `take_profit()` places a `TAKE_PROFIT` (tp-limit) conditional order. Both
-fill as LIMIT (no slippage) once their trigger price is touched.
+| Binance Code | Meaning | Bot Handling |
+|-------------|---------|-------------|
+| `-1121` | Invalid symbol | Logged → signal rejected |
+| `-2022` | reduceOnly mismatch | Fixed in v81 with explicit `reduce=` flag |
+| `-2019` | Margin insufficient | Logged → position skipped |
+| `-4120` | Conditional order not supported | Fall back to price monitoring (SL) or resting LIMIT (TP) |
+| `-1111` | Precision error | Step size rounding applied |
+| `-2010` | Insufficient balance | Logged → position skipped |
 
-**Fallbacks:** If `STOP`/`TAKE_PROFIT` are blocked on a contract (`-4120`), the
-order service falls back: SL → position-manager monitoring (closes via LIMIT on
-breach); TP → resting Basic-tab `LIMIT` at the TP price. None of these are
-`MARKET` — the bot is LIMIT-only by design.
+## Paper Exchange (`src/exchange/paper.py`)
 
-### Futures-Specific Features
+Simulated trading for testing. Features:
+- Instant fills at requested price (no slippage)
+- Configurable balance (default: $100 USDT)
+- Simulated fee: 0.04% per trade
+- No API keys needed
+- All state in memory
 
-**Dynamic Leverage** — Set per-symbol before each trade:
-```python
-await exchange.set_symbol_leverage("ETHUSDT", 5)  # 5x leverage
-```
+## Validation (`src/exchange/validation.py`)
 
-**Isolated Margin** — Each position has separate margin:
-```python
-await exchange.set_margin_type("ETHUSDT", "ISOLATED")
-```
+Pre-submission order validation:
+- **Min Notional**: `quantity * price >= min_notional`
+- **Step Size**: quantity must be multiple of `stepSize`
+- **Lot Size**: quantity within `[minQty, maxQty]`
+- **Price Filter**: price within `[minPrice, maxPrice]`
+- **Tick Size**: price must be multiple of `tickSize`
+- **Min Notional Bump**: auto-increases qty when below minimum
 
-**Balance Reading** — Reads from futures wallet (not spot):
-```python
-# Returns:
-#   total_usdt: marginBalance (equity incl. unrealized PnL)
-#   free_usdt: crossWalletBalance (available for new positions)
-```
+## Symbol Registry (`src/exchange/symbol_registry.py`)
 
-### Configuration
-
-```yaml
-exchange:
-  active: binance
-  binance:
-    api_key_env: BINANCE_API_KEY
-    api_secret_env: BINANCE_API_SECRET
-    testnet: false       # true = testnet.binancefuture.com
-    futures: true        # true = fapi, false = api/v3
-    recv_window: 5000
-```
-
-### API Key Requirements
-
-On Binance → API Management → Edit Restrictions:
-- ✅ Enable **Enable Futures** (required for futures mode)
-- ✅ Enable **Enable Spot & Margin** (for balance lookup)
-- ❌ Disable **Enable Withdrawals** (security)
-- ✅ Optionally: **Restrict access to trusted IPs**
-
-## Adding a New Exchange
-
-1. Create `src/exchange/your_exchange.py`
-2. Extend `Exchange` ABC from `base.py`
-3. Implement all abstract methods
-4. Wire it in `src/main.py` (add to exchange mode switch)
-5. Add config section to `config.yaml`
-
-```python
-from src.exchange.base import Exchange, BalanceInfo, OrderInfo
-
-class YourExchange(Exchange):
-    @property
-    def name(self) -> str:
-        return "your_exchange"
-
-    async def get_balance(self) -> BalanceInfo:
-        # Implement balance fetch
-        ...
-
-    async def market_buy(self, symbol: str, quantity: float) -> OrderInfo:
-        # Implement market buy
-        ...
-    # ... implement remaining methods
-```
+Dynamic symbol cache:
+- Fetches all USDⓈ-M Futures pairs from Binance at startup
+- Refreshes every 15 minutes
+- Exposes `resolve(text)` and `get_symbol_info(symbol)`
+- Caches min notional, step size, tick size, contract type for each pair
+- Handles `1000`-prefix resolution for small-cap coins
