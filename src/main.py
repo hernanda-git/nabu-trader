@@ -19,7 +19,6 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
-import re
 import sys
 from pathlib import Path
 
@@ -29,8 +28,6 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
-
-from dotenv import load_dotenv
 
 from src.agent.agent import AgentBrain
 from src.agent.gate import SafetyGate1, SafetyGate2
@@ -89,8 +86,8 @@ async def main():
     log.info("Config loaded (exchange=%s, auto_trade=%s)",
              cfg["exchange"]["active"], cfg["agent"]["auto_trade"])
 
-    # ── Load .env for Telegram secrets ───────────────────────────────────
-    load_dotenv(ROOT / ".env")
+    # ── Load Telegram secrets from environment ────────────────────────────
+    # .env was loaded by load_config() above — os.environ is already populated.
     bot_token = os.getenv("TELEGRAM_BOT_TOKEN", "")
     notify_chat_id = os.getenv("NOTIFY_CHAT_ID", "YOUR_CHAT_ID")
 

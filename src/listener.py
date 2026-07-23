@@ -253,12 +253,9 @@ class SignalListener:
             text = msg.text or msg.message or ""
             log.info("Edited message #%s", msg.id)
             reply_ctx = await self._resolve_reply_context(msg)
-            await self.orchestrator.handle_signal(
+            await self.orchestrator.handle_edit(
                 message_id=msg.id,
-                channel=self.channel,
                 raw_text=text,
-                has_media=msg.media is not None,
-                reply_to_message_id=reply_ctx.get("reply_to_message_id"),
                 reply_pair=reply_ctx.get("reply_pair"),
             )
 

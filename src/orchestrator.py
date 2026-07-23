@@ -686,6 +686,41 @@ class TradeOrchestrator:
 
         return result
 
+    async def handle_edit(self, message_id: int, raw_text: str,
+                          reply_pair: str | None = None) -> dict[str, Any]:
+        """Handle an edited message — management commands only.
+
+        Edits NEVER trigger LLM calls, trade entries, or idempotency checks.
+        They can only modify EXISTING open positions via management commands.
+        This is a completely separate path from handle_signal().
+        """
+        result: dict[str, Any] = {
+            "message_id": message_id,
+            "action": "edit_noop",
+            "error": None,
+        }
+        mgmt = parse_management_command(message_id, "edit", raw_text, reply_pair)
+        if mgmt is None:
+            log.info("Edit #%s — not a management command, skipped", message_id)
+            return result
+
+        log.info("Edit #%s — management command: action=%s pair=%s",
+                 message_id, mgmt.mgmt_action, mgmt.pair)
+        correlation_id = _generate_correlation_id()
+        result["correlation_id"] = correlation_id
+
+        if mgmt.mgmt_action == _MGMT_TP1_PARTIAL:
+            return await self._handle_tp1_booked(
+                correlation_id, message_id, raw_text, mgmt, result
+            )
+        if mgmt.mgmt_action == _MGMT_FULL:
+            return await self._handle_full_close(
+                correlation_id, message_id, raw_text, mgmt, result
+            )
+        return await self._handle_management(
+            correlation_id, message_id, raw_text, mgmt, result
+        )
+
     # ── Management command handling ────────────────────────────────────────
 
     async def _handle_management(self, correlation_id: str, message_id: int,
