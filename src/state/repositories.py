@@ -335,6 +335,20 @@ class PositionRepository:
         cursor = self.conn.execute("SELECT COUNT(*) FROM positions WHERE status = 'OPEN'")
         return cursor.fetchone()[0]
 
+    def get_last_closed_by_pair(self, pair: str) -> Position | None:
+        """Get the most recently CLOSED position for a pair.
+
+        Used by Gate1 cooldown to check time elapsed since last trade
+        (even when no position is currently OPEN).
+        """
+        cursor = self.conn.execute(
+            "SELECT * FROM positions WHERE status = 'CLOSED' AND pair = ? "
+            "ORDER BY exit_time DESC LIMIT 1",
+            (pair,),
+        )
+        row = cursor.fetchone()
+        return self._row_to_position(row) if row else None
+
     def get_total_notional_usdt(self) -> float:
         """Sum the notional value (entry_price × quantity) of all open positions.
 

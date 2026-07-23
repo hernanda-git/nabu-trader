@@ -172,8 +172,8 @@ async def main():
             app_version = str(__version__)
         except Exception:
             app_version = "0"
-    # Integer-only: strip any non-digit (defensive against stray "v"/SHA input).
-    version_str = re.sub(r"\D", "", str(app_version)) or "0"
+    # Integer-only version (src/version.py stores plain integer, e.g. "104").
+    version_str = str(app_version) or "0"
 
     if bot_token:
         log.info("Telegram notifier ready (chat_id=%s)", notify_chat_id)

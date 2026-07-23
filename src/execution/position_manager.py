@@ -81,14 +81,27 @@ class PositionManager:
 
     async def _monitor_loop(self):
         """Background loop that checks open positions and pending conditions."""
+        consecutive_idle = 0
         while self._running:
             try:
-                await self._reconcile_pending_orders()
-                await self._check_positions()
-                await self._check_pending_conditions()
+                had_work = False
+                if await self._reconcile_pending_orders():
+                    had_work = True
+                if await self._check_positions():
+                    had_work = True
+                if await self._check_pending_conditions():
+                    had_work = True
+                if not had_work:
+                    consecutive_idle += 1
+                else:
+                    consecutive_idle = 0
             except Exception:
                 log.exception("Error in position monitor loop")
-            await asyncio.sleep(self._interval)
+            # Backoff when idle (no open positions, no pending fills, no pending signals)
+            if consecutive_idle > 6:
+                await asyncio.sleep(min(self._interval * 6, 60))
+            else:
+                await asyncio.sleep(self._interval)
 
     # ── Pending LIMIT reconciliation ────────────────────────────────────
     # Root-cause guard: an ENTER that places a LIMIT entry resting on the
@@ -98,16 +111,17 @@ class PositionManager:
     # no SL/TP, invisible to the monitor. This method closes that hole by
     # polling every PENDING entry order against the exchange and, on fill,
     # building the position + placing SL/TP exactly like OrderService does.
-    async def _reconcile_pending_orders(self):
+    async def _reconcile_pending_orders(self) -> bool:
         if self.order_repo is None or self.decision_repo is None or self.signal_repo is None:
-            return
+            return False
         try:
             rows = self._pending_entry_orders()
         except Exception:
             log.debug("reconcile: could not load pending orders")
-            return
+            return False
         for o in rows:
             await self._reconcile_one(o)
+        return len(rows) > 0
 
     def _pending_entry_orders(self) -> list[dict]:
         """Return DB order rows still PENDING that represent entry orders.
@@ -324,17 +338,21 @@ class PositionManager:
         if placed_any:
             self._protection_placed.add(symbol)
 
-    async def _check_positions(self):
-        """Check all open positions for SL/TP hits or timeouts."""
+    async def _check_positions(self) -> bool:
+        """Check all open positions for SL/TP hits or timeouts.
+
+        Returns True if any positions were processed (had work to do).
+        """
         positions = self.position_repo.get_open_positions()
         if not positions:
-            return
+            return False
 
         for pos in positions:
             try:
                 await self._check_position(pos)
             except Exception:
                 log.exception("Error checking position %s", pos.pair)
+        return True
 
     async def _check_position(self, pos: Position):
         """Check a single open position."""
@@ -812,23 +830,27 @@ class PositionManager:
 
     # ── Pending conditions ──────────────────────────────────────────────────
 
-    async def _check_pending_conditions(self):
-        """Check all pending conditional signals and trigger if price condition met."""
+    async def _check_pending_conditions(self) -> bool:
+        """Check all pending conditional signals and trigger if price condition met.
+
+        Returns True if any pending signals were found (had work to do).
+        """
         if not self.pending_signal_repo:
-            return
+            return False
         try:
             pending = self.pending_signal_repo.get_pending()
         except Exception:
             log.exception("Failed to load pending signals")
-            return
+            return False
         if not pending:
-            return
+            return False
 
         for ps in pending:
             try:
                 await self._evaluate_condition(ps)
             except Exception:
                 log.exception("Error evaluating condition for %s", ps.pair)
+        return True
 
     async def _evaluate_condition(self, ps: PendingSignal):
         """Evaluate a single pending condition against current market price."""

@@ -131,21 +131,27 @@ class OrderService:
             except Exception as e:
                 log.debug("Pre-flight balance check skipped: %s", e)
 
-        # Validate minimum notional (Binance requirement)
+        # ─── Pre-submission validation gate ──────────────────────────────
+        # Never send an order that violates the symbol's exchange filters.
+        # This guarantees "no order submitted without passing validation".
+        filters = await self._get_filters(symbol)
+
+        # Validate minimum notional (Binance requirement) — scale quantity up if below
         price_ref = decision.entry_price or 0
         min_notional = self.config.get("risk", {}).get("min_notional_usdt", 1.0)
         notional_check = quantity * price_ref
         if notional_check < min_notional and notional_check > 0:
-            # For low-price coins, scale quantity up to meet min notional
             scale = min_notional / notional_check
             quantity = quantity * scale
             log.info("Scaled quantity by %.4fx to meet min notional $%.2f (was $%.2f)",
                      scale, min_notional, notional_check)
 
-        # ─── Pre-submission validation gate (Task 5) ───────────────────
-        # Never send an order that violates the symbol's exchange filters.
-        # This guarantees "no order submitted without passing validation".
-        filters = await self._get_filters(symbol)
+        # Round scaled quantity to stepSize to avoid precision rejections
+        if filters:
+            step = filters.get("stepSize")
+            if step and step > 0:
+                quantity = round(quantity / step) * step
+
         val_err = validate_order(symbol, side, decision.entry_price, quantity, filters or {})
         if val_err:
             log.warning("Validation gate BLOCKED entry %s %s %s qty=%.4f @ %.8f: %s",

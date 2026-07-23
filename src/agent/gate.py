@@ -68,11 +68,7 @@ class SafetyGate1:
 
         If allowed=False, the signal should be skipped immediately (no LLM call).
         """
-        # 1. Idempotency — message_id already seen (blocks edited duplicates)
-        if self.signal_repo.get_by_message_id(signal.message_id):
-            return False, "Duplicate signal (already processed)"
-
-        # 2. Pair whitelist
+        # 1. Pair whitelist
         allowed_pairs = self.config.get("agent", {}).get("allowed_pairs", ["*"])
         if "*" not in allowed_pairs and signal.pair:
             pair_clean = signal.pair.replace("#", "").replace("$", "").upper()
@@ -83,11 +79,15 @@ class SafetyGate1:
         if signal.pair:
             pair_key = signal.pair.upper().replace("#", "").replace("$", "") + "USDT"
             last_trade = self.position_repo.get_open_by_pair(pair_key)
+            if not last_trade:
+                last_trade = self.position_repo.get_last_closed_by_pair(pair_key)
             if last_trade:
-                cooldown_min = self.config.get("risk", {}).get("min_cooldown_minutes", 5)
-                elapsed = (datetime.now(timezone.utc) - last_trade.entry_time).total_seconds() / 60
-                if elapsed < cooldown_min:
-                    return False, f"Cooldown active for {signal.pair} ({elapsed:.1f}/{cooldown_min}m)"
+                ref_time = last_trade.exit_time if last_trade.status == "CLOSED" else last_trade.entry_time
+                if ref_time:
+                    cooldown_min = self.config.get("risk", {}).get("min_cooldown_minutes", 5)
+                    elapsed = (datetime.now(timezone.utc) - ref_time).total_seconds() / 60
+                    if elapsed < cooldown_min:
+                        return False, f"Cooldown active for {signal.pair} ({elapsed:.1f}/{cooldown_min}m)"
 
         return True, ""
 

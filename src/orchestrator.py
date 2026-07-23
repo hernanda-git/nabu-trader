@@ -322,12 +322,15 @@ class TradeOrchestrator:
             ta_ctx: str | None = None
             if signal.sl_price is None or not signal.tp_prices:
                 try:
-                    ta_ctx = await fetch_ta_context(
-                        self.exchange, signal.pair or "", timeframe="4h"
+                    ta_ctx = await asyncio.wait_for(
+                        fetch_ta_context(self.exchange, signal.pair or "", timeframe="4h"),
+                        timeout=0.5,
                     )
                     if ta_ctx:
                         log.info("TA context fetched for %s (%d chars)",
                                  signal.pair, len(ta_ctx))
+                except asyncio.TimeoutError:
+                    log.debug("TA context fetch timed out for %s (500ms)", signal.pair)
                 except Exception:
                     log.warning("Failed to fetch TA context for %s", signal.pair,
                                 exc_info=True)
