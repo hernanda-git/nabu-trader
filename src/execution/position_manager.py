@@ -685,7 +685,7 @@ class PositionManager:
                                     break
                             except Exception:
                                 pass
-                    return self._finalize_close(pos, order, reason, closed_by)
+                    return await self._finalize_close(pos, order, reason, closed_by)
                 log.error("Market close rejected for %s: %s", pos.pair, order.error)
                 return False
 
@@ -724,7 +724,7 @@ class PositionManager:
                     return False
 
             if order.status in ("FILLED", "NEW"):
-                return self._finalize_close(pos, order, reason, closed_by)
+                return await self._finalize_close(pos, order, reason, closed_by)
             else:
                 log.error("Failed to close %s: status=%s error=%s", pos.pair, order.status, order.error)
                 return False
@@ -732,9 +732,9 @@ class PositionManager:
             log.error("Failed to close %s: %s", pos.pair, e)
             return False
 
-    def _finalize_close(self, pos: Position, order: "object",
-                        reason: str, closed_by: str) -> bool:
-        """Compute PnL and persist the close (DB + event)."""
+    async def _finalize_close(self, pos: Position, order: "object",
+                              reason: str, closed_by: str) -> bool:
+        """Compute PnL and persist the close (DB + event), then notify Telegram."""
         entry_cost = pos.entry_price * pos.quantity
         exit_value = (order.avg_price or 0) * pos.quantity
         pnl = (exit_value - entry_cost) if pos.direction == "LONG" else (entry_cost - exit_value)
@@ -788,6 +788,26 @@ class PositionManager:
                 log.warning("Failed to record close event for %s (close already applied): %s",
                             pos.pair, e)
         log.info("Position closed: %s %s PnL=%.2f (%s)", pos.direction, pos.pair, pnl, closed_by)
+
+        # Notify Telegram about the position close
+        if self._notifier:
+            try:
+                label_map = {"SL": "Stop Loss", "TP": "Take Profit",
+                             "MANUAL": "Manual Close", "SYSTEM": "System"}
+                label = label_map.get(closed_by, closed_by)
+                sign = "🔴" if pnl < 0 else "🟢"
+                await self._notifier.send_message(
+                    f"{sign} **Position Closed** — `{pos.pair}`\n"
+                    f"   ├ Direction: `{pos.direction}`\n"
+                    f"   ├ Entry: `{pos.entry_price:.8f}`\n"
+                    f"   ├ Exit: `{order.avg_price:.8f}`\n"
+                    f"   ├ PnL: `{pnl:+.4f}` USDT\n"
+                    f"   ├ Reason: `{reason}`\n"
+                    f"   └ Closed by: `{label}`"
+                )
+            except Exception:
+                log.debug("close notification failed")
+
         return True
 
     # ── Pending conditions ──────────────────────────────────────────────────

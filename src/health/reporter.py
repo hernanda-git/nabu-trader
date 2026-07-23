@@ -15,6 +15,8 @@ import logging
 import time
 from typing import Any
 
+from src.notifier.telegram import _md_escape
+
 log = logging.getLogger("health.reporter")
 
 
@@ -135,7 +137,7 @@ async def build_health_report(listener: Any) -> tuple[list[str], int, int]:
     lines = [f"🩺 **Health Check** — {overall}", ""]
     for label, status, detail in checks:
         icon = "✅" if status == "OK" else "❌"
-        lines.append(f"{icon} {label}: {status} — {detail}")
+        lines.append(f"{icon} {label}: {status} — {_md_escape(detail)}")
     lines.append("")
     lines.append(f"⏱️ Check took {elapsed}ms · {n_ok}/{len(checks)} ok")
     return lines, n_ok, n_fail
