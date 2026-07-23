@@ -50,7 +50,17 @@ class TelegramNotifier:
         Tries Markdown parse mode first (for rich formatting). If Telegram
         rejects it ("can't parse entities"), retries as plain text so the
         notification is never silently lost.
+
+        Messages over 3950 characters are truncated to avoid Telegram's
+        4096-char limit — the truncation notice is appended so the user
+        knows the message was shortened.
         """
+        # Truncate to avoid Telegram's 4096-char limit
+        MAX_LEN = 3950
+        if len(text) > MAX_LEN:
+            trunc_note = f"\n\n_... truncated ({len(text) - MAX_LEN} chars omitted)_"
+            text = text[:MAX_LEN - len(trunc_note)] + trunc_note
+
         if not self.bot_token:
             log.info("[No bot token] %s", text[:100])
             return False

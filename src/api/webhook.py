@@ -35,6 +35,16 @@ log = logging.getLogger("api.webhook")
 # Default timeout for webhook POST
 WEBHOOK_TIMEOUT = 10  # seconds
 
+# Reusable async client (created on first use)
+_client: httpx.AsyncClient | None = None
+
+
+def _get_client() -> httpx.AsyncClient:
+    global _client
+    if _client is None:
+        _client = httpx.AsyncClient(timeout=WEBHOOK_TIMEOUT)
+    return _client
+
 
 def _get_webhook_url(config: dict | None = None) -> str | None:
     """Get the configured webhook URL.
@@ -99,14 +109,14 @@ async def emit_event(
         headers["X-Signature"] = _sign_payload(body, secret)
 
     try:
-        async with httpx.AsyncClient(timeout=WEBHOOK_TIMEOUT) as client:
-            resp = await client.post(url, content=body, headers=headers)
-            if resp.status_code < 300:
-                log.info("Webhook sent: %s -> %s (status=%d)", event_type, url, resp.status_code)
-                return True
-            else:
-                log.warning("Webhook returned %d for %s: %s", resp.status_code, event_type, resp.text[:200])
-                return False
+        client = _get_client()
+        resp = await client.post(url, content=body, headers=headers)
+        if resp.status_code < 300:
+            log.info("Webhook sent: %s -> %s (status=%d)", event_type, url, resp.status_code)
+            return True
+        else:
+            log.warning("Webhook returned %d for %s: %s", resp.status_code, event_type, resp.text[:200])
+            return False
     except httpx.TimeoutException:
         log.warning("Webhook timeout for %s -> %s", event_type, url)
         return False
