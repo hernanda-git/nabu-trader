@@ -4,7 +4,7 @@
 
 ```bash
 # From git-bash/MSYS (the Hermes terminal runs bash). Add flyctl to PATH:
-export PATH="$PATH:/c/Users/it26/.fly/bin"
+export PATH="$PATH:YOUR_HOME/.fly/bin"
 flyctl status --app nabu-trader
 flyctl logs --app nabu-trader --no-tail
 ```

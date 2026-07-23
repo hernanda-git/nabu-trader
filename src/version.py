@@ -1,3 +1,2 @@
-"""Package version — updated automatically during deploy."""
-
-__version__ = "106"
+"""Nabu Trader version."""
+__version__ = "1.0.0"

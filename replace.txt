@@ -1,0 +1,12 @@
+fattyfatclub==>YOUR_SIGNAL_CHANNEL
+5894116684==>YOUR_CHAT_ID
+learnernoearner-listener==>nabu-trader
+learnernoearner==>nabu
+Learnernoearner==>Nabu Trader
+hernanda-git==>YOUR_USERNAME
+m.hernanda95==>YOUR_EMAIL
+C:\Users\it26==>YOUR_HOME
+e82de14c5731e8==>YOUR_MACHINE_ID
+39313927==>YOUR_API_ID
+7346c49949703325924195f6e07ab6aa==>YOUR_API_HASH
+xvalarion_bot==>YOUR_BOT_USERNAME

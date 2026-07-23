@@ -1,26 +1,46 @@
-# Session files (Telegram auth)
-sessions/
+# Environment
+.env
+.env.local
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+dist/
+build/
+
+# Virtual environment
+.venv/
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Telethon session files
 *.session
-*.session-journal
+sessions/
 
-# Database (auto-created)
+# Data & logs
 data/
-
-# Logs
 logs/
+*.db
+*.db-*
 *.log
 
-# Python cache
-__pycache__/
-*.pyc
-*.pyo
-
-# Environment (contains secrets)
-.env
+# Hermes agent
+.hermes/
 
 # OS
 .DS_Store
 Thumbs.db
 
-# Hermes agent internals
-.hermes/
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
